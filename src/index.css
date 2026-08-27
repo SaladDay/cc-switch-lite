@@ -77,6 +77,26 @@
   );
 }
 
+dialog::backdrop {
+  background: rgb(0 0 0 / 0.4);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.lite-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: rgb(0 0 0 / 0.4);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.lite-modal-inert {
+  pointer-events: none !important;
+  user-select: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
