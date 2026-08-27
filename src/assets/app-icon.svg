@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="CC Switch Lite">
+  <defs>
+    <linearGradient id="background" x1="48" y1="40" x2="464" y2="472" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#38a1ff" />
+      <stop offset="1" stop-color="#0878f9" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="120" fill="url(#background)" />
+  <path d="M242 179c-18-22-45-35-76-35-64 0-110 48-110 112s46 112 110 112c31 0 58-13 76-35l-34-30c-10 13-24 21-42 21-35 0-60-29-60-68s25-68 60-68c18 0 32 8 42 21l34-30Z" fill="white" />
+  <path d="M456 179c-18-22-45-35-76-35-64 0-110 48-110 112s46 112 110 112c31 0 58-13 76-35l-34-30c-10 13-24 21-42 21-35 0-60-29-60-68s25-68 60-68c18 0 32 8 42 21l34-30Z" fill="white" />
+  <circle cx="256" cy="424" r="20" fill="#ff9b37" />
+</svg>
