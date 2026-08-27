@@ -112,11 +112,37 @@ plugin cannot remove another plugin's data.
 
 ## Compatibility policy
 
-The WIT package carries a semantic version. Additive fields and functions use a
-minor version; removed or reinterpreted behavior requires a new major world.
-The host may support multiple major worlds during a migration window. Stored
-provider data includes its plugin ID, plugin version, schema version, and
-adapter identifier so migrations are explicit.
+The WIT package carries a semantic version. Within one major version, published
+record fields, variant and enum cases, and function parameters and results are
+frozen. Changing any of those shapes is a major change, including adding a
+required record field. A minor version may add a separately named type or an
+optional, separately versioned interface only when existing hosts and plugins
+are not required to import, export, or call it. Optional interfaces are
+advertised in the manifest and negotiated before use. New required plugin
+exports or host imports require a new major world.
+
+This direction matters: an import added by a plugin creates a new host
+requirement, while an export added by the host contract creates a new plugin
+requirement. Neither is treated as compatible merely because its WIT text is
+additive. The host may support multiple major worlds during a migration window.
+Stored provider data includes its plugin ID, plugin version, schema version,
+adapter identifier, and the API world used to produce it.
+
+Schema migrations are plugin exports invoked and supervised by the host. A
+migration receives an immutable stored record and its current schema version,
+then returns a replacement record or an operation plan for host validation. It
+runs without direct filesystem access and under the same capability, time, and
+size limits as every other plugin call.
+
+Activation follows a fixed transaction: the host installs and verifies the new
+plugin without activating it, snapshots the current plugin data and lockfile,
+runs each declared migration on a copy, validates the result with the new
+plugin, and atomically switches the active version, data, and lockfile. Any
+failure leaves the old version and data active. Downgrade is allowed only when
+a reverse migration is provided or a compatible retained snapshot exists;
+otherwise it is blocked. If the version that owns stored data is unavailable,
+the host keeps that data disabled but exportable and never silently migrates it
+with another version.
 
 The Rust representation of wire types may change internally. Serialized plugin
 data and the WIT contract are the compatibility boundaries.

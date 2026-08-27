@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import App from "./App";
@@ -12,16 +12,21 @@ describe("App", () => {
   it("shows only the two applications in the Lite boundary", () => {
     render(<App />);
 
-    expect(screen.getByRole("tab", { name: "Claude Code" })).toBeVisible();
-    expect(screen.getByRole("tab", { name: "Codex" })).toBeVisible();
-    expect(screen.getAllByRole("tab")).toHaveLength(2);
+    const switcher = within(
+      screen.getByRole("navigation", { name: "Applications" }),
+    );
+    expect(
+      switcher.getByRole("button", { name: "Claude Code" }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(switcher.getByRole("button", { name: "Codex" })).toBeVisible();
+    expect(switcher.getAllByRole("button")).toHaveLength(2);
   });
 
   it("switches the empty state and remembers the selected application", async () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(screen.getByRole("tab", { name: "Codex" }));
+    await user.click(screen.getByRole("button", { name: "Codex" }));
 
     expect(
       screen.getByRole("heading", { name: "Add your first Codex provider" }),

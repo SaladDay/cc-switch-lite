@@ -13,7 +13,8 @@ full CC Switch application.
 
 ## Development
 
-Requirements: Node.js 20+, pnpm 10, the stable Rust toolchain, and the platform
+Requirements: Node.js 20.19 or newer in the 20.x line, or Node.js 22.12+;
+pnpm 10, the stable Rust toolchain, and the platform
 dependencies required by Tauri 2.
 
 ```sh

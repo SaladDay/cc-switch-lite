@@ -88,7 +88,6 @@ export default function App() {
         <nav
           className="inline-flex rounded-xl bg-muted p-1"
           aria-label="Applications"
-          role="tablist"
         >
           {APPS.map((app) => {
             const Icon = app.icon;
@@ -97,8 +96,7 @@ export default function App() {
               <button
                 key={app.id}
                 type="button"
-                role="tab"
-                aria-selected={selected}
+                aria-pressed={selected}
                 onClick={() => selectApp(app.id)}
                 className={`inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg px-4 text-sm font-medium transition-colors duration-200 ${
                   selected

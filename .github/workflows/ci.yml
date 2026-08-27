@@ -27,6 +27,7 @@ jobs:
       - run: pnpm format:check
       - run: pnpm test
       - run: pnpm build
+      - run: pnpm audit --audit-level moderate
 
   backend:
     runs-on: macos-latest
@@ -35,7 +36,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: mkdir -p dist
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+      - name: Enable pnpm
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: corepack enable && corepack install
+      - run: pnpm install --frozen-lockfile
       - run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
-      - run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
+      - run: pnpm tauri build --no-bundle --ci
