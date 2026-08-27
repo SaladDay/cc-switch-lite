@@ -1,0 +1,19 @@
+[package]
+name = "cc-switch-lite"
+version = "0.1.0-alpha.1"
+description = "A focused provider switcher for Claude Code and Codex"
+license = "MIT"
+repository = "https://github.com/SaladDay/cc-switch-lite"
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "cc_switch_lite_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.4.0", features = [] }
+
+[dependencies]
+cc-switch-core = { git = "https://github.com/SaladDay/cc-switch-core", rev = "14fd610b5e25c4b1b431eda0e5744863da2ea683" }
+tauri = { version = "2.8.2", features = [] }
