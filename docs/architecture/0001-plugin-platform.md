@@ -49,6 +49,13 @@ manifest must carry at least:
 Plugin IDs and contributed identifiers are stable storage keys. Display names
 belong in locale resources and may change without migrating user data.
 
+The publisher signs a canonical manifest envelope that binds the plugin ID,
+version, compatible host API range, requested capabilities, entry points, and
+the digest of every packaged file. A registry may only reference the digest of
+that signed envelope and its package; it cannot override signed manifest
+fields. The canonical encoding and signature algorithms are frozen with the
+first manifest schema.
+
 ## Capabilities
 
 A component starts without filesystem, network, environment-variable, process,
@@ -130,9 +137,12 @@ adapter identifier, and the API world used to produce it.
 
 Schema migrations are plugin exports invoked and supervised by the host. A
 migration receives an immutable stored record and its current schema version,
-then returns a replacement record or an operation plan for host validation. It
-runs without direct filesystem access and under the same capability, time, and
-size limits as every other plugin call.
+then returns only a replacement stored record for host validation. A migration
+cannot produce an `OperationPlan` or mutate live configuration. It runs without
+direct filesystem access and under the same capability, time, and size limits
+as every other plugin call. If the active provider needs to be projected after
+activation, the host requests and executes a normal `OperationPlan` as a
+separate recoverable transaction.
 
 Activation follows a fixed transaction: the host installs and verifies the new
 plugin without activating it, snapshots the current plugin data and lockfile,
