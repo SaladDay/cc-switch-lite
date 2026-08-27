@@ -54,10 +54,13 @@ export interface ProviderDraft {
 export interface ProviderChanges {
   name: string;
   settings: Record<string, string>;
+  adapter?: AdapterReference;
 }
 
-export interface ProviderUpdate extends ProviderChanges {
+export interface ProviderUpdate {
   expectedRevision: number;
+  name: string;
+  settings: Record<string, string>;
 }
 
 export interface CommandError {

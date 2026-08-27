@@ -8,6 +8,7 @@ import type {
   CurrentProvider,
   ProviderRecord,
 } from "./lib/provider-types";
+import type { MarketplacePlugin } from "./lib/plugin-types";
 
 const api = vi.hoisted(() => ({
   listAdapters: vi.fn(),
@@ -20,9 +21,19 @@ const api = vi.hoisted(() => ({
   currentProviders: vi.fn(),
 }));
 
+const pluginApi = vi.hoisted(() => ({
+  listRegistries: vi.fn(),
+  saveRegistry: vi.fn(),
+  removeRegistry: vi.fn(),
+  refresh: vi.fn(),
+  listInstalled: vi.fn(),
+  install: vi.fn(),
+  uninstall: vi.fn(),
+}));
+
 vi.mock("./lib/providers", async (importOriginal) => {
   const original = await importOriginal<typeof import("./lib/providers")>();
-  return { ...original, providersApi: api };
+  return { ...original, providersApi: api, pluginsApi: pluginApi };
 });
 
 const adapters: AdapterDescriptor[] = [
@@ -87,6 +98,35 @@ const workProvider: ProviderRecord = {
   settings: { apiKey: "secret", baseUrl: "https://proxy.example.com" },
 };
 
+const marketplacePlugin: MarketplacePlugin = {
+  registryId: "registry-1",
+  registryRevision: 3,
+  registryLabel: "Community",
+  manifestSha256: "a".repeat(64),
+  packageSha256: "b".repeat(64),
+  publisherKeySha256: "d".repeat(64),
+  permissions: [
+    "Read Claude Code user settings",
+    "Change Claude Code provider routing",
+  ],
+  manifest: {
+    id: "dev.example.claude",
+    version: "1.0.0",
+    name: "Example Claude adapter",
+    description: "Adds an example provider form.",
+    publisher: {
+      id: "dev.example",
+      keyId: "release-1",
+      algorithm: "ed25519",
+    },
+    adapters: [],
+    capabilities: [
+      { kind: "readClaudeSettings" },
+      { kind: "writeClaudeSettings" },
+    ],
+  },
+};
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((complete) => {
@@ -109,6 +149,13 @@ describe("App", () => {
     api.delete.mockResolvedValue(undefined);
     api.switch.mockResolvedValue(undefined);
     api.currentProviders.mockResolvedValue([]);
+    for (const mock of Object.values(pluginApi)) mock.mockReset();
+    pluginApi.listRegistries.mockResolvedValue([]);
+    pluginApi.listInstalled.mockResolvedValue([]);
+    pluginApi.refresh.mockResolvedValue({
+      plugins: [],
+      failures: [],
+    });
   });
 
   it("shows only the two applications in the Lite boundary", async () => {
@@ -206,6 +253,199 @@ describe("App", () => {
     expect(screen.getByRole("heading", { name: "Work" })).toBeVisible();
   });
 
+  it("creates a provider with an installed plugin adapter", async () => {
+    const user = userEvent.setup();
+    const pluginAdapter: AdapterDescriptor = {
+      ...adapters[0],
+      displayName: "Example Claude adapter",
+      reference: {
+        ...adapters[0].reference,
+        pluginId: "dev.example.claude",
+        pluginVersion: "1.0.0",
+        adapterId: "example.claude",
+      },
+    };
+    api.listAdapters.mockResolvedValue([...adapters, pluginAdapter]);
+    api.create.mockResolvedValue({
+      ...workProvider,
+      adapter: pluginAdapter.reference,
+    });
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Add Claude Code provider" }),
+    );
+    const dialog = screen.getByRole("dialog", { name: "Add provider" });
+    await user.selectOptions(within(dialog).getByLabelText("Adapter"), "1");
+    await user.type(within(dialog).getByLabelText("Provider name"), "Plugin");
+    await user.type(within(dialog).getByLabelText("API key"), "secret");
+    await user.click(
+      within(dialog).getByRole("button", { name: "Save provider" }),
+    );
+
+    await waitFor(() =>
+      expect(api.create).toHaveBeenCalledWith(
+        expect.objectContaining({ adapter: pluginAdapter.reference }),
+      ),
+    );
+  });
+
+  it("requires explicit permission approval before installing a plugin", async () => {
+    const user = userEvent.setup();
+    pluginApi.refresh.mockResolvedValue({
+      plugins: [marketplacePlugin],
+      failures: [],
+    });
+    pluginApi.install.mockResolvedValue({
+      id: marketplacePlugin.manifest.id,
+      version: marketplacePlugin.manifest.version,
+      registryId: marketplacePlugin.registryId,
+      packageSha256: marketplacePlugin.packageSha256,
+      manifestSha256: marketplacePlugin.manifestSha256,
+      publisher: marketplacePlugin.manifest.publisher,
+      publisherKeySha256: marketplacePlugin.publisherKeySha256,
+      grantedCapabilities: marketplacePlugin.manifest.capabilities,
+    });
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Open plugin marketplace" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Plugin marketplace",
+    });
+    const install = within(dialog).getByRole("button", { name: "Install" });
+    expect(install).toBeDisabled();
+    await user.click(
+      within(dialog).getByLabelText(
+        "Approve exactly these permissions for this signed version",
+      ),
+    );
+    await user.click(install);
+
+    await waitFor(() =>
+      expect(pluginApi.install).toHaveBeenCalledWith(
+        {
+          registryId: marketplacePlugin.registryId,
+          registryRevision: marketplacePlugin.registryRevision,
+          pluginId: marketplacePlugin.manifest.id,
+          version: marketplacePlugin.manifest.version,
+          manifestSha256: marketplacePlugin.manifestSha256,
+          packageSha256: marketplacePlugin.packageSha256,
+          publisherKeySha256: marketplacePlugin.publisherKeySha256,
+        },
+        marketplacePlugin.manifest.capabilities,
+      ),
+    );
+  });
+
+  it("clears permission approval when the signed manifest changes", async () => {
+    const user = userEvent.setup();
+    const changed = {
+      ...marketplacePlugin,
+      manifestSha256: "c".repeat(64),
+    };
+    pluginApi.refresh
+      .mockResolvedValueOnce({ plugins: [marketplacePlugin], failures: [] })
+      .mockResolvedValueOnce({ plugins: [changed], failures: [] });
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Open plugin marketplace" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Plugin marketplace",
+    });
+    const approval = within(dialog).getByLabelText(
+      "Approve exactly these permissions for this signed version",
+    );
+    await user.click(approval);
+    expect(approval).toBeChecked();
+
+    await user.click(within(dialog).getByRole("button", { name: "Refresh" }));
+
+    await waitFor(() => expect(pluginApi.refresh).toHaveBeenCalledTimes(2));
+    expect(
+      within(dialog).getByLabelText(
+        "Approve exactly these permissions for this signed version",
+      ),
+    ).not.toBeChecked();
+    expect(
+      within(dialog).getByRole("button", { name: "Install" }),
+    ).toBeDisabled();
+  });
+
+  it("does not treat a different source as a plugin update", async () => {
+    const user = userEvent.setup();
+    const installed = {
+      id: marketplacePlugin.manifest.id,
+      version: "0.9.0",
+      registryId: "registry-other",
+      packageSha256: "e".repeat(64),
+      manifestSha256: "f".repeat(64),
+      publisher: marketplacePlugin.manifest.publisher,
+      publisherKeySha256: marketplacePlugin.publisherKeySha256,
+      grantedCapabilities: marketplacePlugin.manifest.capabilities,
+    };
+    pluginApi.listInstalled.mockResolvedValue([installed]);
+    pluginApi.refresh.mockResolvedValue({
+      plugins: [{ ...marketplacePlugin, installed }],
+      failures: [],
+    });
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Open plugin marketplace" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Plugin marketplace",
+    });
+
+    expect(
+      within(dialog).getByRole("button", { name: "ID collision" }),
+    ).toBeDisabled();
+    expect(
+      within(dialog).queryByLabelText(
+        "Approve exactly these permissions for this signed version",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("can remove an installed plugin after its source disappears", async () => {
+    const user = userEvent.setup();
+    pluginApi.listInstalled.mockResolvedValue([
+      {
+        id: marketplacePlugin.manifest.id,
+        version: marketplacePlugin.manifest.version,
+        registryId: marketplacePlugin.registryId,
+        packageSha256: marketplacePlugin.packageSha256,
+        manifestSha256: marketplacePlugin.manifestSha256,
+        publisher: marketplacePlugin.manifest.publisher,
+        publisherKeySha256: marketplacePlugin.publisherKeySha256,
+        grantedCapabilities: marketplacePlugin.manifest.capabilities,
+      },
+    ]);
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Open plugin marketplace" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Plugin marketplace",
+    });
+    expect(
+      within(dialog).getByText(marketplacePlugin.manifest.id),
+    ).toBeVisible();
+
+    await user.click(within(dialog).getByRole("button", { name: "Remove" }));
+
+    await waitFor(() =>
+      expect(pluginApi.uninstall).toHaveBeenCalledWith(
+        marketplacePlugin.manifest.id,
+      ),
+    );
+  });
+
   it("edits and deletes a stored provider without switching live config", async () => {
     const user = userEvent.setup();
     api.list.mockResolvedValue([workProvider]);
@@ -282,6 +522,43 @@ describe("App", () => {
     expect(screen.getByRole("status")).toHaveTextContent(
       "Imported the Claude Code user configuration.",
     );
+  });
+
+  it("imports through a selected plugin adapter", async () => {
+    const user = userEvent.setup();
+    const pluginAdapter: AdapterDescriptor = {
+      ...adapters[0],
+      displayName: "Example Claude adapter",
+      reference: {
+        ...adapters[0].reference,
+        pluginId: marketplacePlugin.manifest.id,
+        pluginVersion: marketplacePlugin.manifest.version,
+        adapterId: "example.claude",
+      },
+    };
+    const imported = { ...workProvider, adapter: pluginAdapter.reference };
+    api.listAdapters.mockResolvedValue([...adapters, pluginAdapter]);
+    api.importLive.mockResolvedValue(imported);
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Import Claude Code user configuration",
+      }),
+    );
+    const dialog = screen.getByRole("dialog", { name: "Import provider" });
+    await user.selectOptions(within(dialog).getByLabelText("Adapter"), "1");
+    await user.click(
+      within(dialog).getByRole("button", { name: "Import provider" }),
+    );
+
+    await waitFor(() =>
+      expect(api.importLive).toHaveBeenCalledWith(
+        "claude",
+        pluginAdapter.reference,
+      ),
+    );
+    expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
   });
 
   it("switches a stored provider and marks it current", async () => {

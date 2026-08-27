@@ -9,16 +9,19 @@ import {
   Moon,
   Pencil,
   Plus,
-  Settings,
+  Store,
   Sun,
   Trash2,
   type LucideIcon,
 } from "lucide-react";
 
 import { DeleteProviderDialog } from "./components/DeleteProviderDialog";
+import { ImportProviderDialog } from "./components/ImportProviderDialog";
+import { MarketplaceDialog } from "./components/MarketplaceDialog";
 import { ProviderDialog } from "./components/ProviderDialog";
 import type {
   AdapterDescriptor,
+  AdapterReference,
   AppId,
   CurrentProvider,
   JsonValue,
@@ -135,6 +138,8 @@ export default function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [currentError, setCurrentError] = useState<string | null>(null);
   const [editing, setEditing] = useState<ProviderRecord | "new" | null>(null);
+  const [marketplaceOpen, setMarketplaceOpen] = useState(false);
+  const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [deleting, setDeleting] = useState<ProviderRecord | null>(null);
   const [mutationBusy, setMutationBusy] = useState(false);
   const [mutationError, setMutationError] = useState<string | null>(null);
@@ -155,7 +160,11 @@ export default function App() {
   const importLabel = isClaude
     ? "Import Claude Code user configuration"
     : `Import current ${definition.label} configuration`;
-  const adapter = adapters.find((item) => item.appId === activeApp);
+  const activeAdapters = adapters.filter((item) => item.appId === activeApp);
+  const adapter =
+    activeAdapters.find(
+      (item) => item.reference.pluginId === "org.cc-switch.builtin",
+    ) ?? activeAdapters[0];
   const editingAdapter =
     editing === "new"
       ? adapter
@@ -163,6 +172,15 @@ export default function App() {
         ? adapters.find((item) => adapterMatchesProvider(item, editing))
         : undefined;
   const ActiveIcon = definition.icon;
+
+  const reloadAdapters = useCallback(async () => {
+    try {
+      setAdapters(await providersApi.listAdapters());
+      setAdapterError(null);
+    } catch (error) {
+      setAdapterError(errorMessage(error));
+    }
+  }, []);
 
   const refreshCurrent = useCallback(
     async (app: AppId, showError = true): Promise<boolean> => {
@@ -264,6 +282,7 @@ export default function App() {
     setActiveApp(app);
     setEditing(null);
     setDeleting(null);
+    setImportDialogOpen(false);
     setMutationError(null);
     setLiveError(null);
     setCurrentError(null);
@@ -283,17 +302,20 @@ export default function App() {
     setMutationError(null);
     try {
       if (editing === "new") {
-        if (!adapter) return;
+        const selectedAdapter = update.adapter ?? adapter?.reference;
+        if (!selectedAdapter) return;
         const created = await providersApi.create({
           appId: activeApp,
-          adapter: adapter.reference,
-          ...update,
+          adapter: selectedAdapter,
+          name: update.name,
+          settings: update.settings,
         });
         setProviders((current) => [...current, created]);
       } else {
         const updated = await providersApi.update(editing.id, {
-          ...update,
           expectedRevision: editing.revision,
+          name: update.name,
+          settings: update.settings,
         });
         setProviders((current) =>
           current.map((provider) =>
@@ -341,12 +363,14 @@ export default function App() {
     }
   };
 
-  const importLiveProvider = async () => {
+  const importLiveProvider = async (selectedAdapter?: AdapterReference) => {
     setLiveBusy("import");
     setLiveError(null);
     setNotice(null);
     try {
-      const imported = await providersApi.importLive(activeApp);
+      const imported = selectedAdapter
+        ? await providersApi.importLive(activeApp, selectedAdapter)
+        : await providersApi.importLive(activeApp);
       setProviders((current) => [...current, imported]);
       await refreshCurrent(activeApp);
       setNotice(
@@ -354,11 +378,21 @@ export default function App() {
           ? "Imported the Claude Code user configuration."
           : `Imported the current ${definition.label} configuration.`,
       );
+      setImportDialogOpen(false);
     } catch (error) {
       setLiveError(errorMessage(error));
     } finally {
       setLiveBusy(null);
     }
+  };
+
+  const beginImport = () => {
+    setLiveError(null);
+    if (activeAdapters.length > 1) {
+      setImportDialogOpen(true);
+      return;
+    }
+    void importLiveProvider();
   };
 
   const switchProvider = async (provider: ProviderRecord) => {
@@ -438,17 +472,18 @@ export default function App() {
           </button>
           <button
             type="button"
-            disabled
-            className="inline-flex size-9 items-center justify-center rounded-lg text-muted-foreground opacity-50"
-            aria-label="Settings are not available yet"
-            title="Settings are added with the plugin marketplace"
+            disabled={mutationBusy || liveBusy !== null}
+            onClick={() => setMarketplaceOpen(true)}
+            className="inline-flex size-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
+            aria-label="Open plugin marketplace"
+            title="Plugin marketplace"
           >
-            <Settings className="size-4" />
+            <Store className="size-4" />
           </button>
           <button
             type="button"
             disabled={!adapter || loading || mutationBusy || liveBusy !== null}
-            onClick={importLiveProvider}
+            onClick={beginImport}
             className="ml-2 inline-flex h-10 items-center gap-2 rounded-xl border border-border px-3 text-sm font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
             aria-label={importLabel}
           >
@@ -541,7 +576,7 @@ export default function App() {
               <button
                 type="button"
                 disabled={!adapter || liveBusy !== null}
-                onClick={importLiveProvider}
+                onClick={beginImport}
                 className="inline-flex h-10 items-center gap-2 rounded-xl border border-border px-4 text-sm font-medium transition-colors hover:bg-muted disabled:opacity-50"
               >
                 {liveBusy === "import" ? (
@@ -691,12 +726,31 @@ export default function App() {
       {editing && editingAdapter && (
         <ProviderDialog
           key={editing === "new" ? `${activeApp}-new` : editing.id}
-          adapter={editingAdapter}
+          adapters={editing === "new" ? activeAdapters : [editingAdapter]}
           provider={editing === "new" ? undefined : editing}
           busy={mutationBusy}
           error={mutationError}
           onCancel={() => setEditing(null)}
           onSave={saveProvider}
+        />
+      )}
+
+      {marketplaceOpen && (
+        <MarketplaceDialog
+          onCancel={() => setMarketplaceOpen(false)}
+          onChanged={() => void reloadAdapters()}
+        />
+      )}
+
+      {importDialogOpen && (
+        <ImportProviderDialog
+          adapters={activeAdapters}
+          busy={liveBusy === "import"}
+          error={liveError}
+          onCancel={() => setImportDialogOpen(false)}
+          onImport={(selectedAdapter) =>
+            void importLiveProvider(selectedAdapter)
+          }
         />
       )}
 

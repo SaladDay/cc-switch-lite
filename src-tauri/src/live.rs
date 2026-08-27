@@ -14,9 +14,11 @@ use toml_edit::{value, DocumentMut, Item, Table};
 
 use crate::{
     operation::{
-        read_optional, sha256, ContentExpectation, LivePaths, LogicalTarget, OperationError,
-        OperationExecutor, OperationPlan, PlannedWrite, OPERATION_CONTRACT_MAJOR,
+        read_optional, read_optional_no_follow, sha256, ContentExpectation, LivePaths,
+        LogicalTarget, OperationError, OperationExecutor, OperationPlan, PlannedWrite,
+        OPERATION_CONTRACT_MAJOR,
     },
+    plugin::{PluginCapability, PluginRoute, PluginSlot, PluginSnapshot},
     provider::{
         adapter_for_reference, built_in_adapters, validate_settings, CurrentProvider,
         ProviderDraft, ProviderRecord,
@@ -48,6 +50,7 @@ const CLAUDE_ENV_CONFLICT_KEYS: [&str; 18] = [
     "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
     "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
 ];
+const MAX_PLUGIN_SNAPSHOT_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -282,6 +285,83 @@ impl LiveConfig {
                 .filter(|provider| managed_settings_match(app_id, &provider.settings, &live))
                 .map(CurrentProvider::from)
                 .collect())
+        })
+    }
+
+    pub fn with_plugin_snapshots<T, E>(
+        &self,
+        app_id: &str,
+        capabilities: &[PluginCapability],
+        action: impl FnOnce(Vec<PluginSnapshot>) -> Result<T, E>,
+    ) -> Result<Result<T, E>, LiveError> {
+        self.with_lock(|| {
+            let paths = self.paths();
+            let snapshots = plugin_snapshots(&paths, app_id, capabilities)?;
+            Ok(action(snapshots))
+        })
+    }
+
+    pub fn execute_plugin_route<E>(
+        &self,
+        provider: &ProviderRecord,
+        capabilities: &[PluginCapability],
+        router: impl FnOnce(Vec<PluginSnapshot>) -> Result<PluginRoute, E>,
+    ) -> Result<Result<(), E>, LiveError> {
+        let app_id = provider.app_id.as_str();
+        self.with_lock(|| {
+            let target = match app_id {
+                "claude" => LogicalTarget::ClaudeSettings,
+                "codex" => LogicalTarget::CodexConfig,
+                _ => {
+                    return Err(LiveError::InvalidProvider(
+                        "application is not available in Lite".to_owned(),
+                    ));
+                }
+            };
+            if !plugin_can_write(capabilities, target) {
+                return Err(LiveError::InvalidProvider(
+                    "plugin adapter lacks its approved provider-routing capability".to_owned(),
+                ));
+            }
+            let paths = self.paths();
+            let snapshots = plugin_snapshots(&paths, app_id, capabilities)?;
+            let route = match router(snapshots) {
+                Ok(route) => route,
+                Err(error) => return Ok(Err(error)),
+            };
+            let mut routed = provider.clone();
+            routed.settings = route_settings(route);
+            let descriptor = built_in_adapters()
+                .into_iter()
+                .find(|adapter| adapter.app_id == app_id)
+                .ok_or_else(|| {
+                    LiveError::InvalidProvider("built-in route adapter is unavailable".to_owned())
+                })?;
+            validate_settings(&descriptor, &routed.settings).map_err(LiveError::InvalidProvider)?;
+
+            let (paths, plan) = match app_id {
+                "claude" => {
+                    let paths = paths.resolved_for_write(target)?;
+                    let original = read_optional(&paths.claude_settings)?;
+                    let plan = Self::claude_plan(original.as_deref(), &routed)?;
+                    (paths, plan)
+                }
+                "codex" => {
+                    let paths = paths.resolved_for_write(target)?;
+                    let original = read_optional(&paths.codex_config)?;
+                    let stored_ownership = self.read_ownership()?;
+                    let needs_save = stored_ownership.is_none();
+                    let ownership = stored_ownership.unwrap_or_else(CodexRouteOwnership::new);
+                    let plan = Self::codex_plan(original.as_deref(), &routed, &ownership)?;
+                    if needs_save {
+                        self.write_ownership(&ownership)?;
+                    }
+                    (paths, plan)
+                }
+                _ => unreachable!(),
+            };
+            OperationExecutor::new(&paths).execute(&plan)?;
+            Ok(Ok(()))
         })
     }
 
@@ -666,6 +746,107 @@ impl LiveConfig {
         })?;
         Ok(lock)
     }
+}
+
+fn plugin_snapshots(
+    paths: &LivePaths,
+    app_id: &str,
+    capabilities: &[PluginCapability],
+) -> Result<Vec<PluginSnapshot>, LiveError> {
+    let allowed = |capability| capabilities.contains(&capability);
+    let requested = match app_id {
+        "claude" => vec![(
+            PluginCapability::ReadClaudeSettings,
+            PluginSlot::ClaudeSettings,
+            &paths.claude_settings,
+        )],
+        "codex" => vec![
+            (
+                PluginCapability::ReadCodexConfig,
+                PluginSlot::CodexConfig,
+                &paths.codex_config,
+            ),
+            (
+                PluginCapability::ReadCodexAuth,
+                PluginSlot::CodexAuth,
+                &paths.codex_auth,
+            ),
+        ],
+        _ => {
+            return Err(LiveError::InvalidProvider(
+                "application is not available in Lite".to_owned(),
+            ));
+        }
+    };
+    requested
+        .into_iter()
+        .filter(|(capability, _, _)| allowed(*capability))
+        .map(|(_, slot, path)| {
+            let contents = if slot == PluginSlot::CodexAuth {
+                plugin_codex_api_key_snapshot(path)?
+            } else {
+                read_optional_no_follow(path, MAX_PLUGIN_SNAPSHOT_BYTES)?
+            };
+            let digest = contents.as_deref().map(sha256);
+            let contents = contents
+                .map(|contents| {
+                    String::from_utf8(contents).map_err(|_| {
+                        LiveError::InvalidConfig(
+                            "plugin-readable live configuration is not UTF-8".to_owned(),
+                        )
+                    })
+                })
+                .transpose()?;
+            Ok(PluginSnapshot {
+                slot,
+                contents,
+                digest,
+            })
+        })
+        .collect()
+}
+
+fn plugin_codex_api_key_snapshot(path: &Path) -> Result<Option<Vec<u8>>, LiveError> {
+    let Some(contents) = read_optional_no_follow(path, MAX_PLUGIN_SNAPSHOT_BYTES)? else {
+        return Ok(None);
+    };
+    let auth = parse_json_object(Some(&contents), "Codex auth.json")?;
+    if !matches!(
+        string_field(&auth, "auth_mode", true)?,
+        None | Some("apikey")
+    ) || codex_auth_has_other_credentials(&auth)
+    {
+        return Ok(None);
+    }
+    let Some(api_key) = secret_string_field(&auth, "OPENAI_API_KEY", true)?
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    serde_json::to_vec(&serde_json::json!({ "OPENAI_API_KEY": api_key }))
+        .map(Some)
+        .map_err(|_| LiveError::InvalidConfig("Codex API-key snapshot is invalid".to_owned()))
+}
+
+fn plugin_can_write(capabilities: &[PluginCapability], target: LogicalTarget) -> bool {
+    match target {
+        LogicalTarget::ClaudeSettings => {
+            capabilities.contains(&PluginCapability::WriteClaudeSettings)
+        }
+        LogicalTarget::CodexConfig => capabilities.contains(&PluginCapability::WriteCodexConfig),
+    }
+}
+
+fn route_settings(route: PluginRoute) -> Map<String, Value> {
+    let mut settings = Map::new();
+    settings.insert("apiKey".to_owned(), Value::String(route.api_key));
+    if let Some(base_url) = route.base_url {
+        settings.insert("baseUrl".to_owned(), Value::String(base_url));
+    }
+    if let Some(model) = route.model {
+        settings.insert("model".to_owned(), Value::String(model));
+    }
+    settings
 }
 
 fn parse_json_object(
@@ -1435,6 +1616,38 @@ mod tests {
     }
 
     #[test]
+    fn plugin_auth_snapshot_withholds_oauth_and_sanitizes_api_key_mode() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let live = live(directory.path());
+        let paths = live.paths();
+        fs::create_dir_all(paths.codex_auth.parent().unwrap()).unwrap();
+        fs::write(
+            &paths.codex_auth,
+            r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":"must-not-use","tokens":{"access_token":"oauth"}}"#,
+        )
+        .unwrap();
+
+        let snapshots =
+            plugin_snapshots(&paths, "codex", &[PluginCapability::ReadCodexAuth]).unwrap();
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].contents, None);
+        assert_eq!(snapshots[0].digest, None);
+
+        fs::write(
+            &paths.codex_auth,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"secret","last_refresh":null}"#,
+        )
+        .unwrap();
+        let snapshots =
+            plugin_snapshots(&paths, "codex", &[PluginCapability::ReadCodexAuth]).unwrap();
+        assert_eq!(
+            snapshots[0].contents.as_deref(),
+            Some(r#"{"OPENAI_API_KEY":"secret"}"#)
+        );
+    }
+
+    #[test]
     fn import_accepts_explicit_codex_api_key_mode() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let live = live(directory.path());
@@ -1736,5 +1949,105 @@ mod tests {
         let error = live.import_draft("codex").unwrap_err().to_string();
 
         assert!(!error.contains("must-not-echo"));
+    }
+
+    #[test]
+    fn plugin_route_cannot_write_without_approval() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let live = live(directory.path());
+        let path = live.paths().claude_settings;
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{}").unwrap();
+        let route = PluginRoute {
+            api_key: "secret".to_owned(),
+            base_url: None,
+            model: None,
+        };
+
+        let provider = provider("claude", json!({"apiKey": "stored"}));
+        let result = live.execute_plugin_route::<()>(&provider, &[], |_| Ok(route));
+
+        assert!(matches!(result, Err(LiveError::InvalidProvider(_))));
+        assert_eq!(fs::read_to_string(path).unwrap(), "{}");
+    }
+
+    #[test]
+    fn approved_plugin_route_is_merged_by_the_host() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let live = live(directory.path());
+        let path = live.paths().claude_settings;
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"hooks":{"SessionStart":[{"command":"keep"}]}}"#).unwrap();
+        let route = PluginRoute {
+            api_key: "secret".to_owned(),
+            base_url: Some("https://gateway.example".to_owned()),
+            model: None,
+        };
+        let provider = provider("claude", json!({"apiKey": "stored"}));
+
+        live.execute_plugin_route::<()>(
+            &provider,
+            &[PluginCapability::WriteClaudeSettings],
+            |_| Ok(route),
+        )
+        .expect("live operation")
+        .expect("plugin router");
+
+        let written: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(written["hooks"]["SessionStart"][0]["command"], "keep");
+        assert_eq!(written["env"]["ANTHROPIC_API_KEY"], "secret");
+        assert_eq!(
+            written["env"]["ANTHROPIC_BASE_URL"],
+            "https://gateway.example"
+        );
+    }
+
+    #[test]
+    fn plugin_route_values_are_validated_by_the_host() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let live = live(directory.path());
+        let path = live.paths().claude_settings;
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{}").unwrap();
+        let route = PluginRoute {
+            api_key: "secret".to_owned(),
+            base_url: Some("http://remote.example".to_owned()),
+            model: None,
+        };
+        let provider = provider("claude", json!({"apiKey": "stored"}));
+
+        let result = live.execute_plugin_route::<()>(
+            &provider,
+            &[PluginCapability::WriteClaudeSettings],
+            |_| Ok(route),
+        );
+
+        assert!(matches!(result, Err(LiveError::InvalidProvider(_))));
+        assert_eq!(fs::read_to_string(path).unwrap(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_snapshot_rejects_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let live = live(directory.path());
+        let path = live.paths().claude_settings;
+        let secret = directory.path().join("secret.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&secret, r#"{"secret":"must-not-read"}"#).unwrap();
+        symlink(&secret, &path).unwrap();
+
+        let result = live.with_plugin_snapshots::<(), ()>(
+            "claude",
+            &[PluginCapability::ReadClaudeSettings],
+            |_| panic!("plugin must not receive a symlink target"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(LiveError::Operation(OperationError::InvalidTarget(_)))
+        ));
     }
 }

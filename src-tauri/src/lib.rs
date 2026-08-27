@@ -1,12 +1,19 @@
 mod live;
 mod operation;
+mod plugin;
 mod provider;
 mod store;
 
+use std::collections::{HashMap, HashSet};
+
 use live::{LiveConfig, LiveError};
+use plugin::{
+    InstallSelection, InstalledPlugin, MarketplaceCatalog, PluginCapability, PluginError,
+    PluginManager, PluginRequest, PluginResponse, RegistryDraft, RegistrySource,
+};
 use provider::{
-    built_in_adapters, AdapterDescriptor, CurrentProvider, ProviderDraft, ProviderRecord,
-    ProviderUpdate,
+    built_in_adapters, AdapterDescriptor, AdapterReference, CurrentProvider, ProviderDraft,
+    ProviderRecord, ProviderUpdate, BUILTIN_PLUGIN_ID, CONTRACT_MAJOR,
 };
 use serde::Serialize;
 use store::{ProviderStore, StoreError};
@@ -52,11 +59,22 @@ impl From<LiveError> for CommandError {
     }
 }
 
+impl From<PluginError> for CommandError {
+    fn from(error: PluginError) -> Self {
+        Self {
+            code: error.code(),
+            message: error.to_string(),
+        }
+    }
+}
+
 type CommandResult<T> = Result<T, CommandError>;
+const MAX_CURRENT_CALLS: usize = 32;
+const MAX_CURRENT_CALLS_PER_PLUGIN: usize = 8;
 
 #[tauri::command]
-fn list_provider_adapters() -> Vec<AdapterDescriptor> {
-    built_in_adapters()
+fn list_provider_adapters(plugins: State<'_, PluginManager>) -> Vec<AdapterDescriptor> {
+    plugins.adapters()
 }
 
 #[tauri::command]
@@ -70,18 +88,36 @@ fn list_providers(
 #[tauri::command]
 fn create_provider(
     store: State<'_, ProviderStore>,
+    plugins: State<'_, PluginManager>,
     provider: ProviderDraft,
 ) -> CommandResult<ProviderRecord> {
-    store.create(provider).map_err(Into::into)
+    let app_id = provider.app_id.clone();
+    let created = store.create_resolved_from(&app_id, || {
+        let descriptor = plugins
+            .adapter_for_reference(&app_id, &provider.adapter)?
+            .ok_or(PluginError::NotFound)?;
+        plugins.validate_provider(&descriptor, &provider.settings)?;
+        Ok::<_, PluginError>((provider, descriptor))
+    })??;
+    Ok(created)
 }
 
 #[tauri::command]
 fn update_provider(
     store: State<'_, ProviderStore>,
+    plugins: State<'_, PluginManager>,
     id: String,
     provider: ProviderUpdate,
 ) -> CommandResult<ProviderRecord> {
-    store.update(&id, provider).map_err(Into::into)
+    store
+        .update_from(&id, provider, |current, update| {
+            let descriptor = plugins
+                .adapter_for_reference(&current.app_id, &current.adapter)?
+                .ok_or(PluginError::NotFound)?;
+            plugins.validate_provider(&descriptor, &update.settings)?;
+            Ok::<_, PluginError>(descriptor)
+        })?
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -100,38 +136,229 @@ fn delete_provider(
 fn import_live_provider(
     store: State<'_, ProviderStore>,
     live: State<'_, LiveConfig>,
+    plugins: State<'_, PluginManager>,
     app_id: String,
+    adapter: Option<AdapterReference>,
 ) -> CommandResult<ProviderRecord> {
-    store
-        .create_from(&app_id, || live.import_draft(&app_id))?
-        .map_err(Into::into)
+    let reference = match adapter {
+        Some(reference) => reference,
+        None => built_in_adapters()
+            .into_iter()
+            .find(|candidate| candidate.app_id == app_id)
+            .map(|candidate| candidate.reference)
+            .ok_or_else(|| {
+                CommandError::from(PluginError::Invalid(
+                    "application is not available in Lite".to_owned(),
+                ))
+            })?,
+    };
+    let imported = store.create_resolved_from(&app_id, || {
+        let descriptor = plugins
+            .adapter_for_reference(&app_id, &reference)?
+            .ok_or(PluginError::NotFound)?;
+        let draft = if reference.plugin_id == BUILTIN_PLUGIN_ID {
+            live.import_draft(&app_id).map_err(CommandError::from)?
+        } else {
+            let capabilities = plugins.capabilities_for_reference(&app_id, &reference)?;
+            let response = live
+                .with_plugin_snapshots(&app_id, &capabilities, |snapshots| {
+                    plugins.invoke(
+                        &reference,
+                        &PluginRequest::Import {
+                            contract_major: CONTRACT_MAJOR,
+                            app_id: app_id.clone(),
+                            adapter_id: reference.adapter_id.clone(),
+                            snapshots,
+                        },
+                    )
+                })
+                .map_err(CommandError::from)??;
+            match response {
+                PluginResponse::Imported { provider } => provider,
+                _ => return Err(CommandError::from(PluginError::Runtime)),
+            }
+        };
+        if draft.adapter != reference {
+            return Err(CommandError::from(PluginError::Invalid(
+                "imported provider does not use the requested adapter".to_owned(),
+            )));
+        }
+        let mut draft = draft;
+        if reference.plugin_id != BUILTIN_PLUGIN_ID {
+            draft.name = format!("Imported {}", descriptor.display_name);
+        }
+        plugins
+            .validate_provider(&descriptor, &draft.settings)
+            .map_err(CommandError::from)?;
+        Ok::<_, CommandError>((draft, descriptor))
+    })??;
+    Ok(imported)
 }
 
 #[tauri::command]
 fn switch_provider(
     store: State<'_, ProviderStore>,
     live: State<'_, LiveConfig>,
+    plugins: State<'_, PluginManager>,
     app_id: String,
     id: String,
     expected_revision: u64,
 ) -> CommandResult<()> {
-    store
-        .with_provider(&app_id, &id, expected_revision, |provider| {
-            live.switch(provider)
-        })?
-        .map_err(Into::into)
+    store.with_provider(&app_id, &id, expected_revision, |provider| {
+        if provider.adapter.plugin_id == BUILTIN_PLUGIN_ID {
+            return live.switch(provider).map_err(CommandError::from);
+        }
+        let capabilities =
+            plugins.capabilities_for_reference(&provider.app_id, &provider.adapter)?;
+        live.execute_plugin_route(provider, &capabilities, |snapshots| {
+            let response = plugins.invoke(
+                &provider.adapter,
+                &PluginRequest::Plan {
+                    contract_major: CONTRACT_MAJOR,
+                    provider: provider.clone(),
+                    snapshots,
+                },
+            )?;
+            match response {
+                PluginResponse::Routed { route } => Ok(route),
+                _ => Err(PluginError::Runtime),
+            }
+        })
+        .map_err(CommandError::from)?
+        .map_err(CommandError::from)
+    })??;
+    Ok(())
 }
 
 #[tauri::command]
 fn current_providers(
     store: State<'_, ProviderStore>,
     live: State<'_, LiveConfig>,
+    plugins: State<'_, PluginManager>,
     app_id: String,
 ) -> CommandResult<Vec<CurrentProvider>> {
+    let current = store.with_providers(&app_id, |providers| {
+        let built_in = providers
+            .iter()
+            .filter(|provider| provider.adapter.plugin_id == BUILTIN_PLUGIN_ID)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut current = live
+            .current_providers(&app_id, &built_in)
+            .map_err(CommandError::from)?;
+        let mut failed_plugins = HashSet::new();
+        let mut calls_by_plugin = HashMap::<String, usize>::new();
+        let mut total_calls = 0usize;
+        for provider in providers
+            .iter()
+            .filter(|provider| provider.adapter.plugin_id != BUILTIN_PLUGIN_ID)
+        {
+            let plugin_id = provider.adapter.plugin_id.clone();
+            if total_calls >= MAX_CURRENT_CALLS || failed_plugins.contains(&plugin_id) {
+                continue;
+            }
+            let plugin_calls = calls_by_plugin.entry(plugin_id.clone()).or_default();
+            if *plugin_calls >= MAX_CURRENT_CALLS_PER_PLUGIN {
+                continue;
+            }
+            *plugin_calls += 1;
+            total_calls += 1;
+            let matches = (|| {
+                let capabilities =
+                    plugins.capabilities_for_reference(&provider.app_id, &provider.adapter)?;
+                let response = live
+                    .with_plugin_snapshots(&app_id, &capabilities, |snapshots| {
+                        plugins.invoke_current(
+                            &provider.adapter,
+                            &PluginRequest::Current {
+                                contract_major: CONTRACT_MAJOR,
+                                app_id: app_id.clone(),
+                                adapter_id: provider.adapter.adapter_id.clone(),
+                                settings: provider.settings.clone(),
+                                snapshots,
+                            },
+                        )
+                    })
+                    .map_err(CommandError::from)??;
+                match response {
+                    PluginResponse::Current { matches } => Ok(matches),
+                    _ => Err(CommandError::from(PluginError::Runtime)),
+                }
+            })();
+            match matches {
+                Ok(true) => current.push(CurrentProvider::from(provider)),
+                Ok(false) => {}
+                Err(_) => {
+                    failed_plugins.insert(plugin_id);
+                }
+            }
+        }
+        Ok::<_, CommandError>(current)
+    })??;
+    Ok(current)
+}
+
+#[tauri::command]
+fn list_plugin_registries(plugins: State<'_, PluginManager>) -> CommandResult<Vec<RegistrySource>> {
+    plugins.registries().map_err(Into::into)
+}
+
+#[tauri::command]
+fn save_plugin_registry(
+    plugins: State<'_, PluginManager>,
+    registry: RegistryDraft,
+) -> CommandResult<RegistrySource> {
+    plugins.save_registry(registry).map_err(Into::into)
+}
+
+#[tauri::command]
+fn remove_plugin_registry(
+    plugins: State<'_, PluginManager>,
+    id: String,
+    expected_revision: u64,
+) -> CommandResult<()> {
+    plugins
+        .remove_registry(&id, expected_revision)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn refresh_plugin_marketplace(
+    plugins: State<'_, PluginManager>,
+) -> CommandResult<MarketplaceCatalog> {
+    plugins.refresh().await.map_err(Into::into)
+}
+
+#[tauri::command]
+fn list_installed_plugins(
+    plugins: State<'_, PluginManager>,
+) -> CommandResult<Vec<InstalledPlugin>> {
+    plugins.installed().map_err(Into::into)
+}
+
+#[tauri::command]
+async fn install_plugin(
+    store: State<'_, ProviderStore>,
+    plugins: State<'_, PluginManager>,
+    plugin: InstallSelection,
+    approved_capabilities: Vec<PluginCapability>,
+) -> CommandResult<InstalledPlugin> {
+    let prepared = plugins.prepare_install(&plugin).await?;
     store
-        .with_providers(&app_id, |providers| {
-            live.current_providers(&app_id, providers)
+        .with_all_providers(|providers| {
+            plugins.activate(prepared, &approved_capabilities, providers)
         })?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+fn uninstall_plugin(
+    store: State<'_, ProviderStore>,
+    plugins: State<'_, PluginManager>,
+    plugin_id: String,
+) -> CommandResult<()> {
+    store
+        .with_all_providers(|providers| plugins.remove(&plugin_id, providers))?
         .map_err(Into::into)
 }
 
@@ -143,6 +370,7 @@ pub fn run() {
             let store_path = app_data_dir.join("providers.json");
             let home_dir = app.path().home_dir()?;
             app.manage(ProviderStore::new(store_path));
+            app.manage(PluginManager::new(app_data_dir.join("plugins"))?);
             app.manage(LiveConfig::from_home(
                 &home_dir,
                 app_data_dir.join("live-config.lock"),
@@ -159,6 +387,13 @@ pub fn run() {
             import_live_provider,
             switch_provider,
             current_providers,
+            list_plugin_registries,
+            save_plugin_registry,
+            remove_plugin_registry,
+            refresh_plugin_marketplace,
+            list_installed_plugins,
+            install_plugin,
+            uninstall_plugin,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run CC Switch Lite");
@@ -175,7 +410,7 @@ mod tests {
 
     #[test]
     fn built_in_adapters_follow_the_core_application_boundary() {
-        let adapters = list_provider_adapters();
+        let adapters = built_in_adapters();
         let app_ids: Vec<_> = adapters
             .iter()
             .map(|adapter| adapter.app_id.as_str())

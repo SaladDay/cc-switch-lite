@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::provider::adapter_for_reference;
 use crate::provider::{
-    adapter_for_reference, validate_name, validate_settings, ProviderDraft, ProviderRecord,
+    validate_name, validate_settings, AdapterDescriptor, ProviderDraft, ProviderRecord,
     ProviderUpdate,
 };
 
@@ -147,6 +149,20 @@ impl ProviderStore {
         Ok(action(provider))
     }
 
+    pub fn with_all_providers<T, E>(
+        &self,
+        action: impl FnOnce(&[ProviderRecord]) -> Result<T, E>,
+    ) -> Result<Result<T, E>, StoreError> {
+        let _guard = self
+            .gate
+            .try_lock()
+            .map_err(|_| StoreError::LockUnavailable)?;
+        let _file_lock = self.lock_file()?;
+        let file = self.read()?;
+        Ok(action(&file.providers))
+    }
+
+    #[cfg(test)]
     pub fn create(&self, draft: ProviderDraft) -> Result<ProviderRecord, StoreError> {
         let provider = provider_from_draft(draft)?;
 
@@ -161,6 +177,7 @@ impl ProviderStore {
         Ok(provider)
     }
 
+    #[cfg(test)]
     pub fn create_from<E>(
         &self,
         app_id: &str,
@@ -188,7 +205,51 @@ impl ProviderStore {
         Ok(Ok(provider))
     }
 
+    pub fn create_resolved_from<E>(
+        &self,
+        app_id: &str,
+        provider_factory: impl FnOnce() -> Result<(ProviderDraft, AdapterDescriptor), E>,
+    ) -> Result<Result<ProviderRecord, E>, StoreError> {
+        ensure_supported_app(app_id)?;
+        let _guard = self
+            .gate
+            .try_lock()
+            .map_err(|_| StoreError::LockUnavailable)?;
+        let _file_lock = self.lock_file()?;
+        let mut file = self.read()?;
+        let (draft, descriptor) = match provider_factory() {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+        if draft.app_id != app_id || descriptor.app_id != app_id {
+            return Err(StoreError::InvalidProvider(
+                "the provider targets a different application".to_owned(),
+            ));
+        }
+        let provider = provider_from_descriptor(draft, descriptor)?;
+        file.providers.push(provider.clone());
+        self.write(&file)?;
+        Ok(Ok(provider))
+    }
+
+    #[cfg(test)]
     pub fn update(&self, id: &str, update: ProviderUpdate) -> Result<ProviderRecord, StoreError> {
+        self.update_from::<StoreError>(id, update, |provider, _| {
+            adapter_for_reference(&provider.app_id, &provider.adapter).ok_or_else(|| {
+                StoreError::InvalidProvider("the provider adapter is unavailable".to_owned())
+            })
+        })?
+    }
+
+    pub fn update_from<E>(
+        &self,
+        id: &str,
+        update: ProviderUpdate,
+        descriptor_factory: impl FnOnce(
+            &ProviderRecord,
+            &ProviderUpdate,
+        ) -> Result<AdapterDescriptor, E>,
+    ) -> Result<Result<ProviderRecord, E>, StoreError> {
         let name = validate_name(&update.name).map_err(StoreError::InvalidProvider)?;
         let _guard = self
             .gate
@@ -196,18 +257,24 @@ impl ProviderStore {
             .map_err(|_| StoreError::LockUnavailable)?;
         let _file_lock = self.lock_file()?;
         let mut file = self.read()?;
-        let provider = file
+        let index = file
             .providers
-            .iter_mut()
-            .find(|provider| provider.id == id)
+            .iter()
+            .position(|provider| provider.id == id)
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
-        if provider.revision != update.expected_revision {
+        if file.providers[index].revision != update.expected_revision {
             return Err(StoreError::Conflict(id.to_owned()));
         }
-        let descriptor =
-            adapter_for_reference(&provider.app_id, &provider.adapter).ok_or_else(|| {
-                StoreError::InvalidProvider("the provider adapter is unavailable".to_owned())
-            })?;
+        let descriptor = match descriptor_factory(&file.providers[index], &update) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return Ok(Err(error)),
+        };
+        let provider = &mut file.providers[index];
+        if descriptor.app_id != provider.app_id || descriptor.reference != provider.adapter {
+            return Err(StoreError::InvalidProvider(
+                "the resolved adapter does not own this provider".to_owned(),
+            ));
+        }
         validate_settings(&descriptor, &update.settings).map_err(StoreError::InvalidProvider)?;
 
         provider.name = name;
@@ -218,7 +285,7 @@ impl ProviderStore {
             .ok_or_else(|| StoreError::InvalidStore("provider revision overflow".to_owned()))?;
         let updated = provider.clone();
         self.write(&file)?;
-        Ok(updated)
+        Ok(Ok(updated))
     }
 
     pub fn delete(&self, app_id: &str, id: &str, expected_revision: u64) -> Result<(), StoreError> {
@@ -335,10 +402,23 @@ impl ProviderStore {
     }
 }
 
+#[cfg(test)]
 fn provider_from_draft(draft: ProviderDraft) -> Result<ProviderRecord, StoreError> {
     let descriptor = adapter_for_reference(&draft.app_id, &draft.adapter).ok_or_else(|| {
         StoreError::InvalidProvider("the selected adapter is not available".to_owned())
     })?;
+    provider_from_descriptor(draft, descriptor)
+}
+
+fn provider_from_descriptor(
+    draft: ProviderDraft,
+    descriptor: AdapterDescriptor,
+) -> Result<ProviderRecord, StoreError> {
+    if draft.app_id != descriptor.app_id || draft.adapter != descriptor.reference {
+        return Err(StoreError::InvalidProvider(
+            "the selected adapter does not match the provider".to_owned(),
+        ));
+    }
     let name = validate_name(&draft.name).map_err(StoreError::InvalidProvider)?;
     validate_settings(&descriptor, &draft.settings).map_err(StoreError::InvalidProvider)?;
     Ok(ProviderRecord {

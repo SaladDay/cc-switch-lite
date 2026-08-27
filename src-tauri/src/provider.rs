@@ -51,7 +51,7 @@ impl From<&ProviderRecord> for CurrentProvider {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderDraft {
     pub app_id: String,
@@ -68,7 +68,7 @@ pub struct ProviderUpdate {
     pub settings: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FieldKind {
     Text,
@@ -76,8 +76,8 @@ pub enum FieldKind {
     Secret,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FormField {
     pub key: String,
     pub label: String,
@@ -226,6 +226,33 @@ pub fn validate_name(name: &str) -> Result<String, String> {
         ));
     }
     Ok(normalized.to_owned())
+}
+
+pub fn validate_descriptor_schema(descriptor: &AdapterDescriptor) -> Result<(), String> {
+    if descriptor.fields.is_empty() || descriptor.fields.len() > 32 {
+        return Err("an adapter must declare between 1 and 32 fields".to_owned());
+    }
+    let mut keys = std::collections::HashSet::new();
+    for field in &descriptor.fields {
+        if field.key.is_empty()
+            || field.key.len() > 64
+            || !field
+                .key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            || !keys.insert(&field.key)
+        {
+            return Err("adapter field keys must be unique safe identifiers".to_owned());
+        }
+        if field.label.trim().is_empty()
+            || field.label.chars().count() > 80
+            || field.placeholder.len() > 256
+            || field.help.len() > 512
+        {
+            return Err("adapter field presentation exceeds host limits".to_owned());
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_settings(
