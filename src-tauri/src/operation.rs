@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
 };
@@ -23,7 +23,7 @@ pub enum LogicalTarget {
 }
 
 impl LogicalTarget {
-    fn app_id(self) -> &'static str {
+    pub(crate) fn app_id(self) -> &'static str {
         match self {
             Self::ClaudeSettings => "claude",
             Self::CodexConfig => "codex",
@@ -136,8 +136,8 @@ pub enum OperationError {
     Conflict,
     #[error("live configuration target is invalid: {0}")]
     InvalidTarget(String),
-    #[error("live configuration exceeds the {MAX_CONTENT_BYTES} byte limit")]
-    TooLarge,
+    #[error("live configuration exceeds the {limit} byte limit")]
+    TooLarge { limit: usize },
     #[error(transparent)]
     File(#[from] FileError),
     #[error("live configuration I/O failed for {path}: {source}")]
@@ -156,7 +156,7 @@ impl OperationError {
             Self::InvalidPlan(_) => "invalid_operation_plan",
             Self::Conflict => "live_conflict",
             Self::InvalidTarget(_) => "invalid_live_target",
-            Self::TooLarge => "live_too_large",
+            Self::TooLarge { .. } => "live_too_large",
             Self::File(_) | Self::Io { .. } => "live_io_error",
             Self::Rollback(_) => "rollback_failed",
         }
@@ -354,6 +354,55 @@ pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, OperationError> {
             });
         }
     };
+    read_opened(path, file, MAX_CONTENT_BYTES)
+}
+
+pub fn read_optional_no_follow(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, OperationError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(OperationError::InvalidTarget(format!(
+                "{} must not be a symbolic link",
+                path.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(OperationError::InvalidTarget(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(OperationError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|source| OperationError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    read_opened(path, file, max_bytes)
+}
+
+fn read_opened(
+    path: &Path,
+    file: File,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, OperationError> {
     let metadata = file.metadata().map_err(|source| OperationError::Io {
         path: path.to_owned(),
         source,
@@ -364,19 +413,19 @@ pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, OperationError> {
             path.display()
         )));
     }
-    if metadata.len() > MAX_CONTENT_BYTES as u64 {
-        return Err(OperationError::TooLarge);
+    if metadata.len() > max_bytes as u64 {
+        return Err(OperationError::TooLarge { limit: max_bytes });
     }
 
     let mut contents = Vec::with_capacity(metadata.len() as usize);
-    file.take((MAX_CONTENT_BYTES + 1) as u64)
+    file.take((max_bytes + 1) as u64)
         .read_to_end(&mut contents)
         .map_err(|source| OperationError::Io {
             path: path.to_owned(),
             source,
         })?;
-    if contents.len() > MAX_CONTENT_BYTES {
-        return Err(OperationError::TooLarge);
+    if contents.len() > max_bytes {
+        return Err(OperationError::TooLarge { limit: max_bytes });
     }
     Ok(Some(contents))
 }
@@ -617,7 +666,9 @@ mod tests {
 
         assert!(matches!(
             read_optional(&path),
-            Err(OperationError::TooLarge)
+            Err(OperationError::TooLarge {
+                limit: MAX_CONTENT_BYTES
+            })
         ));
     }
 

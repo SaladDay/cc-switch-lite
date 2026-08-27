@@ -9,7 +9,7 @@ import type {
 import { useModalDialog } from "../lib/use-modal-dialog";
 
 interface ProviderDialogProps {
-  adapter: AdapterDescriptor;
+  adapters: AdapterDescriptor[];
   provider?: ProviderRecord;
   busy: boolean;
   error: string | null;
@@ -30,13 +30,15 @@ function initialSettings(
 }
 
 export function ProviderDialog({
-  adapter,
+  adapters,
   provider,
   busy,
   error,
   onCancel,
   onSave,
 }: ProviderDialogProps) {
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const adapter = adapters[selectedIndex];
   const dialogRef = useModalDialog({ busy, onCancel });
   const [name, setName] = useState(provider?.name ?? "");
   const [settings, setSettings] = useState(() =>
@@ -46,7 +48,11 @@ export function ProviderDialog({
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    onSave({ name, settings });
+    onSave({
+      name,
+      settings,
+      adapter: provider ? undefined : adapter.reference,
+    });
   };
 
   return (
@@ -81,6 +87,30 @@ export function ProviderDialog({
       </div>
 
       <form onSubmit={submit} className="space-y-5 px-6 py-6">
+        {!provider && adapters.length > 1 && (
+          <label className="block text-sm font-medium">
+            Adapter
+            <select
+              value={selectedIndex}
+              onChange={(event) => {
+                const index = Number(event.target.value);
+                setSelectedIndex(index);
+                setSettings(initialSettings(adapters[index]));
+              }}
+              className="mt-2 h-10 w-full rounded-xl border border-border bg-background px-3 text-sm outline-none transition focus:border-primary"
+            >
+              {adapters.map((candidate, index) => (
+                <option
+                  key={`${candidate.reference.pluginId}:${candidate.reference.pluginVersion}:${candidate.reference.adapterId}`}
+                  value={index}
+                >
+                  {candidate.displayName}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+
         <label className="block text-sm font-medium">
           Provider name
           <input

@@ -1,0 +1,12 @@
+[package]
+name = "cc-switch-plugin-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dlmalloc = { version = "=0.2.14", features = ["global"] }
+wit-bindgen = { version = "=0.46.0", default-features = false, features = ["macros", "realloc"] }

@@ -7,9 +7,9 @@ CC Switch Lite shares low-level contracts with CC Switch through
 its UI, state, and release cycle independent.
 
 The project is in pre-alpha development. The first release is intentionally
-limited to provider management and safe live-configuration switching. Proxy
-routing, managed OAuth, usage tracking, MCP, prompts, and skills remain in the
-full CC Switch application.
+limited to provider management, safe live-configuration switching, and signed
+provider-adapter plugins. Proxy routing, managed OAuth, usage tracking, MCP,
+prompts, and skills remain in the full CC Switch application.
 
 ## Development
 
@@ -24,8 +24,17 @@ pnpm test
 pnpm tauri dev
 ```
 
-The plugin platform design is documented in
-[`docs/architecture/0001-plugin-platform.md`](docs/architecture/0001-plugin-platform.md).
+The plugin platform direction is documented in
+[`docs/architecture/0001-plugin-platform.md`](docs/architecture/0001-plugin-platform.md),
+and the implemented contract-major-1 boundary is frozen in
+[`docs/architecture/0002-plugin-contract-v1.md`](docs/architecture/0002-plugin-contract-v1.md).
+
+The marketplace supports multiple independently configured registry sources.
+Each source has its own Ed25519 publisher allowlist. Installations verify the
+signed manifest, complete package, and every declared payload before activation;
+permissions must be approved for the exact signed version. Components receive
+no WASI, network, filesystem, environment, process, or shell imports. See
+[`plugin-api/README.md`](plugin-api/README.md) for the guest and package contract.
 
 Provider credentials are currently stored as a local JSON file in Tauri's app
 data directory. Writes are atomic; the file is forced to mode `0600` on Unix
