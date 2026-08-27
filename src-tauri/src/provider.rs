@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub const BUILTIN_PLUGIN_ID: &str = "org.cc-switch.builtin";
+pub const BUILTIN_PLUGIN_VERSION: &str = "0.1.0";
 pub const CONTRACT_MAJOR: u32 = 1;
 pub const SCHEMA_VERSION: u32 = 1;
 const MAX_NAME_CHARS: usize = 80;
@@ -16,6 +17,8 @@ pub struct AdapterReference {
     pub adapter_id: String,
     pub contract_major: u32,
     pub schema_version: u32,
+    #[serde(default, flatten)]
+    pub extensions: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,13 +29,15 @@ pub struct ProviderRecord {
     pub adapter: AdapterReference,
     pub name: String,
     pub settings: Map<String, Value>,
+    #[serde(default, flatten)]
+    pub extensions: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderDraft {
     pub app_id: String,
-    pub adapter_id: String,
+    pub adapter: AdapterReference,
     pub name: String,
     pub settings: Map<String, Value>,
 }
@@ -84,10 +89,13 @@ impl AdapterDescriptor {
             display_name: display_name.to_owned(),
             reference: AdapterReference {
                 plugin_id: BUILTIN_PLUGIN_ID.to_owned(),
-                plugin_version: env!("CARGO_PKG_VERSION").to_owned(),
+                // This version identifies stored data ownership. It only changes
+                // alongside an explicit compatibility or migration path.
+                plugin_version: BUILTIN_PLUGIN_VERSION.to_owned(),
                 adapter_id: adapter_id.to_owned(),
                 contract_major: CONTRACT_MAJOR,
                 schema_version: SCHEMA_VERSION,
+                extensions: Map::new(),
             },
             fields,
         }
@@ -179,23 +187,13 @@ pub fn built_in_adapters() -> Vec<AdapterDescriptor> {
     ]
 }
 
-pub fn adapter_for(app_id: &str, adapter_id: &str) -> Option<AdapterDescriptor> {
-    built_in_adapters()
-        .into_iter()
-        .find(|adapter| adapter.app_id == app_id && adapter.reference.adapter_id == adapter_id)
-}
-
 pub fn adapter_for_reference(
     app_id: &str,
     reference: &AdapterReference,
 ) -> Option<AdapterDescriptor> {
-    built_in_adapters().into_iter().find(|adapter| {
-        adapter.app_id == app_id
-            && adapter.reference.plugin_id == reference.plugin_id
-            && adapter.reference.adapter_id == reference.adapter_id
-            && adapter.reference.contract_major == reference.contract_major
-            && adapter.reference.schema_version == reference.schema_version
-    })
+    built_in_adapters()
+        .into_iter()
+        .find(|adapter| adapter.app_id == app_id && adapter.reference == *reference)
 }
 
 pub fn validate_name(name: &str) -> Result<String, String> {

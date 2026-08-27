@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Asterisk,
   Bot,
@@ -64,7 +64,15 @@ function initialDarkMode(): boolean {
   );
 }
 
-function stringSetting(provider: ProviderRecord, key: string): string {
+function visibleStringSetting(
+  adapter: AdapterDescriptor,
+  provider: ProviderRecord,
+  key: string,
+): string {
+  const field = adapter.fields.find(
+    (candidate) => candidate.key === key && candidate.kind !== "secret",
+  );
+  if (!field) return "";
   const value = provider.settings[key];
   return typeof value === "string" ? value : "";
 }
@@ -76,6 +84,7 @@ function adapterMatchesProvider(
   return (
     adapter.appId === provider.appId &&
     adapter.reference.pluginId === provider.adapter.pluginId &&
+    adapter.reference.pluginVersion === provider.adapter.pluginVersion &&
     adapter.reference.adapterId === provider.adapter.adapterId &&
     adapter.reference.contractMajor === provider.adapter.contractMajor &&
     adapter.reference.schemaVersion === provider.adapter.schemaVersion
@@ -94,6 +103,8 @@ export default function App() {
   const [deleting, setDeleting] = useState<ProviderRecord | null>(null);
   const [mutationBusy, setMutationBusy] = useState(false);
   const [mutationError, setMutationError] = useState<string | null>(null);
+  const addProviderButtonRef = useRef<HTMLButtonElement>(null);
+  const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const definition = APPS.find((app) => app.id === activeApp) ?? APPS[0];
   const adapter = adapters.find((item) => item.appId === activeApp);
   const editingAdapter =
@@ -170,7 +181,7 @@ export default function App() {
         if (!adapter) return;
         const created = await providersApi.create({
           appId: activeApp,
-          adapterId: adapter.reference.adapterId,
+          adapter: adapter.reference,
           ...update,
         });
         setProviders((current) => [...current, created]);
@@ -196,10 +207,22 @@ export default function App() {
     setMutationError(null);
     try {
       await providersApi.delete(activeApp, deleting.id);
-      setProviders((current) =>
-        current.filter((provider) => provider.id !== deleting.id),
+      const deletedIndex = providers.findIndex(
+        (provider) => provider.id === deleting.id,
       );
+      const remaining = providers.filter(
+        (provider) => provider.id !== deleting.id,
+      );
+      const nextProvider =
+        remaining[Math.min(Math.max(deletedIndex, 0), remaining.length - 1)];
+      setProviders(remaining);
       setDeleting(null);
+      window.setTimeout(() => {
+        const target = nextProvider
+          ? deleteButtonRefs.current.get(nextProvider.id)
+          : addProviderButtonRef.current;
+        target?.focus();
+      }, 0);
     } catch (error) {
       setMutationError(errorMessage(error));
     } finally {
@@ -272,6 +295,7 @@ export default function App() {
             <Settings className="size-4" />
           </button>
           <button
+            ref={addProviderButtonRef}
             type="button"
             disabled={!adapter}
             onClick={() => openEditor("new")}
@@ -351,7 +375,12 @@ export default function App() {
         ) : (
           <section className="grid grid-cols-2 gap-4" aria-label="Providers">
             {providers.map((provider) => {
-              const endpoint = stringSetting(provider, "baseUrl");
+              const providerAdapter = adapters.find((item) =>
+                adapterMatchesProvider(item, provider),
+              );
+              const endpoint = providerAdapter
+                ? visibleStringSetting(providerAdapter, provider, "baseUrl")
+                : "";
               return (
                 <article
                   key={provider.id}
@@ -367,7 +396,9 @@ export default function App() {
                           {provider.name}
                         </h3>
                         <p className="mt-1 truncate text-xs text-muted-foreground">
-                          {endpoint || "Default endpoint"}
+                          {!providerAdapter
+                            ? "Adapter unavailable"
+                            : endpoint || "Default endpoint"}
                         </p>
                       </div>
                     </div>
@@ -386,6 +417,11 @@ export default function App() {
                         <Pencil className="size-4" />
                       </button>
                       <button
+                        ref={(element) => {
+                          if (element)
+                            deleteButtonRefs.current.set(provider.id, element);
+                          else deleteButtonRefs.current.delete(provider.id);
+                        }}
                         type="button"
                         onClick={() => {
                           setMutationError(null);

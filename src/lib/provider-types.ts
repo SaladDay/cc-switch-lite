@@ -39,7 +39,7 @@ export interface AdapterDescriptor {
 
 export interface ProviderDraft {
   appId: string;
-  adapterId: string;
+  adapter: AdapterReference;
   name: string;
   settings: Record<string, string>;
 }

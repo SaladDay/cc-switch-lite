@@ -29,5 +29,6 @@ The plugin platform design is documented in
 
 Provider credentials are currently stored as a local JSON file in Tauri's app
 data directory. Writes are atomic; the file is forced to mode `0600` on Unix
-and uses the app-data directory's inherited ACL on Windows. This storage is
+and uses the app-data directory's inherited ACL on Windows. A private sidecar
+lock serializes changes made by multiple Lite processes. This storage is
 separate from Claude Code and Codex live configuration.

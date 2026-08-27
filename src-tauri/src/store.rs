@@ -1,14 +1,20 @@
-use std::{collections::HashSet, fs, path::PathBuf, sync::Mutex};
+use std::{
+    collections::HashSet,
+    fs::{self, File, OpenOptions},
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use cc_switch_core::fs::{atomic_write_private, read_json_file, FileError};
 use cc_switch_core::AppType;
+use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::provider::{
-    adapter_for, adapter_for_reference, validate_name, validate_settings, ProviderDraft,
-    ProviderRecord, ProviderUpdate,
+    adapter_for_reference, validate_name, validate_settings, ProviderDraft, ProviderRecord,
+    ProviderUpdate,
 };
 
 const STORE_VERSION: u32 = 1;
@@ -60,13 +66,16 @@ impl Default for ProviderFile {
 
 pub struct ProviderStore {
     path: PathBuf,
+    lock_path: PathBuf,
     gate: Mutex<()>,
 }
 
 impl ProviderStore {
     pub fn new(path: PathBuf) -> Self {
+        let lock_path = path.with_extension("lock");
         Self {
             path,
+            lock_path,
             gate: Mutex::new(()),
         }
     }
@@ -74,6 +83,7 @@ impl ProviderStore {
     pub fn list(&self, app_id: &str) -> Result<Vec<ProviderRecord>, StoreError> {
         ensure_supported_app(app_id)?;
         let _guard = self.gate.lock().map_err(|_| StoreError::LockUnavailable)?;
+        let _file_lock = self.lock_file()?;
         let file = self.read()?;
         Ok(file
             .providers
@@ -83,13 +93,14 @@ impl ProviderStore {
     }
 
     pub fn create(&self, draft: ProviderDraft) -> Result<ProviderRecord, StoreError> {
-        let descriptor = adapter_for(&draft.app_id, &draft.adapter_id).ok_or_else(|| {
+        let descriptor = adapter_for_reference(&draft.app_id, &draft.adapter).ok_or_else(|| {
             StoreError::InvalidProvider("the selected adapter is not available".to_owned())
         })?;
         let name = validate_name(&draft.name).map_err(StoreError::InvalidProvider)?;
         validate_settings(&descriptor, &draft.settings).map_err(StoreError::InvalidProvider)?;
 
         let _guard = self.gate.lock().map_err(|_| StoreError::LockUnavailable)?;
+        let _file_lock = self.lock_file()?;
         let mut file = self.read()?;
         let provider = ProviderRecord {
             id: Uuid::new_v4().to_string(),
@@ -97,6 +108,7 @@ impl ProviderStore {
             adapter: descriptor.reference,
             name,
             settings: draft.settings,
+            extensions: serde_json::Map::new(),
         };
         file.providers.push(provider.clone());
         self.write(&file)?;
@@ -106,6 +118,7 @@ impl ProviderStore {
     pub fn update(&self, id: &str, update: ProviderUpdate) -> Result<ProviderRecord, StoreError> {
         let name = validate_name(&update.name).map_err(StoreError::InvalidProvider)?;
         let _guard = self.gate.lock().map_err(|_| StoreError::LockUnavailable)?;
+        let _file_lock = self.lock_file()?;
         let mut file = self.read()?;
         let provider = file
             .providers
@@ -119,7 +132,6 @@ impl ProviderStore {
         validate_settings(&descriptor, &update.settings).map_err(StoreError::InvalidProvider)?;
 
         provider.name = name;
-        provider.adapter = descriptor.reference;
         provider.settings = update.settings;
         let updated = provider.clone();
         self.write(&file)?;
@@ -129,6 +141,7 @@ impl ProviderStore {
     pub fn delete(&self, app_id: &str, id: &str) -> Result<(), StoreError> {
         ensure_supported_app(app_id)?;
         let _guard = self.gate.lock().map_err(|_| StoreError::LockUnavailable)?;
+        let _file_lock = self.lock_file()?;
         let mut file = self.read()?;
         let index = file
             .providers
@@ -137,6 +150,33 @@ impl ProviderStore {
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
         file.providers.remove(index);
         self.write(&file)
+    }
+
+    fn lock_file(&self) -> Result<File, StoreError> {
+        if let Some(parent) = self.lock_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| file_error(parent, source))?;
+        }
+
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options
+            .open(&self.lock_path)
+            .map_err(|source| file_error(&self.lock_path, source))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            lock.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|source| file_error(&self.lock_path, source))?;
+        }
+
+        FileExt::lock(&lock).map_err(|source| file_error(&self.lock_path, source))?;
+        Ok(lock)
     }
 
     fn read(&self) -> Result<ProviderFile, StoreError> {
@@ -173,6 +213,13 @@ impl ProviderStore {
         atomic_write_private(&self.path, &contents)?;
         Ok(())
     }
+}
+
+fn file_error(path: &Path, source: std::io::Error) -> StoreError {
+    StoreError::File(FileError::Io {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 fn ensure_supported_app(app_id: &str) -> Result<(), StoreError> {
@@ -220,16 +267,23 @@ fn validate_file(file: &ProviderFile) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::built_in_adapters;
     use serde_json::{json, Map};
+    use std::{sync::mpsc, thread, time::Duration};
 
     fn settings(value: serde_json::Value) -> Map<String, serde_json::Value> {
         value.as_object().expect("settings object").clone()
     }
 
     fn draft(app_id: &str, adapter_id: &str, name: &str) -> ProviderDraft {
+        let adapter = built_in_adapters()
+            .into_iter()
+            .find(|adapter| adapter.reference.adapter_id == adapter_id)
+            .expect("built-in adapter")
+            .reference;
         ProviderDraft {
             app_id: app_id.to_owned(),
-            adapter_id: adapter_id.to_owned(),
+            adapter,
             name: name.to_owned(),
             settings: settings(json!({"apiKey": "secret"})),
         }
@@ -300,37 +354,49 @@ mod tests {
     }
 
     #[test]
-    fn unknown_plugin_records_survive_builtin_mutations() {
+    fn unknown_plugin_fields_survive_builtin_mutations() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("providers.json");
-        let unknown = ProviderRecord {
-            id: "plugin-provider".to_owned(),
-            app_id: "future-client".to_owned(),
-            adapter: crate::provider::AdapterReference {
-                plugin_id: "example.plugin".to_owned(),
-                plugin_version: "1.0.0".to_owned(),
-                adapter_id: "example.adapter".to_owned(),
-                contract_major: 1,
-                schema_version: 1,
-            },
-            name: "Future".to_owned(),
-            settings: settings(json!({"token": "secret"})),
-        };
-        ProviderStore::new(path.clone())
-            .write(&ProviderFile {
-                version: STORE_VERSION,
-                providers: vec![unknown.clone()],
-            })
-            .expect("seed plugin record");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "providers": [{
+                    "id": "plugin-provider",
+                    "appId": "future-client",
+                    "adapter": {
+                        "pluginId": "example.plugin",
+                        "pluginVersion": "2.0.0",
+                        "adapterId": "example.adapter",
+                        "contractMajor": 2,
+                        "schemaVersion": 3,
+                        "futureAdapterField": {"mode": "opaque"}
+                    },
+                    "name": "Future",
+                    "settings": {"token": "secret"},
+                    "futureProviderField": [1, 2, 3]
+                }]
+            }))
+            .expect("serialize seed"),
+        )
+        .expect("seed plugin record");
 
-        let store = ProviderStore::new(path);
+        let store = ProviderStore::new(path.clone());
         store
             .create(draft("claude", "builtin.claude.api-key", "Work"))
             .expect("create builtin provider");
-        let file = store.read().expect("read provider file");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("read provider file"))
+                .expect("parse provider file");
+        let plugin = &stored["providers"][0];
 
-        assert_eq!(file.providers[0], unknown);
-        assert_eq!(file.providers.len(), 2);
+        assert_eq!(plugin["adapter"]["contractMajor"], 2);
+        assert_eq!(
+            plugin["adapter"]["futureAdapterField"],
+            json!({"mode": "opaque"})
+        );
+        assert_eq!(plugin["futureProviderField"], json!([1, 2, 3]));
+        assert_eq!(stored["providers"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -346,9 +412,11 @@ mod tests {
                 adapter_id: "builtin.claude.api-key".to_owned(),
                 contract_major: 1,
                 schema_version: 1,
+                extensions: Map::new(),
             },
             name: "Plugin".to_owned(),
             settings: settings(json!({"token": "secret"})),
+            extensions: Map::new(),
         };
         ProviderStore::new(path.clone())
             .write(&ProviderFile {
@@ -368,5 +436,64 @@ mod tests {
 
         assert!(matches!(result, Err(StoreError::InvalidProvider(_))));
         assert_eq!(store.read().unwrap().providers, [plugin_provider]);
+    }
+
+    #[test]
+    fn a_missing_adapter_version_is_read_only() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("providers.json");
+        let store = ProviderStore::new(path);
+        let mut provider = store
+            .create(draft("claude", "builtin.claude.api-key", "Work"))
+            .expect("create provider");
+        provider.adapter.plugin_version = "0.0.9".to_owned();
+        store
+            .write(&ProviderFile {
+                version: STORE_VERSION,
+                providers: vec![provider.clone()],
+            })
+            .expect("seed old adapter version");
+
+        let result = store.update(
+            &provider.id,
+            ProviderUpdate {
+                name: "Changed".to_owned(),
+                settings: settings(json!({"apiKey": "new-secret"})),
+            },
+        );
+
+        assert!(matches!(result, Err(StoreError::InvalidProvider(_))));
+        assert_eq!(store.read().unwrap().providers, [provider]);
+    }
+
+    #[test]
+    fn independent_stores_serialize_mutations_with_the_sidecar_lock() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("providers.json");
+        let first = ProviderStore::new(path.clone());
+        let held_lock = first.lock_file().expect("hold first store lock");
+        let second = ProviderStore::new(path);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            started_tx.send(()).expect("signal worker");
+            let result = second.create(draft("claude", "builtin.claude.api-key", "Second process"));
+            result_tx.send(result).expect("send mutation result");
+        });
+        started_rx.recv().expect("worker started");
+        assert!(result_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        drop(held_lock);
+        result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second store unblocked")
+            .expect("second store mutation");
+        worker.join().expect("join worker");
+        first
+            .create(draft("claude", "builtin.claude.api-key", "First process"))
+            .expect("first store mutation");
+
+        assert_eq!(first.list("claude").expect("list providers").len(), 2);
     }
 }

@@ -24,7 +24,7 @@ const adapters: AdapterDescriptor[] = [
     displayName: "Claude API",
     reference: {
       pluginId: "org.cc-switch.builtin",
-      pluginVersion: "0.1.0-alpha.1",
+      pluginVersion: "0.1.0",
       adapterId: "builtin.claude.api-key",
       contractMajor: 1,
       schemaVersion: 1,
@@ -53,7 +53,7 @@ const adapters: AdapterDescriptor[] = [
     displayName: "OpenAI API",
     reference: {
       pluginId: "org.cc-switch.builtin",
-      pluginVersion: "0.1.0-alpha.1",
+      pluginVersion: "0.1.0",
       adapterId: "builtin.codex.api-key",
       contractMajor: 1,
       schemaVersion: 1,
@@ -142,7 +142,7 @@ describe("App", () => {
     await waitFor(() =>
       expect(api.create).toHaveBeenCalledWith({
         appId: "claude",
-        adapterId: "builtin.claude.api-key",
+        adapter: adapters[0].reference,
         name: "Work",
         settings: { apiKey: "secret", baseUrl: "" },
       }),
@@ -194,6 +194,25 @@ describe("App", () => {
         name: "Add your first Claude Code provider",
       }),
     ).toBeVisible();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Add Claude Code provider" }),
+      ).toHaveFocus(),
+    );
+  });
+
+  it("does not interpret settings when the owning adapter is unavailable", async () => {
+    const unavailable = {
+      ...workProvider,
+      adapter: { ...workProvider.adapter, pluginVersion: "0.0.9" },
+      settings: { baseUrl: "must-not-be-rendered" },
+    };
+    api.list.mockResolvedValue([unavailable]);
+    render(<App />);
+
+    expect(await screen.findByText("Adapter unavailable")).toBeVisible();
+    expect(screen.queryByText("must-not-be-rendered")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit Work" })).toBeDisabled();
   });
 
   it("applies and remembers the chosen theme", async () => {
