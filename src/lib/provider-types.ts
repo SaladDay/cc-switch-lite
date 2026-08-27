@@ -1,0 +1,55 @@
+export type AppId = "claude" | "codex";
+
+export type JsonValue =
+  string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+export interface AdapterReference {
+  pluginId: string;
+  pluginVersion: string;
+  adapterId: string;
+  contractMajor: number;
+  schemaVersion: number;
+}
+
+export interface ProviderRecord {
+  id: string;
+  appId: string;
+  adapter: AdapterReference;
+  name: string;
+  settings: Record<string, JsonValue>;
+}
+
+export type FieldKind = "text" | "url" | "secret";
+
+export interface FormField {
+  key: string;
+  label: string;
+  kind: FieldKind;
+  required: boolean;
+  placeholder: string;
+  help: string;
+}
+
+export interface AdapterDescriptor {
+  appId: string;
+  displayName: string;
+  reference: AdapterReference;
+  fields: FormField[];
+}
+
+export interface ProviderDraft {
+  appId: string;
+  adapterId: string;
+  name: string;
+  settings: Record<string, string>;
+}
+
+export interface ProviderUpdate {
+  name: string;
+  settings: Record<string, string>;
+}
+
+export interface CommandError {
+  code: string;
+  message: string;
+}

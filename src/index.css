@@ -77,6 +77,12 @@
   );
 }
 
+dialog::backdrop {
+  background: rgb(0 0 0 / 0.4);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
