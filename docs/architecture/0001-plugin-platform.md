@@ -44,17 +44,21 @@ manifest must carry at least:
 - entry points and contributed application/provider identifiers;
 - requested capabilities and their constraints;
 - hashes for the component and every asset;
-- publisher identity and package signature metadata.
+- publisher identity and the signature scheme and key identifier.
 
 Plugin IDs and contributed identifiers are stable storage keys. Display names
 belong in locale resources and may change without migrating user data.
 
-The publisher signs a canonical manifest envelope that binds the plugin ID,
-version, compatible host API range, requested capabilities, entry points, and
-the digest of every packaged file. A registry may only reference the digest of
-that signed envelope and its package; it cannot override signed manifest
-fields. The canonical encoding and signature algorithms are frozen with the
-first manifest schema.
+The publisher signs canonical bytes of the unsigned manifest. Those bytes bind
+the plugin ID, version, compatible host API range, requested capabilities,
+entry points, and the digest of every payload file (the component, locales, and
+static assets). The manifest and detached signature are not payload entries, so
+neither digest is self-referential. A registry entry records both the canonical
+manifest digest and the immutable completed archive digest; it cannot override
+signed manifest fields. The host verifies the archive digest before unpacking,
+then the detached signature and every payload digest. The canonical encoding,
+excluded fields, and signature algorithms are frozen with the first manifest
+schema.
 
 ## Capabilities
 
