@@ -3,7 +3,11 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import App, { sameJsonValue } from "./App";
-import type { AdapterDescriptor, ProviderRecord } from "./lib/provider-types";
+import type {
+  AdapterDescriptor,
+  CurrentProvider,
+  ProviderRecord,
+} from "./lib/provider-types";
 
 const api = vi.hoisted(() => ({
   listAdapters: vi.fn(),
@@ -11,6 +15,9 @@ const api = vi.hoisted(() => ({
   create: vi.fn(),
   update: vi.fn(),
   delete: vi.fn(),
+  importLive: vi.fn(),
+  switch: vi.fn(),
+  currentProviders: vi.fn(),
 }));
 
 vi.mock("./lib/providers", async (importOriginal) => {
@@ -80,6 +87,18 @@ const workProvider: ProviderRecord = {
   settings: { apiKey: "secret", baseUrl: "https://proxy.example.com" },
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
+
+function current(provider: ProviderRecord) {
+  return { id: provider.id, revision: provider.revision };
+}
+
 describe("App", () => {
   beforeEach(() => {
     window.localStorage.clear();
@@ -88,6 +107,8 @@ describe("App", () => {
     api.listAdapters.mockResolvedValue(adapters);
     api.list.mockResolvedValue([]);
     api.delete.mockResolvedValue(undefined);
+    api.switch.mockResolvedValue(undefined);
+    api.currentProviders.mockResolvedValue([]);
   });
 
   it("shows only the two applications in the Lite boundary", async () => {
@@ -123,6 +144,40 @@ describe("App", () => {
     expect(window.localStorage.getItem("cc-switch-lite:last-app")).toBe(
       "codex",
     );
+  });
+
+  it("ignores a stale current-provider response after changing applications", async () => {
+    const user = userEvent.setup();
+    const claudeCurrent = deferred<CurrentProvider[]>();
+    const codexProvider: ProviderRecord = {
+      ...workProvider,
+      id: "codex-provider",
+      appId: "codex",
+      adapter: adapters[1].reference,
+      name: "Codex Work",
+    };
+    api.list.mockImplementation((appId: string) =>
+      Promise.resolve(appId === "codex" ? [codexProvider] : [workProvider]),
+    );
+    api.currentProviders.mockImplementation((appId: string) =>
+      appId === "claude"
+        ? claudeCurrent.promise
+        : Promise.resolve([current(codexProvider)]),
+    );
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "Codex" }));
+    expect(
+      await screen.findByRole("button", { name: "Codex Work is current" }),
+    ).toBeDisabled();
+
+    claudeCurrent.resolve([current(workProvider)]);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Codex Work is current" }),
+      ).toBeDisabled(),
+    );
+    expect(screen.queryByRole("heading", { name: "Work" })).toBeNull();
   });
 
   it("creates a provider from the adapter-driven form", async () => {
@@ -204,6 +259,82 @@ describe("App", () => {
       expect(
         screen.getByRole("button", { name: "Add Claude Code provider" }),
       ).toHaveFocus(),
+    );
+  });
+
+  it("imports the current live provider through the host", async () => {
+    const user = userEvent.setup();
+    api.importLive.mockResolvedValue(workProvider);
+    api.currentProviders
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([current(workProvider)]);
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Import Claude Code user configuration",
+      }),
+    );
+
+    await waitFor(() => expect(api.importLive).toHaveBeenCalledWith("claude"));
+    expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
+    expect(screen.getAllByText("User default")[0]).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Imported the Claude Code user configuration.",
+    );
+  });
+
+  it("switches a stored provider and marks it current", async () => {
+    const user = userEvent.setup();
+    api.list.mockResolvedValue([workProvider]);
+    api.currentProviders
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([current(workProvider)]);
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Switch to Work" }),
+    );
+
+    await waitFor(() =>
+      expect(api.switch).toHaveBeenCalledWith("claude", "provider-1", 1),
+    );
+    expect(
+      screen.getByRole("button", {
+        name: "Work is the Claude Code user default",
+      }),
+    ).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Work is now the Claude Code user default. Project, local, or managed settings can override it.",
+    );
+  });
+
+  it("does not mark a different provider revision as current", async () => {
+    api.list.mockResolvedValue([workProvider]);
+    api.currentProviders.mockResolvedValue([
+      { id: workProvider.id, revision: workProvider.revision + 1 },
+    ]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("button", { name: "Switch to Work" }),
+    ).toBeEnabled();
+  });
+
+  it("clears a current-provider error after a successful focus refresh", async () => {
+    api.currentProviders
+      .mockRejectedValueOnce(new Error("Current unavailable"))
+      .mockResolvedValueOnce([]);
+    render(<App />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Current unavailable",
+    );
+
+    window.dispatchEvent(new Event("focus"));
+
+    await waitFor(() =>
+      expect(screen.queryByText("Current unavailable")).toBeNull(),
     );
   });
 

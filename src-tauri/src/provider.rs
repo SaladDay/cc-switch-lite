@@ -1,7 +1,7 @@
 use cc_switch_core::AppType;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use url::Url;
+use url::{Host, Url};
 
 pub const BUILTIN_PLUGIN_ID: &str = "org.cc-switch.builtin";
 pub const BUILTIN_PLUGIN_VERSION: &str = "0.1.0";
@@ -33,6 +33,22 @@ pub struct ProviderRecord {
     pub settings: Map<String, Value>,
     #[serde(default, flatten)]
     pub extensions: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentProvider {
+    pub id: String,
+    pub revision: u64,
+}
+
+impl From<&ProviderRecord> for CurrentProvider {
+    fn from(provider: &ProviderRecord) -> Self {
+        Self {
+            id: provider.id.clone(),
+            revision: provider.revision,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -144,7 +160,7 @@ pub fn built_in_adapters() -> Vec<AdapterDescriptor> {
                     FieldKind::Secret,
                     true,
                     "sk-ant-…",
-                    "Stored only in CC Switch Lite's private provider file.",
+                    "Stored privately by Lite and copied to Claude Code when switched.",
                 ),
                 field(
                     "model",
@@ -175,7 +191,7 @@ pub fn built_in_adapters() -> Vec<AdapterDescriptor> {
                     FieldKind::Secret,
                     true,
                     "sk-…",
-                    "Stored only in CC Switch Lite's private provider file.",
+                    "Stored privately by Lite and copied to Codex when switched.",
                 ),
                 field(
                     "model",
@@ -228,7 +244,7 @@ pub fn validate_settings(
         }
         if field.kind == FieldKind::Url && !value.is_empty() && !is_safe_http_url(value) {
             return Err(format!(
-                "Setting '{}' must be a valid http:// or https:// URL without embedded credentials",
+                "Setting '{}' must be HTTPS (or loopback HTTP) without credentials, query, or fragment",
                 field.label
             ));
         }
@@ -238,7 +254,7 @@ pub fn validate_settings(
         let present = settings
             .get(&field.key)
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty());
+            .is_some_and(|value| !value.trim().is_empty());
         if !present {
             return Err(format!("Setting '{}' is required", field.label));
         }
@@ -248,11 +264,25 @@ pub fn validate_settings(
 
 fn is_safe_http_url(value: &str) -> bool {
     Url::parse(value).is_ok_and(|url| {
-        matches!(url.scheme(), "http" | "https")
+        (url.scheme() == "https" || (url.scheme() == "http" && is_loopback_host(&url)))
             && url.host_str().is_some()
             && url.username().is_empty()
             && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
     })
+}
+
+fn is_loopback_host(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        Some(Host::Domain(domain)) => {
+            domain.eq_ignore_ascii_case("localhost")
+                || domain.to_ascii_lowercase().ends_with(".localhost")
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +314,7 @@ mod tests {
 
         assert!(validate_settings(descriptor, &settings(json!({"apiKey": "secret"}))).is_ok());
         assert!(validate_settings(descriptor, &settings(json!({}))).is_err());
+        assert!(validate_settings(descriptor, &settings(json!({"apiKey": "   "}))).is_err());
         assert!(validate_settings(
             descriptor,
             &settings(json!({"apiKey": "secret", "unknown": "value"}))
@@ -297,6 +328,27 @@ mod tests {
         assert!(validate_settings(
             descriptor,
             &settings(json!({"apiKey": "secret", "baseUrl": "https://"}))
+        )
+        .is_err());
+        assert!(validate_settings(
+            descriptor,
+            &settings(json!({
+                "apiKey": "secret",
+                "baseUrl": "http://remote.example.com"
+            }))
+        )
+        .is_err());
+        assert!(validate_settings(
+            descriptor,
+            &settings(json!({"apiKey": "secret", "baseUrl": "http://127.0.0.1:8080"}))
+        )
+        .is_ok());
+        assert!(validate_settings(
+            descriptor,
+            &settings(json!({
+                "apiKey": "secret",
+                "baseUrl": "https://gateway.example/v1?tenant=private"
+            }))
         )
         .is_err());
         assert!(validate_settings(
