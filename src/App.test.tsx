@@ -2,7 +2,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import App from "./App";
+import App, { sameJsonValue } from "./App";
 import type { AdapterDescriptor, ProviderRecord } from "./lib/provider-types";
 
 const api = vi.hoisted(() => ({
@@ -236,6 +236,24 @@ describe("App", () => {
     expect(await screen.findByText("Adapter unavailable")).toBeVisible();
     expect(screen.queryByText("must-not-be-rendered")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Edit Work" })).toBeDisabled();
+  });
+
+  it("matches adapter identities without Object.hasOwn", () => {
+    const hasOwn = Object.hasOwn;
+    let matches = false;
+    Object.defineProperty(Object, "hasOwn", {
+      configurable: true,
+      value: undefined,
+    });
+    try {
+      matches = sameJsonValue(adapters[0].reference, workProvider.adapter);
+    } finally {
+      Object.defineProperty(Object, "hasOwn", {
+        configurable: true,
+        value: hasOwn,
+      });
+    }
+    expect(matches).toBe(true);
   });
 
   it("shows only a credential-free endpoint origin", async () => {

@@ -65,7 +65,7 @@ function initialDarkMode(): boolean {
   );
 }
 
-function sameJsonValue(left: JsonValue, right: JsonValue): boolean {
+export function sameJsonValue(left: JsonValue, right: JsonValue): boolean {
   if (Object.is(left, right)) return true;
   if (Array.isArray(left) || Array.isArray(right)) {
     return (
@@ -89,7 +89,8 @@ function sameJsonValue(left: JsonValue, right: JsonValue): boolean {
     leftKeys.length === rightKeys.length &&
     leftKeys.every(
       (key) =>
-        Object.hasOwn(right, key) && sameJsonValue(left[key], right[key]),
+        Object.prototype.hasOwnProperty.call(right, key) &&
+        sameJsonValue(left[key], right[key]),
     )
   );
 }
