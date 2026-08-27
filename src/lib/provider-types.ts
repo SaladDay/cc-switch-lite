@@ -21,6 +21,11 @@ export interface ProviderRecord {
   settings: Record<string, JsonValue>;
 }
 
+export interface CurrentProvider {
+  id: string;
+  revision: number;
+}
+
 export type FieldKind = "text" | "url" | "secret";
 
 export interface FormField {

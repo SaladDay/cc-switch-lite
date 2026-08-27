@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Asterisk,
   Bot,
+  Check,
+  Download,
   KeyRound,
   LoaderCircle,
   Moon,
@@ -18,6 +20,7 @@ import { ProviderDialog } from "./components/ProviderDialog";
 import type {
   AdapterDescriptor,
   AppId,
+  CurrentProvider,
   JsonValue,
   ProviderChanges,
   ProviderRecord,
@@ -130,13 +133,28 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [adapterError, setAdapterError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [currentError, setCurrentError] = useState<string | null>(null);
   const [editing, setEditing] = useState<ProviderRecord | "new" | null>(null);
   const [deleting, setDeleting] = useState<ProviderRecord | null>(null);
   const [mutationBusy, setMutationBusy] = useState(false);
   const [mutationError, setMutationError] = useState<string | null>(null);
+  const [liveBusy, setLiveBusy] = useState<string | null>(null);
+  const [liveError, setLiveError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [currentProviders, setCurrentProviders] = useState<CurrentProvider[]>(
+    [],
+  );
+  const currentRequestGeneration = useRef(0);
+  const activeAppRef = useRef(activeApp);
+  activeAppRef.current = activeApp;
   const addProviderButtonRef = useRef<HTMLButtonElement>(null);
   const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const definition = APPS.find((app) => app.id === activeApp) ?? APPS[0];
+  const isClaude = activeApp === "claude";
+  const currentLabel = isClaude ? "User default" : "Current";
+  const importLabel = isClaude
+    ? "Import Claude Code user configuration"
+    : `Import current ${definition.label} configuration`;
   const adapter = adapters.find((item) => item.appId === activeApp);
   const editingAdapter =
     editing === "new"
@@ -145,6 +163,33 @@ export default function App() {
         ? adapters.find((item) => adapterMatchesProvider(item, editing))
         : undefined;
   const ActiveIcon = definition.icon;
+
+  const refreshCurrent = useCallback(
+    async (app: AppId, showError = true): Promise<boolean> => {
+      const generation = ++currentRequestGeneration.current;
+      try {
+        const providers = await providersApi.currentProviders(app);
+        if (
+          generation === currentRequestGeneration.current &&
+          activeAppRef.current === app
+        ) {
+          setCurrentProviders(providers);
+          setCurrentError(null);
+        }
+        return true;
+      } catch (error) {
+        if (
+          generation === currentRequestGeneration.current &&
+          activeAppRef.current === app
+        ) {
+          setCurrentProviders([]);
+          if (showError) setCurrentError(errorMessage(error));
+        }
+        return false;
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", isDark);
@@ -168,38 +213,67 @@ export default function App() {
 
   useEffect(() => {
     let ignore = false;
+    const app = activeApp;
+    const currentGeneration = ++currentRequestGeneration.current;
     setLoading(true);
     setProviders([]);
+    setCurrentProviders([]);
     setLoadError(null);
-    providersApi
-      .list(activeApp)
-      .then((items) => {
-        if (!ignore) setProviders(items);
-      })
-      .catch((error: unknown) => {
-        if (!ignore) {
-          setProviders([]);
-          setLoadError(errorMessage(error));
+    setCurrentError(null);
+    Promise.allSettled([
+      providersApi.list(app),
+      providersApi.currentProviders(app),
+    ]).then(([providerResult, currentResult]) => {
+      if (ignore || activeAppRef.current !== app) return;
+      if (providerResult.status === "fulfilled") {
+        setProviders(providerResult.value);
+      } else {
+        setProviders([]);
+        setLoadError(errorMessage(providerResult.reason));
+      }
+      if (currentGeneration === currentRequestGeneration.current) {
+        if (currentResult.status === "fulfilled") {
+          setCurrentProviders(currentResult.value);
+          setCurrentError(null);
+        } else {
+          setCurrentError(errorMessage(currentResult.reason));
         }
-      })
-      .finally(() => {
-        if (!ignore) setLoading(false);
-      });
+      }
+      setLoading(false);
+    });
     return () => {
       ignore = true;
     };
   }, [activeApp]);
+
+  useEffect(() => {
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") {
+        void refreshCurrent(activeApp);
+      }
+    };
+    window.addEventListener("focus", refreshWhenVisible);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.removeEventListener("focus", refreshWhenVisible);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [activeApp, refreshCurrent]);
 
   const selectApp = (app: AppId) => {
     setActiveApp(app);
     setEditing(null);
     setDeleting(null);
     setMutationError(null);
+    setLiveError(null);
+    setCurrentError(null);
+    setNotice(null);
     window.localStorage.setItem(APP_STORAGE_KEY, app);
   };
 
   const openEditor = (provider: ProviderRecord | "new") => {
     setMutationError(null);
+    setNotice(null);
     setEditing(provider);
   };
 
@@ -228,6 +302,8 @@ export default function App() {
         );
       }
       setEditing(null);
+      setNotice(editing === "new" ? "Provider added." : "Provider updated.");
+      await refreshCurrent(activeApp);
     } catch (error) {
       setMutationError(errorMessage(error));
     } finally {
@@ -251,6 +327,7 @@ export default function App() {
         remaining[Math.min(Math.max(deletedIndex, 0), remaining.length - 1)];
       setProviders(remaining);
       setDeleting(null);
+      await refreshCurrent(activeApp);
       window.setTimeout(() => {
         const target = nextProvider
           ? deleteButtonRefs.current.get(nextProvider.id)
@@ -261,6 +338,45 @@ export default function App() {
       setMutationError(errorMessage(error));
     } finally {
       setMutationBusy(false);
+    }
+  };
+
+  const importLiveProvider = async () => {
+    setLiveBusy("import");
+    setLiveError(null);
+    setNotice(null);
+    try {
+      const imported = await providersApi.importLive(activeApp);
+      setProviders((current) => [...current, imported]);
+      await refreshCurrent(activeApp);
+      setNotice(
+        isClaude
+          ? "Imported the Claude Code user configuration."
+          : `Imported the current ${definition.label} configuration.`,
+      );
+    } catch (error) {
+      setLiveError(errorMessage(error));
+    } finally {
+      setLiveBusy(null);
+    }
+  };
+
+  const switchProvider = async (provider: ProviderRecord) => {
+    setLiveBusy(provider.id);
+    setLiveError(null);
+    setNotice(null);
+    try {
+      await providersApi.switch(activeApp, provider.id, provider.revision);
+      await refreshCurrent(activeApp);
+      setNotice(
+        isClaude
+          ? `${provider.name} is now the Claude Code user default. Project, local, or managed settings can override it.`
+          : `${provider.name} is now active for ${definition.label}.`,
+      );
+    } catch (error) {
+      setLiveError(errorMessage(error));
+    } finally {
+      setLiveBusy(null);
     }
   };
 
@@ -292,9 +408,10 @@ export default function App() {
               <button
                 key={app.id}
                 type="button"
+                disabled={mutationBusy || liveBusy !== null}
                 aria-pressed={selected}
                 onClick={() => selectApp(app.id)}
-                className={`inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg px-4 text-sm font-medium transition-colors duration-200 ${
+                className={`inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg px-4 text-sm font-medium transition-colors duration-200 disabled:cursor-not-allowed disabled:opacity-60 ${
                   selected
                     ? "bg-background text-foreground shadow-sm"
                     : "text-muted-foreground hover:bg-background/60 hover:text-foreground"
@@ -329,11 +446,25 @@ export default function App() {
             <Settings className="size-4" />
           </button>
           <button
+            type="button"
+            disabled={!adapter || loading || mutationBusy || liveBusy !== null}
+            onClick={importLiveProvider}
+            className="ml-2 inline-flex h-10 items-center gap-2 rounded-xl border border-border px-3 text-sm font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+            aria-label={importLabel}
+          >
+            {liveBusy === "import" ? (
+              <LoaderCircle className="size-4 animate-spin" />
+            ) : (
+              <Download className="size-4" />
+            )}
+            Import
+          </button>
+          <button
             ref={addProviderButtonRef}
             type="button"
-            disabled={!adapter}
+            disabled={!adapter || loading || mutationBusy || liveBusy !== null}
             onClick={() => openEditor("new")}
-            className="ml-2 inline-flex h-10 items-center gap-2 rounded-xl bg-primary px-4 text-sm font-medium text-primary-foreground shadow-sm transition-opacity disabled:opacity-50"
+            className="inline-flex h-10 items-center gap-2 rounded-xl bg-primary px-4 text-sm font-medium text-primary-foreground shadow-sm transition-opacity disabled:opacity-50"
             aria-label={`Add ${definition.label} provider`}
           >
             <Plus className="size-4" />
@@ -358,12 +489,22 @@ export default function App() {
           </span>
         </div>
 
-        {(adapterError || loadError) && (
+        {(adapterError || liveError || loadError || currentError) && (
           <div
             role="alert"
             className="mb-6 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-600 dark:text-red-300"
           >
-            {adapterError || loadError}
+            {adapterError || liveError || loadError || currentError}
+          </div>
+        )}
+
+        {notice && (
+          <div
+            role="status"
+            className="mb-6 flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300"
+          >
+            <Check className="size-4" aria-hidden="true" />
+            {notice}
           </div>
         )}
 
@@ -393,18 +534,33 @@ export default function App() {
               {definition.emptyTitle}
             </h2>
             <p className="mx-auto mt-2 max-w-sm text-sm leading-6 text-muted-foreground">
-              Save a provider here. Live configuration is not changed until a
-              later switching step.
+              Add one manually, or import the API provider from your current
+              live configuration.
             </p>
-            <button
-              type="button"
-              disabled={!adapter}
-              onClick={() => openEditor("new")}
-              className="mt-6 inline-flex h-10 items-center gap-2 rounded-xl bg-primary px-4 text-sm font-medium text-primary-foreground shadow-sm disabled:opacity-50"
-            >
-              <Plus className="size-4" />
-              Add provider
-            </button>
+            <div className="mt-6 flex justify-center gap-3">
+              <button
+                type="button"
+                disabled={!adapter || liveBusy !== null}
+                onClick={importLiveProvider}
+                className="inline-flex h-10 items-center gap-2 rounded-xl border border-border px-4 text-sm font-medium transition-colors hover:bg-muted disabled:opacity-50"
+              >
+                {liveBusy === "import" ? (
+                  <LoaderCircle className="size-4 animate-spin" />
+                ) : (
+                  <Download className="size-4" />
+                )}
+                {isClaude ? "Import user default" : "Import current"}
+              </button>
+              <button
+                type="button"
+                disabled={!adapter || liveBusy !== null}
+                onClick={() => openEditor("new")}
+                className="inline-flex h-10 items-center gap-2 rounded-xl bg-primary px-4 text-sm font-medium text-primary-foreground shadow-sm disabled:opacity-50"
+              >
+                <Plus className="size-4" />
+                Add provider
+              </button>
+            </div>
           </section>
         ) : (
           <section className="grid grid-cols-2 gap-4" aria-label="Providers">
@@ -415,10 +571,17 @@ export default function App() {
               const endpoint = providerAdapter
                 ? visibleEndpoint(providerAdapter, provider)
                 : "";
+              const isCurrent = currentProviders.some(
+                (current) =>
+                  current.id === provider.id &&
+                  current.revision === provider.revision,
+              );
               return (
                 <article
                   key={provider.id}
-                  className="glass-card rounded-2xl p-5 shadow-card"
+                  className={`glass-card rounded-2xl p-5 shadow-card ${
+                    isCurrent ? "ring-1 ring-primary/50" : ""
+                  }`}
                 >
                   <div className="flex items-start justify-between gap-4">
                     <div className="flex min-w-0 items-start gap-3">
@@ -426,9 +589,24 @@ export default function App() {
                         <KeyRound className="size-5" aria-hidden="true" />
                       </div>
                       <div className="min-w-0">
-                        <h3 className="truncate font-semibold">
-                          {provider.name}
-                        </h3>
+                        <div className="flex min-w-0 items-center gap-2">
+                          <h3 className="truncate font-semibold">
+                            {provider.name}
+                          </h3>
+                          {isCurrent && (
+                            <span
+                              className="inline-flex shrink-0 items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary"
+                              title={
+                                isClaude
+                                  ? "Project, local, or managed settings can override this user default"
+                                  : undefined
+                              }
+                            >
+                              <Check className="size-3" aria-hidden="true" />
+                              {currentLabel}
+                            </span>
+                          )}
+                        </div>
                         <p className="mt-1 truncate text-xs text-muted-foreground">
                           {!providerAdapter
                             ? "Adapter unavailable"
@@ -439,11 +617,7 @@ export default function App() {
                     <div className="flex shrink-0 gap-1">
                       <button
                         type="button"
-                        disabled={
-                          !adapters.some((item) =>
-                            adapterMatchesProvider(item, provider),
-                          )
-                        }
+                        disabled={!providerAdapter || liveBusy !== null}
                         onClick={() => openEditor(provider)}
                         className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                         aria-label={`Edit ${provider.name}`}
@@ -457,19 +631,55 @@ export default function App() {
                           else deleteButtonRefs.current.delete(provider.id);
                         }}
                         type="button"
+                        disabled={liveBusy !== null}
                         onClick={() => {
                           setMutationError(null);
                           setDeleting(provider);
                         }}
-                        className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-red-500/10 hover:text-red-600"
+                        className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-red-500/10 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-40"
                         aria-label={`Delete ${provider.name}`}
                       >
                         <Trash2 className="size-4" />
                       </button>
                     </div>
                   </div>
-                  <div className="mt-5 border-t border-border pt-4 text-xs text-muted-foreground">
-                    Stored locally · Switching comes next
+                  <div className="mt-5 flex items-center justify-between gap-3 border-t border-border pt-4">
+                    <span className="text-xs text-muted-foreground">
+                      Stored locally
+                    </span>
+                    <button
+                      type="button"
+                      disabled={
+                        !providerAdapter || isCurrent || liveBusy !== null
+                      }
+                      onClick={() => switchProvider(provider)}
+                      className={`inline-flex h-8 min-w-24 items-center justify-center gap-1.5 rounded-lg px-3 text-xs font-medium transition-colors disabled:cursor-not-allowed ${
+                        isCurrent
+                          ? "bg-primary/10 text-primary"
+                          : "bg-primary text-primary-foreground disabled:opacity-40"
+                      }`}
+                      aria-label={
+                        isCurrent
+                          ? isClaude
+                            ? `${provider.name} is the Claude Code user default`
+                            : `${provider.name} is current`
+                          : `Switch to ${provider.name}`
+                      }
+                    >
+                      {liveBusy === provider.id ? (
+                        <>
+                          <LoaderCircle className="size-3.5 animate-spin" />
+                          Switching…
+                        </>
+                      ) : isCurrent ? (
+                        <>
+                          <Check className="size-3.5" />
+                          {currentLabel}
+                        </>
+                      ) : (
+                        "Switch"
+                      )}
+                    </button>
                   </div>
                 </article>
               );

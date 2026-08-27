@@ -78,17 +78,34 @@ unrestricted paths are not part of the first API version.
 ## Operation plans
 
 Adapters do not receive filesystem paths and do not write files. They accept
-plain input snapshots and return an `OperationPlan` containing logical target
-slots, expected prior digests, proposed bytes, sensitivity, and deletion
-intent.
+plain input snapshots and return a versioned `OperationPlan`. The first host
+contract contains an application ID and one or more writes. Each write contains
+only a logical target, the expected missing state or SHA-256 digest, and UTF-8
+text. Logical targets determine sensitivity and the write policy: new live
+files are private, while replacements preserve an existing file's Unix mode.
+Raw paths and deletion are not part of contract major 1.
 
 The host resolves logical slots to platform paths, validates size and digest
-limits, takes a rollback snapshot, and executes the plan. It records the new
-current provider only after every write succeeds. A failure restores all
-targets touched by the plan.
+limits, validates JSON or TOML according to the target, takes a rollback
+snapshot, and executes the plan. A failure restores all targets already
+touched by the plan only while they still contain the bytes written by that
+operation at the rollback check. The host rechecks every precondition
+immediately before its atomic replace and resolves the write target before the
+adapter snapshot is produced. These checks detect changes already visible at
+those points; an external writer that does not honor Lite's advisory lock can
+still race the final cross-platform replace. Platform-specific compare-and-swap
+and directory-handle transactions are outside contract major 1. The current
+provider is derived from the live managed fields after a successful switch
+instead of being stored as a second source of truth.
 
 Import uses the reverse flow: the host reads allowed slots, then passes their
 contents to the adapter for parsing into provider data.
+
+The bootstrap Codex adapter does not garbage-collect older managed route
+tables. A route can still be referenced by a profile in another Codex config
+layer, which is outside the single logical slot available to contract major 1.
+Profile-aware credential cleanup requires a separate, explicitly bounded host
+capability rather than guessing from the active config file.
 
 ## User interface contributions
 

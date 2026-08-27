@@ -1,13 +1,14 @@
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
+    io::Read,
     path::{Path, PathBuf},
     sync::Mutex,
 };
 
-use cc_switch_core::fs::{atomic_write_private, read_json_file, FileError};
+use cc_switch_core::fs::{atomic_write_private, FileError};
 use cc_switch_core::AppType;
-use fs4::FileExt;
+use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -52,10 +53,12 @@ impl StoreError {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct ProviderFile {
     version: u32,
     providers: Vec<ProviderRecord>,
+    #[serde(default, flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for ProviderFile {
@@ -63,6 +66,7 @@ impl Default for ProviderFile {
         Self {
             version: STORE_VERSION,
             providers: Vec::new(),
+            extensions: serde_json::Map::new(),
         }
     }
 }
@@ -85,7 +89,10 @@ impl ProviderStore {
 
     pub fn list(&self, app_id: &str) -> Result<Vec<ProviderRecord>, StoreError> {
         ensure_supported_app(app_id)?;
-        let _guard = self.gate.lock().map_err(|_| StoreError::LockUnavailable)?;
+        let _guard = self
+            .gate
+            .try_lock()
+            .map_err(|_| StoreError::LockUnavailable)?;
         let _file_lock = self.lock_file()?;
         let file = self.read()?;
         Ok(file
@@ -95,33 +102,98 @@ impl ProviderStore {
             .collect())
     }
 
-    pub fn create(&self, draft: ProviderDraft) -> Result<ProviderRecord, StoreError> {
-        let descriptor = adapter_for_reference(&draft.app_id, &draft.adapter).ok_or_else(|| {
-            StoreError::InvalidProvider("the selected adapter is not available".to_owned())
-        })?;
-        let name = validate_name(&draft.name).map_err(StoreError::InvalidProvider)?;
-        validate_settings(&descriptor, &draft.settings).map_err(StoreError::InvalidProvider)?;
+    pub fn with_providers<T, E>(
+        &self,
+        app_id: &str,
+        action: impl FnOnce(&[ProviderRecord]) -> Result<T, E>,
+    ) -> Result<Result<T, E>, StoreError> {
+        ensure_supported_app(app_id)?;
+        let _guard = self
+            .gate
+            .try_lock()
+            .map_err(|_| StoreError::LockUnavailable)?;
+        let _file_lock = self.lock_file()?;
+        let providers = self
+            .read()?
+            .providers
+            .into_iter()
+            .filter(|provider| provider.app_id == app_id)
+            .collect::<Vec<_>>();
+        Ok(action(&providers))
+    }
 
-        let _guard = self.gate.lock().map_err(|_| StoreError::LockUnavailable)?;
+    pub fn with_provider<T, E>(
+        &self,
+        app_id: &str,
+        id: &str,
+        expected_revision: u64,
+        action: impl FnOnce(&ProviderRecord) -> Result<T, E>,
+    ) -> Result<Result<T, E>, StoreError> {
+        ensure_supported_app(app_id)?;
+        let _guard = self
+            .gate
+            .try_lock()
+            .map_err(|_| StoreError::LockUnavailable)?;
+        let _file_lock = self.lock_file()?;
+        let file = self.read()?;
+        let provider = file
+            .providers
+            .iter()
+            .find(|provider| provider.id == id && provider.app_id == app_id)
+            .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
+        if provider.revision != expected_revision {
+            return Err(StoreError::Conflict(id.to_owned()));
+        }
+        Ok(action(provider))
+    }
+
+    pub fn create(&self, draft: ProviderDraft) -> Result<ProviderRecord, StoreError> {
+        let provider = provider_from_draft(draft)?;
+
+        let _guard = self
+            .gate
+            .try_lock()
+            .map_err(|_| StoreError::LockUnavailable)?;
         let _file_lock = self.lock_file()?;
         let mut file = self.read()?;
-        let provider = ProviderRecord {
-            id: Uuid::new_v4().to_string(),
-            revision: 1,
-            app_id: descriptor.app_id,
-            adapter: descriptor.reference,
-            name,
-            settings: draft.settings,
-            extensions: serde_json::Map::new(),
-        };
         file.providers.push(provider.clone());
         self.write(&file)?;
         Ok(provider)
     }
 
+    pub fn create_from<E>(
+        &self,
+        app_id: &str,
+        draft_factory: impl FnOnce() -> Result<ProviderDraft, E>,
+    ) -> Result<Result<ProviderRecord, E>, StoreError> {
+        ensure_supported_app(app_id)?;
+        let _guard = self
+            .gate
+            .try_lock()
+            .map_err(|_| StoreError::LockUnavailable)?;
+        let _file_lock = self.lock_file()?;
+        let mut file = self.read()?;
+        let draft = match draft_factory() {
+            Ok(draft) => draft,
+            Err(error) => return Ok(Err(error)),
+        };
+        if draft.app_id != app_id {
+            return Err(StoreError::InvalidProvider(
+                "the imported provider targets a different application".to_owned(),
+            ));
+        }
+        let provider = provider_from_draft(draft)?;
+        file.providers.push(provider.clone());
+        self.write(&file)?;
+        Ok(Ok(provider))
+    }
+
     pub fn update(&self, id: &str, update: ProviderUpdate) -> Result<ProviderRecord, StoreError> {
         let name = validate_name(&update.name).map_err(StoreError::InvalidProvider)?;
-        let _guard = self.gate.lock().map_err(|_| StoreError::LockUnavailable)?;
+        let _guard = self
+            .gate
+            .try_lock()
+            .map_err(|_| StoreError::LockUnavailable)?;
         let _file_lock = self.lock_file()?;
         let mut file = self.read()?;
         let provider = file
@@ -151,7 +223,10 @@ impl ProviderStore {
 
     pub fn delete(&self, app_id: &str, id: &str, expected_revision: u64) -> Result<(), StoreError> {
         ensure_supported_app(app_id)?;
-        let _guard = self.gate.lock().map_err(|_| StoreError::LockUnavailable)?;
+        let _guard = self
+            .gate
+            .try_lock()
+            .map_err(|_| StoreError::LockUnavailable)?;
         let _file_lock = self.lock_file()?;
         let mut file = self.read()?;
         let index = file
@@ -189,30 +264,61 @@ impl ProviderStore {
                 .map_err(|source| file_error(&self.lock_path, source))?;
         }
 
-        FileExt::lock(&lock).map_err(|source| file_error(&self.lock_path, source))?;
+        FileExt::try_lock(&lock).map_err(|error| match error {
+            TryLockError::WouldBlock => StoreError::LockUnavailable,
+            TryLockError::Error(source) => file_error(&self.lock_path, source),
+        })?;
         Ok(lock)
     }
 
     fn read(&self) -> Result<ProviderFile, StoreError> {
-        match fs::metadata(&self.path) {
-            Ok(metadata) if metadata.len() > MAX_STORE_BYTES => {
-                return Err(StoreError::InvalidStore(format!(
-                    "file exceeds the {MAX_STORE_BYTES} byte limit"
-                )));
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StoreError::InvalidStore(
+                    "provider store must not be a symbolic link".to_owned(),
+                ));
             }
-            Ok(_) => {}
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => {
+                return Err(StoreError::InvalidStore(
+                    "provider store must be a regular file".to_owned(),
+                ));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ProviderFile::default());
             }
-            Err(error) => {
-                return Err(StoreError::File(FileError::Io {
-                    path: self.path.clone(),
-                    source: error,
-                }));
-            }
+            Err(source) => return Err(file_error(&self.path, source)),
+        };
+        if metadata.len() > MAX_STORE_BYTES {
+            return Err(StoreError::InvalidStore(format!(
+                "file exceeds the {MAX_STORE_BYTES} byte limit"
+            )));
         }
 
-        let file: ProviderFile = read_json_file(&self.path)?;
+        let file = File::open(&self.path).map_err(|source| file_error(&self.path, source))?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| file_error(&self.path, source))?;
+        if !metadata.is_file() {
+            return Err(StoreError::InvalidStore(
+                "provider store must be a regular file".to_owned(),
+            ));
+        }
+        if metadata.len() > MAX_STORE_BYTES {
+            return Err(StoreError::InvalidStore(format!(
+                "file exceeds the {MAX_STORE_BYTES} byte limit"
+            )));
+        }
+        let mut contents = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_STORE_BYTES + 1)
+            .read_to_end(&mut contents)
+            .map_err(|source| file_error(&self.path, source))?;
+        if contents.len() as u64 > MAX_STORE_BYTES {
+            return Err(StoreError::InvalidStore(format!(
+                "file exceeds the {MAX_STORE_BYTES} byte limit"
+            )));
+        }
+        let file: ProviderFile = serde_json::from_slice(&contents)?;
         validate_file(&file)?;
         Ok(file)
     }
@@ -227,6 +333,23 @@ impl ProviderStore {
         atomic_write_private(&self.path, &contents)?;
         Ok(())
     }
+}
+
+fn provider_from_draft(draft: ProviderDraft) -> Result<ProviderRecord, StoreError> {
+    let descriptor = adapter_for_reference(&draft.app_id, &draft.adapter).ok_or_else(|| {
+        StoreError::InvalidProvider("the selected adapter is not available".to_owned())
+    })?;
+    let name = validate_name(&draft.name).map_err(StoreError::InvalidProvider)?;
+    validate_settings(&descriptor, &draft.settings).map_err(StoreError::InvalidProvider)?;
+    Ok(ProviderRecord {
+        id: Uuid::new_v4().to_string(),
+        revision: 1,
+        app_id: descriptor.app_id,
+        adapter: descriptor.reference,
+        name,
+        settings: draft.settings,
+        extensions: serde_json::Map::new(),
+    })
 }
 
 fn file_error(path: &Path, source: std::io::Error) -> StoreError {
@@ -284,7 +407,10 @@ mod tests {
     use super::*;
     use crate::provider::built_in_adapters;
     use serde_json::{json, Map};
-    use std::{sync::mpsc, thread, time::Duration};
+    use std::{
+        sync::{mpsc, Arc},
+        thread,
+    };
 
     fn settings(value: serde_json::Value) -> Map<String, serde_json::Value> {
         value.as_object().expect("settings object").clone()
@@ -380,6 +506,7 @@ mod tests {
             &path,
             serde_json::to_vec_pretty(&json!({
                 "version": 1,
+                "futureRootField": {"registry": "keep"},
                 "providers": [{
                     "id": "plugin-provider",
                     "revision": 7,
@@ -416,6 +543,7 @@ mod tests {
             json!({"mode": "opaque"})
         );
         assert_eq!(plugin["futureProviderField"], json!([1, 2, 3]));
+        assert_eq!(stored["futureRootField"], json!({"registry": "keep"}));
         assert_eq!(stored["providers"].as_array().unwrap().len(), 2);
     }
 
@@ -443,6 +571,7 @@ mod tests {
             .write(&ProviderFile {
                 version: STORE_VERSION,
                 providers: vec![plugin_provider.clone()],
+                extensions: Map::new(),
             })
             .expect("seed plugin record");
 
@@ -473,6 +602,7 @@ mod tests {
             .write(&ProviderFile {
                 version: STORE_VERSION,
                 providers: vec![provider.clone()],
+                extensions: Map::new(),
             })
             .expect("seed old adapter version");
 
@@ -490,34 +620,168 @@ mod tests {
     }
 
     #[test]
-    fn independent_stores_serialize_mutations_with_the_sidecar_lock() {
+    fn independent_stores_report_a_busy_sidecar_lock() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("providers.json");
         let first = ProviderStore::new(path.clone());
         let held_lock = first.lock_file().expect("hold first store lock");
         let second = ProviderStore::new(path);
-        let (started_tx, started_rx) = mpsc::channel();
-        let (result_tx, result_rx) = mpsc::channel();
 
-        let worker = thread::spawn(move || {
-            started_tx.send(()).expect("signal worker");
-            let result = second.create(draft("claude", "builtin.claude.api-key", "Second process"));
-            result_tx.send(result).expect("send mutation result");
-        });
-        started_rx.recv().expect("worker started");
-        assert!(result_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        let result = second.create(draft("claude", "builtin.claude.api-key", "Second process"));
+
+        assert!(matches!(result, Err(StoreError::LockUnavailable)));
 
         drop(held_lock);
-        result_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("second store unblocked")
-            .expect("second store mutation");
-        worker.join().expect("join worker");
+        second
+            .create(draft("claude", "builtin.claude.api-key", "Second process"))
+            .expect("second store mutation after release");
         first
             .create(draft("claude", "builtin.claude.api-key", "First process"))
             .expect("first store mutation");
 
         assert_eq!(first.list("claude").expect("list providers").len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_store_rejects_final_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("providers.json");
+        symlink("/dev/zero", &path).expect("create provider symlink");
+
+        let result = ProviderStore::new(path).list("claude");
+
+        assert!(matches!(result, Err(StoreError::InvalidStore(_))));
+    }
+
+    #[test]
+    fn provider_store_rejects_oversized_files() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("providers.json");
+        let file = File::create(&path).expect("create provider file");
+        file.set_len(MAX_STORE_BYTES + 1)
+            .expect("extend provider file");
+
+        let result = ProviderStore::new(path).list("claude");
+
+        assert!(matches!(result, Err(StoreError::InvalidStore(_))));
+    }
+
+    #[test]
+    fn provider_revision_lock_is_held_through_the_action() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("providers.json");
+        let store = Arc::new(ProviderStore::new(path.clone()));
+        let created = store
+            .create(draft("claude", "builtin.claude.api-key", "Original"))
+            .expect("create provider");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let action_store = Arc::clone(&store);
+        let action_id = created.id.clone();
+        let action = thread::spawn(move || {
+            action_store
+                .with_provider::<(), ()>("claude", &action_id, 1, |_| {
+                    entered_tx.send(()).expect("signal entered action");
+                    release_rx.recv().expect("release action");
+                    Ok(())
+                })
+                .expect("load provider")
+                .expect("run action");
+        });
+        entered_rx.recv().expect("action entered");
+
+        let competing_store = ProviderStore::new(path);
+        let competing_id = created.id.clone();
+        let competing_result = competing_store.update(
+            &competing_id,
+            ProviderUpdate {
+                expected_revision: 1,
+                name: "Competing update".to_owned(),
+                settings: settings(json!({"apiKey": "new-secret"})),
+            },
+        );
+        assert!(matches!(competing_result, Err(StoreError::LockUnavailable)));
+
+        release_tx.send(()).expect("release action");
+        action.join().expect("join action");
+        competing_store
+            .update(
+                &competing_id,
+                ProviderUpdate {
+                    expected_revision: 1,
+                    name: "Competing update".to_owned(),
+                    settings: settings(json!({"apiKey": "new-secret"})),
+                },
+            )
+            .expect("update after release");
+    }
+
+    #[test]
+    fn provider_snapshot_lock_is_held_through_the_action() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("providers.json");
+        let store = Arc::new(ProviderStore::new(path.clone()));
+        let created = store
+            .create(draft("claude", "builtin.claude.api-key", "Original"))
+            .expect("create provider");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let snapshot_store = Arc::clone(&store);
+        let snapshot = thread::spawn(move || {
+            snapshot_store
+                .with_providers::<(), ()>("claude", |_| {
+                    entered_tx.send(()).expect("signal snapshot");
+                    release_rx.recv().expect("release snapshot");
+                    Ok(())
+                })
+                .expect("load providers")
+                .expect("run snapshot action");
+        });
+        entered_rx.recv().expect("snapshot entered");
+
+        let result = ProviderStore::new(path).update(
+            &created.id,
+            ProviderUpdate {
+                expected_revision: created.revision,
+                name: "Competing update".to_owned(),
+                settings: settings(json!({"apiKey": "new-secret"})),
+            },
+        );
+
+        assert!(matches!(result, Err(StoreError::LockUnavailable)));
+        release_tx.send(()).expect("release snapshot");
+        snapshot.join().expect("join snapshot");
+    }
+
+    #[test]
+    fn import_factory_holds_the_store_lock_until_the_provider_is_written() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("providers.json");
+        let store = Arc::new(ProviderStore::new(path.clone()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let import_store = Arc::clone(&store);
+        let import = thread::spawn(move || {
+            import_store
+                .create_from("claude", || {
+                    entered_tx.send(()).expect("signal live snapshot");
+                    release_rx.recv().expect("release live snapshot");
+                    Ok::<_, ()>(draft("claude", "builtin.claude.api-key", "Imported"))
+                })
+                .expect("open provider store")
+                .expect("read live snapshot")
+        });
+        entered_rx.recv().expect("live snapshot entered");
+
+        let competing_result = ProviderStore::new(path).list("claude");
+        assert!(matches!(competing_result, Err(StoreError::LockUnavailable)));
+
+        release_tx.send(()).expect("release live snapshot");
+        let imported = import.join().expect("join import");
+        assert_eq!(store.list("claude").expect("list providers"), [imported]);
     }
 
     #[test]

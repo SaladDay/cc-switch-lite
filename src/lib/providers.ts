@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  CurrentProvider,
   AdapterDescriptor,
   CommandError,
   ProviderDraft,
@@ -18,6 +19,12 @@ export const providersApi = {
     invoke<ProviderRecord>("update_provider", { id, provider }),
   delete: (appId: string, id: string, expectedRevision: number) =>
     invoke<void>("delete_provider", { appId, id, expectedRevision }),
+  importLive: (appId: string) =>
+    invoke<ProviderRecord>("import_live_provider", { appId }),
+  switch: (appId: string, id: string, expectedRevision: number) =>
+    invoke<void>("switch_provider", { appId, id, expectedRevision }),
+  currentProviders: (appId: string) =>
+    invoke<CurrentProvider[]>("current_providers", { appId }),
 };
 
 export function errorMessage(error: unknown): string {

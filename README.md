@@ -30,5 +30,17 @@ The plugin platform design is documented in
 Provider credentials are currently stored as a local JSON file in Tauri's app
 data directory. Writes are atomic; the file is forced to mode `0600` on Unix
 and uses the app-data directory's inherited ACL on Windows. A private sidecar
-lock serializes changes made by multiple Lite processes. This storage is
-separate from Claude Code and Codex live configuration.
+lock serializes changes made by multiple Lite processes; a busy lock is
+reported immediately instead of blocking a command.
+
+Import reads only the API-provider fields that Lite can reproduce. Switching
+uses a versioned, host-validated operation plan with logical configuration
+targets—adapters never receive arbitrary file-write access. Lite updates its
+managed Claude environment keys or its dedicated Codex provider table and
+preserves unrelated live settings. Codex routes carry an installation identity
+and content digest, so Lite refuses to replace a route it cannot prove it owns.
+Lite retains older managed Codex routes because profiles in other Codex config
+layers may still reference them; profile-aware route cleanup is not part of
+this bootstrap step.
+Claude Code status refers to the user-level default; project, local, or managed
+settings can still override it.
