@@ -76,8 +76,11 @@ fn delete_provider(
     store: State<'_, ProviderStore>,
     app_id: String,
     id: String,
+    expected_revision: u64,
 ) -> CommandResult<()> {
-    store.delete(&app_id, &id).map_err(Into::into)
+    store
+        .delete(&app_id, &id, expected_revision)
+        .map_err(Into::into)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

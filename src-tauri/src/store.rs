@@ -32,6 +32,8 @@ pub enum StoreError {
     InvalidProvider(String),
     #[error("provider '{0}' was not found")]
     NotFound(String),
+    #[error("provider '{0}' changed; reload and try again")]
+    Conflict(String),
     #[error("provider store lock is unavailable")]
     LockUnavailable,
 }
@@ -43,6 +45,7 @@ impl StoreError {
             Self::InvalidStore(_) => "invalid_store",
             Self::InvalidProvider(_) => "invalid_provider",
             Self::NotFound(_) => "not_found",
+            Self::Conflict(_) => "conflict",
             Self::LockUnavailable => "lock_unavailable",
         }
     }
@@ -104,6 +107,7 @@ impl ProviderStore {
         let mut file = self.read()?;
         let provider = ProviderRecord {
             id: Uuid::new_v4().to_string(),
+            revision: 1,
             app_id: descriptor.app_id,
             adapter: descriptor.reference,
             name,
@@ -125,6 +129,9 @@ impl ProviderStore {
             .iter_mut()
             .find(|provider| provider.id == id)
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
+        if provider.revision != update.expected_revision {
+            return Err(StoreError::Conflict(id.to_owned()));
+        }
         let descriptor =
             adapter_for_reference(&provider.app_id, &provider.adapter).ok_or_else(|| {
                 StoreError::InvalidProvider("the provider adapter is unavailable".to_owned())
@@ -133,12 +140,16 @@ impl ProviderStore {
 
         provider.name = name;
         provider.settings = update.settings;
+        provider.revision = provider
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidStore("provider revision overflow".to_owned()))?;
         let updated = provider.clone();
         self.write(&file)?;
         Ok(updated)
     }
 
-    pub fn delete(&self, app_id: &str, id: &str) -> Result<(), StoreError> {
+    pub fn delete(&self, app_id: &str, id: &str, expected_revision: u64) -> Result<(), StoreError> {
         ensure_supported_app(app_id)?;
         let _guard = self.gate.lock().map_err(|_| StoreError::LockUnavailable)?;
         let _file_lock = self.lock_file()?;
@@ -148,6 +159,9 @@ impl ProviderStore {
             .iter()
             .position(|provider| provider.id == id && provider.app_id == app_id)
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
+        if file.providers[index].revision != expected_revision {
+            return Err(StoreError::Conflict(id.to_owned()));
+        }
         file.providers.remove(index);
         self.write(&file)
     }
@@ -242,6 +256,7 @@ fn validate_file(file: &ProviderFile) -> Result<(), StoreError> {
     let mut ids = HashSet::new();
     for provider in &file.providers {
         if provider.id.is_empty()
+            || provider.revision == 0
             || provider.app_id.is_empty()
             || provider.adapter.plugin_id.is_empty()
             || provider.adapter.plugin_version.is_empty()
@@ -326,6 +341,7 @@ mod tests {
             .update(
                 &created.id,
                 ProviderUpdate {
+                    expected_revision: created.revision,
                     name: "Primary".to_owned(),
                     settings: settings(json!({
                         "apiKey": "new-secret",
@@ -337,8 +353,11 @@ mod tests {
 
         assert_eq!(updated.id, created.id);
         assert_eq!(updated.adapter, created.adapter);
+        assert_eq!(updated.revision, 2);
         assert_eq!(updated.name, "Primary");
-        store.delete("codex", &created.id).expect("delete provider");
+        store
+            .delete("codex", &created.id, updated.revision)
+            .expect("delete provider");
         assert!(store.list("codex").expect("list providers").is_empty());
     }
 
@@ -363,6 +382,7 @@ mod tests {
                 "version": 1,
                 "providers": [{
                     "id": "plugin-provider",
+                    "revision": 7,
                     "appId": "future-client",
                     "adapter": {
                         "pluginId": "example.plugin",
@@ -405,6 +425,7 @@ mod tests {
         let path = directory.path().join("providers.json");
         let plugin_provider = ProviderRecord {
             id: "plugin-provider".to_owned(),
+            revision: 1,
             app_id: "claude".to_owned(),
             adapter: crate::provider::AdapterReference {
                 plugin_id: "example.plugin".to_owned(),
@@ -429,6 +450,7 @@ mod tests {
         let result = store.update(
             &plugin_provider.id,
             ProviderUpdate {
+                expected_revision: plugin_provider.revision,
                 name: "Changed".to_owned(),
                 settings: settings(json!({"apiKey": "stolen"})),
             },
@@ -457,6 +479,7 @@ mod tests {
         let result = store.update(
             &provider.id,
             ProviderUpdate {
+                expected_revision: provider.revision,
                 name: "Changed".to_owned(),
                 settings: settings(json!({"apiKey": "new-secret"})),
             },
@@ -495,5 +518,44 @@ mod tests {
             .expect("first store mutation");
 
         assert_eq!(first.list("claude").expect("list providers").len(), 2);
+    }
+
+    #[test]
+    fn stale_updates_and_deletes_report_a_conflict() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("providers.json");
+        let first = ProviderStore::new(path.clone());
+        let second = ProviderStore::new(path);
+        let created = first
+            .create(draft("claude", "builtin.claude.api-key", "Original"))
+            .expect("create provider");
+        let stale = second
+            .list("claude")
+            .expect("load stale snapshot")
+            .remove(0);
+
+        let updated = first
+            .update(
+                &created.id,
+                ProviderUpdate {
+                    expected_revision: created.revision,
+                    name: "First writer".to_owned(),
+                    settings: settings(json!({"apiKey": "first-secret"})),
+                },
+            )
+            .expect("first update");
+        let stale_update = second.update(
+            &stale.id,
+            ProviderUpdate {
+                expected_revision: stale.revision,
+                name: "Stale writer".to_owned(),
+                settings: settings(json!({"apiKey": "stale-secret"})),
+            },
+        );
+        let stale_delete = second.delete("claude", &stale.id, stale.revision);
+
+        assert!(matches!(stale_update, Err(StoreError::Conflict(_))));
+        assert!(matches!(stale_delete, Err(StoreError::Conflict(_))));
+        assert_eq!(first.list("claude").unwrap(), [updated]);
     }
 }

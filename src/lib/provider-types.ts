@@ -4,6 +4,7 @@ export type JsonValue =
   string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
 export interface AdapterReference {
+  [key: string]: JsonValue;
   pluginId: string;
   pluginVersion: string;
   adapterId: string;
@@ -13,6 +14,7 @@ export interface AdapterReference {
 
 export interface ProviderRecord {
   id: string;
+  revision: number;
   appId: string;
   adapter: AdapterReference;
   name: string;
@@ -44,9 +46,13 @@ export interface ProviderDraft {
   settings: Record<string, string>;
 }
 
-export interface ProviderUpdate {
+export interface ProviderChanges {
   name: string;
   settings: Record<string, string>;
+}
+
+export interface ProviderUpdate extends ProviderChanges {
+  expectedRevision: number;
 }
 
 export interface CommandError {

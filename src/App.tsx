@@ -18,8 +18,9 @@ import { ProviderDialog } from "./components/ProviderDialog";
 import type {
   AdapterDescriptor,
   AppId,
+  JsonValue,
+  ProviderChanges,
   ProviderRecord,
-  ProviderUpdate,
 } from "./lib/provider-types";
 import { errorMessage, providersApi } from "./lib/providers";
 
@@ -64,17 +65,50 @@ function initialDarkMode(): boolean {
   );
 }
 
-function visibleStringSetting(
+function sameJsonValue(left: JsonValue, right: JsonValue): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => sameJsonValue(value, right[index]))
+    );
+  }
+  if (
+    typeof left !== "object" ||
+    left === null ||
+    typeof right !== "object" ||
+    right === null
+  )
+    return false;
+
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every(
+      (key) =>
+        Object.hasOwn(right, key) && sameJsonValue(left[key], right[key]),
+    )
+  );
+}
+
+function visibleEndpoint(
   adapter: AdapterDescriptor,
   provider: ProviderRecord,
-  key: string,
 ): string {
   const field = adapter.fields.find(
-    (candidate) => candidate.key === key && candidate.kind !== "secret",
+    (candidate) => candidate.key === "baseUrl" && candidate.kind !== "secret",
   );
   if (!field) return "";
-  const value = provider.settings[key];
-  return typeof value === "string" ? value : "";
+  const value = provider.settings.baseUrl;
+  if (typeof value !== "string" || value === "") return "";
+  try {
+    return new URL(value).origin;
+  } catch {
+    return "Custom endpoint";
+  }
 }
 
 function adapterMatchesProvider(
@@ -83,11 +117,7 @@ function adapterMatchesProvider(
 ): boolean {
   return (
     adapter.appId === provider.appId &&
-    adapter.reference.pluginId === provider.adapter.pluginId &&
-    adapter.reference.pluginVersion === provider.adapter.pluginVersion &&
-    adapter.reference.adapterId === provider.adapter.adapterId &&
-    adapter.reference.contractMajor === provider.adapter.contractMajor &&
-    adapter.reference.schemaVersion === provider.adapter.schemaVersion
+    sameJsonValue(adapter.reference, provider.adapter)
   );
 }
 
@@ -172,7 +202,7 @@ export default function App() {
     setEditing(provider);
   };
 
-  const saveProvider = async (update: ProviderUpdate) => {
+  const saveProvider = async (update: ProviderChanges) => {
     if (!editing) return;
     setMutationBusy(true);
     setMutationError(null);
@@ -186,7 +216,10 @@ export default function App() {
         });
         setProviders((current) => [...current, created]);
       } else {
-        const updated = await providersApi.update(editing.id, update);
+        const updated = await providersApi.update(editing.id, {
+          ...update,
+          expectedRevision: editing.revision,
+        });
         setProviders((current) =>
           current.map((provider) =>
             provider.id === updated.id ? updated : provider,
@@ -206,7 +239,7 @@ export default function App() {
     setMutationBusy(true);
     setMutationError(null);
     try {
-      await providersApi.delete(activeApp, deleting.id);
+      await providersApi.delete(activeApp, deleting.id, deleting.revision);
       const deletedIndex = providers.findIndex(
         (provider) => provider.id === deleting.id,
       );
@@ -379,7 +412,7 @@ export default function App() {
                 adapterMatchesProvider(item, provider),
               );
               const endpoint = providerAdapter
-                ? visibleStringSetting(providerAdapter, provider, "baseUrl")
+                ? visibleEndpoint(providerAdapter, provider)
                 : "";
               return (
                 <article

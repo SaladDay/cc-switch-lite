@@ -1,11 +1,12 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import { X } from "lucide-react";
 
 import type {
   AdapterDescriptor,
+  ProviderChanges,
   ProviderRecord,
-  ProviderUpdate,
 } from "../lib/provider-types";
+import { useModalDialog } from "../lib/use-modal-dialog";
 
 interface ProviderDialogProps {
   adapter: AdapterDescriptor;
@@ -13,7 +14,7 @@ interface ProviderDialogProps {
   busy: boolean;
   error: string | null;
   onCancel: () => void;
-  onSave: (provider: ProviderUpdate) => void;
+  onSave: (provider: ProviderChanges) => void;
 }
 
 function initialSettings(
@@ -36,22 +37,12 @@ export function ProviderDialog({
   onCancel,
   onSave,
 }: ProviderDialogProps) {
-  const dialogRef = useRef<HTMLDialogElement>(null);
+  const dialogRef = useModalDialog({ busy, onCancel });
   const [name, setName] = useState(provider?.name ?? "");
   const [settings, setSettings] = useState(() =>
     initialSettings(adapter, provider),
   );
   const title = provider ? "Edit provider" : "Add provider";
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-    if (typeof dialog.showModal === "function") dialog.showModal();
-    else dialog.setAttribute("open", "");
-    return () => {
-      if (dialog.open && typeof dialog.close === "function") dialog.close();
-    };
-  }, []);
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -61,12 +52,13 @@ export function ProviderDialog({
   return (
     <dialog
       ref={dialogRef}
+      aria-modal="true"
       aria-labelledby="provider-dialog-title"
       onCancel={(event) => {
         event.preventDefault();
         if (!busy) onCancel();
       }}
-      className="glass-card m-auto max-h-[calc(100vh-3rem)] w-[calc(100%-3rem)] max-w-lg overflow-y-auto rounded-2xl p-0 text-foreground shadow-2xl"
+      className="glass-card fixed inset-0 z-50 m-auto max-h-[calc(100vh-3rem)] w-[calc(100%-3rem)] max-w-lg overflow-y-auto rounded-2xl p-0 text-foreground shadow-2xl"
     >
       <div className="flex items-start justify-between border-b border-border px-6 py-5">
         <div>

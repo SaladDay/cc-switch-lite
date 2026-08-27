@@ -73,6 +73,7 @@ const adapters: AdapterDescriptor[] = [
 
 const workProvider: ProviderRecord = {
   id: "provider-1",
+  revision: 1,
   appId: "claude",
   adapter: adapters[0].reference,
   name: "Work",
@@ -153,7 +154,11 @@ describe("App", () => {
   it("edits and deletes a stored provider without switching live config", async () => {
     const user = userEvent.setup();
     api.list.mockResolvedValue([workProvider]);
-    api.update.mockResolvedValue({ ...workProvider, name: "Primary" });
+    api.update.mockResolvedValue({
+      ...workProvider,
+      revision: 2,
+      name: "Primary",
+    });
     render(<App />);
 
     await user.click(await screen.findByRole("button", { name: "Edit Work" }));
@@ -171,6 +176,7 @@ describe("App", () => {
       await screen.findByRole("heading", { name: "Primary" }),
     ).toBeVisible();
     expect(api.update).toHaveBeenCalledWith("provider-1", {
+      expectedRevision: 1,
       name: "Primary",
       settings: {
         apiKey: "secret",
@@ -187,7 +193,7 @@ describe("App", () => {
     );
 
     await waitFor(() =>
-      expect(api.delete).toHaveBeenCalledWith("claude", "provider-1"),
+      expect(api.delete).toHaveBeenCalledWith("claude", "provider-1", 2),
     );
     expect(
       await screen.findByRole("heading", {
@@ -213,6 +219,70 @@ describe("App", () => {
     expect(await screen.findByText("Adapter unavailable")).toBeVisible();
     expect(screen.queryByText("must-not-be-rendered")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Edit Work" })).toBeDisabled();
+  });
+
+  it("treats an adapter with opaque identity fields as unavailable", async () => {
+    const futureIdentity = {
+      ...workProvider,
+      adapter: {
+        ...workProvider.adapter,
+        futureAdapterField: { mode: "opaque" },
+      },
+      settings: { baseUrl: "must-not-be-rendered" },
+    };
+    api.list.mockResolvedValue([futureIdentity]);
+    render(<App />);
+
+    expect(await screen.findByText("Adapter unavailable")).toBeVisible();
+    expect(screen.queryByText("must-not-be-rendered")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit Work" })).toBeDisabled();
+  });
+
+  it("shows only a credential-free endpoint origin", async () => {
+    api.list.mockResolvedValue([
+      {
+        ...workProvider,
+        settings: {
+          apiKey: "secret",
+          baseUrl:
+            "https://user:password@proxy.example.com/v1?api_key=token#private",
+        },
+      },
+    ]);
+    render(<App />);
+
+    expect(await screen.findByText("https://proxy.example.com")).toBeVisible();
+    expect(document.body).not.toHaveTextContent("password");
+    expect(document.body).not.toHaveTextContent("api_key");
+    expect(document.body).not.toHaveTextContent("token");
+  });
+
+  it("keeps the dialog fallback modal and closes it with Escape", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    const trigger = await screen.findByRole("button", {
+      name: "Add Claude Code provider",
+    });
+    await user.click(trigger);
+    expect(
+      screen.getByRole("dialog", { name: "Add provider" }),
+    ).toHaveAttribute("aria-modal", "true");
+    expect(document.querySelector("header")).toHaveAttribute("inert");
+    expect(document.querySelector("main")).toHaveAttribute(
+      "aria-hidden",
+      "true",
+    );
+
+    await user.keyboard("{Escape}");
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "Add provider" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(document.querySelector("header")).not.toHaveAttribute("inert");
+    expect(trigger).toHaveFocus();
   });
 
   it("applies and remembers the chosen theme", async () => {

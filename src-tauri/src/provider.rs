@@ -1,6 +1,7 @@
 use cc_switch_core::AppType;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use url::Url;
 
 pub const BUILTIN_PLUGIN_ID: &str = "org.cc-switch.builtin";
 pub const BUILTIN_PLUGIN_VERSION: &str = "0.1.0";
@@ -25,6 +26,7 @@ pub struct AdapterReference {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderRecord {
     pub id: String,
+    pub revision: u64,
     pub app_id: String,
     pub adapter: AdapterReference,
     pub name: String,
@@ -45,6 +47,7 @@ pub struct ProviderDraft {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderUpdate {
+    pub expected_revision: u64,
     pub name: String,
     pub settings: Map<String, Value>,
 }
@@ -223,12 +226,9 @@ pub fn validate_settings(
         if value.len() > MAX_VALUE_BYTES {
             return Err(format!("Setting '{}' is too large", field.label));
         }
-        if field.kind == FieldKind::Url
-            && !value.is_empty()
-            && !(value.starts_with("https://") || value.starts_with("http://"))
-        {
+        if field.kind == FieldKind::Url && !value.is_empty() && !is_safe_http_url(value) {
             return Err(format!(
-                "Setting '{}' must use http:// or https://",
+                "Setting '{}' must be a valid http:// or https:// URL without embedded credentials",
                 field.label
             ));
         }
@@ -244,6 +244,15 @@ pub fn validate_settings(
         }
     }
     Ok(())
+}
+
+fn is_safe_http_url(value: &str) -> bool {
+    Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
 }
 
 #[cfg(test)]
@@ -283,6 +292,19 @@ mod tests {
         assert!(validate_settings(
             descriptor,
             &settings(json!({"apiKey": "secret", "baseUrl": "file:///tmp/config"}))
+        )
+        .is_err());
+        assert!(validate_settings(
+            descriptor,
+            &settings(json!({"apiKey": "secret", "baseUrl": "https://"}))
+        )
+        .is_err());
+        assert!(validate_settings(
+            descriptor,
+            &settings(json!({
+                "apiKey": "secret",
+                "baseUrl": "https://user:password@proxy.example.com"
+            }))
         )
         .is_err());
     }

@@ -16,8 +16,8 @@ export const providersApi = {
     invoke<ProviderRecord>("create_provider", { provider }),
   update: (id: string, provider: ProviderUpdate) =>
     invoke<ProviderRecord>("update_provider", { id, provider }),
-  delete: (appId: string, id: string) =>
-    invoke<void>("delete_provider", { appId, id }),
+  delete: (appId: string, id: string, expectedRevision: number) =>
+    invoke<void>("delete_provider", { appId, id, expectedRevision }),
 };
 
 export function errorMessage(error: unknown): string {

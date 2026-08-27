@@ -1,6 +1,5 @@
-import { useEffect, useRef } from "react";
-
 import type { ProviderRecord } from "../lib/provider-types";
+import { useModalDialog } from "../lib/use-modal-dialog";
 
 interface DeleteProviderDialogProps {
   provider: ProviderRecord;
@@ -17,29 +16,20 @@ export function DeleteProviderDialog({
   onCancel,
   onConfirm,
 }: DeleteProviderDialogProps) {
-  const dialogRef = useRef<HTMLDialogElement>(null);
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-    if (typeof dialog.showModal === "function") dialog.showModal();
-    else dialog.setAttribute("open", "");
-    return () => {
-      if (dialog.open && typeof dialog.close === "function") dialog.close();
-    };
-  }, []);
+  const dialogRef = useModalDialog({ busy, onCancel });
 
   return (
     <dialog
       ref={dialogRef}
       role="alertdialog"
+      aria-modal="true"
       aria-labelledby="delete-dialog-title"
       aria-describedby="delete-dialog-description"
       onCancel={(event) => {
         event.preventDefault();
         if (!busy) onCancel();
       }}
-      className="glass-card m-auto w-[calc(100%-3rem)] max-w-sm rounded-2xl p-6 text-foreground shadow-2xl"
+      className="glass-card fixed inset-0 z-50 m-auto w-[calc(100%-3rem)] max-w-sm rounded-2xl p-6 text-foreground shadow-2xl"
     >
       <h2 id="delete-dialog-title" className="text-lg font-semibold">
         Delete provider?
