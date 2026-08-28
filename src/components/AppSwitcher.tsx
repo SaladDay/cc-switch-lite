@@ -1,6 +1,7 @@
 import type { CSSProperties } from "react";
-import { Terminal } from "lucide-react";
+import { Monitor, Terminal } from "lucide-react";
 
+import { appDefinition } from "../lib/apps";
 import type { AppId } from "../lib/provider-types";
 import { cn } from "../lib/utils";
 import { ProviderIcon } from "./ProviderIcon";
@@ -12,39 +13,14 @@ interface AppSwitcherProps {
   onSwitch: (app: AppId) => void;
 }
 
-const APP_ICON_NAME: Record<AppId, string> = {
-  claude: "claude",
-  "claude-desktop": "claude",
-  codex: "openai",
-  gemini: "gemini",
-  grokbuild: "grok",
-  opencode: "opencode",
-  openclaw: "openclaw",
-  hermes: "hermes",
-  pi: "pi",
-};
-
-const APP_DISPLAY_NAME: Record<AppId, string> = {
-  claude: "Claude Code",
-  "claude-desktop": "Claude Desktop",
-  codex: "Codex",
-  gemini: "Gemini CLI",
-  grokbuild: "Grok Build",
-  opencode: "OpenCode",
-  openclaw: "OpenClaw",
-  hermes: "Hermes",
-  pi: "Pi",
-};
-
 function AppGlyph({ app, isActive }: { app: AppId; isActive: boolean }) {
+  const definition = appDefinition(app);
+  const BadgeIcon =
+    app === "claude" ? Terminal : app === "claude-desktop" ? Monitor : null;
   return (
     <span className="relative inline-flex shrink-0">
-      <ProviderIcon
-        icon={APP_ICON_NAME[app]}
-        name={APP_DISPLAY_NAME[app]}
-        size={20}
-      />
-      {app === "claude" && (
+      <ProviderIcon icon={definition.icon} name={definition.label} size={20} />
+      {BadgeIcon && (
         <span
           className={cn(
             "absolute -bottom-0.5 -right-0.5 flex h-[11px] w-[11px] items-center justify-center rounded-[3px] border",
@@ -54,7 +30,7 @@ function AppGlyph({ app, isActive }: { app: AppId; isActive: boolean }) {
           )}
           aria-hidden="true"
         >
-          <Terminal className="h-[8px] w-[8px]" strokeWidth={2.5} />
+          <BadgeIcon className="h-[8px] w-[8px]" strokeWidth={2.5} />
         </span>
       )}
     </span>
@@ -76,6 +52,7 @@ export function AppSwitcher({
     >
       {apps.map((app) => {
         const isActive = activeApp === app;
+        const label = appDefinition(app).label;
         return (
           <button
             key={app}
@@ -84,8 +61,8 @@ export function AppSwitcher({
             onClick={() => {
               if (!isActive) onSwitch(app);
             }}
-            title={APP_DISPLAY_NAME[app]}
-            aria-label={APP_DISPLAY_NAME[app]}
+            title={label}
+            aria-label={label}
             aria-pressed={isActive}
             className={cn(
               "group inline-flex h-8 items-center rounded-md px-3 text-sm font-medium transition-all duration-200 disabled:pointer-events-none disabled:opacity-50",

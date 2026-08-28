@@ -3,12 +3,16 @@ import { LoaderCircle, Plus, Save } from "lucide-react";
 
 import type {
   AdapterDescriptor,
+  JsonValue,
   ProviderChanges,
   ProviderRecord,
 } from "../lib/provider-types";
+import { isNativeAdapter } from "../lib/provider-types";
+import { nativeSettingsTemplate } from "../lib/apps";
 import { FullScreenPanel } from "./FullScreenPanel";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
+import { Textarea } from "./ui/textarea";
 
 interface ProviderDialogProps {
   adapters: AdapterDescriptor[];
@@ -44,13 +48,43 @@ export function ProviderDialog({
   const [settings, setSettings] = useState(() =>
     initialSettings(adapter, provider),
   );
+  const [nativeSettings, setNativeSettings] = useState(() =>
+    JSON.stringify(
+      provider?.settings ?? nativeSettingsTemplate(adapter.appId),
+      null,
+      2,
+    ),
+  );
+  const [nativeSettingsError, setNativeSettingsError] = useState<string | null>(
+    null,
+  );
   const title = provider ? "Edit provider" : "Add provider";
+  const native = isNativeAdapter(adapter.reference);
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    let nextSettings = settings;
+    if (native) {
+      try {
+        const parsed: JsonValue = JSON.parse(nativeSettings);
+        if (
+          typeof parsed !== "object" ||
+          parsed === null ||
+          Array.isArray(parsed)
+        ) {
+          setNativeSettingsError("Configuration must be a JSON object.");
+          return;
+        }
+        nextSettings = parsed;
+        setNativeSettingsError(null);
+      } catch {
+        setNativeSettingsError("Configuration must be valid JSON.");
+        return;
+      }
+    }
     onSave({
       name,
-      settings,
+      settings: nextSettings,
       adapter: provider ? undefined : adapter.reference,
     });
   };
@@ -59,7 +93,11 @@ export function ProviderDialog({
     <FullScreenPanel
       title={title}
       titleId="provider-dialog-title"
-      description={`${adapter.displayName}. Credentials remain in CC Switch Lite until this provider is activated.`}
+      description={
+        native
+          ? "Edit the same provider configuration object used by full CC Switch."
+          : `${adapter.displayName}. Credentials remain in CC Switch Lite until this provider is activated.`
+      }
       closeLabel="Close provider dialog"
       busy={busy}
       onClose={onCancel}
@@ -101,6 +139,14 @@ export function ProviderDialog({
                 const index = Number(event.target.value);
                 setSelectedIndex(index);
                 setSettings(initialSettings(adapters[index]));
+                setNativeSettings(
+                  JSON.stringify(
+                    nativeSettingsTemplate(adapters[index].appId),
+                    null,
+                    2,
+                  ),
+                );
+                setNativeSettingsError(null);
               }}
               className="flex h-9 w-full rounded-md border border-border-default bg-background px-3 py-1 text-sm text-foreground shadow-sm outline-none transition-colors focus:ring-2 focus:ring-blue-500/20 dark:focus:ring-blue-400/20"
             >
@@ -171,6 +217,44 @@ export function ProviderDialog({
             </div>
           );
         })}
+
+        {native && (
+          <div className="space-y-2">
+            <label
+              htmlFor="native-settings"
+              className="block text-sm font-medium"
+            >
+              Configuration JSON
+            </label>
+            <Textarea
+              id="native-settings"
+              required
+              value={nativeSettings}
+              onChange={(event) => {
+                setNativeSettings(event.target.value);
+                setNativeSettingsError(null);
+              }}
+              className="min-h-64 font-mono text-xs leading-5"
+              aria-describedby="native-settings-help"
+              aria-invalid={nativeSettingsError !== null}
+            />
+            <p
+              id="native-settings-help"
+              className="text-xs font-normal leading-5 text-muted-foreground"
+            >
+              This is the provider fragment written by the selected application.
+              Unknown keys are preserved.
+            </p>
+            {nativeSettingsError && (
+              <p
+                role="alert"
+                className="text-sm text-red-600 dark:text-red-300"
+              >
+                {nativeSettingsError}
+              </p>
+            )}
+          </div>
+        )}
 
         {error && (
           <p

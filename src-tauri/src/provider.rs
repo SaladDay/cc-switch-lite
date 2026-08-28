@@ -159,7 +159,42 @@ pub fn native_adapter_reference(app: &AppType) -> AdapterReference {
     }
 }
 
-#[cfg(test)]
+/// Whether Lite may mutate a provider owned by the shared native catalog.
+///
+/// Full CC Switch keeps a few provider categories whose live configuration is
+/// outside Lite's config-writer boundary. They remain visible in the shared
+/// catalog, but Lite must not edit, apply, or delete them.
+pub fn is_lite_writable(provider: &ProviderRecord) -> bool {
+    let Ok(app) = provider.app_id.parse::<AppType>() else {
+        return false;
+    };
+    if !provider
+        .adapter
+        .same_identity(&native_adapter_reference(&app))
+    {
+        return true;
+    }
+
+    match app {
+        AppType::OpenCode => {
+            !matches!(provider.category.as_deref(), Some("omo") | Some("omo-slim"))
+        }
+        AppType::ClaudeDesktop => {
+            provider.id == "claude-desktop-official"
+                || provider.category.as_deref() == Some("official")
+                || provider
+                    .metadata
+                    .get("claudeDesktopMode")
+                    .and_then(Value::as_str)
+                    != Some("proxy")
+        }
+        AppType::Hermes => {
+            provider.settings.get("_cc_source").and_then(Value::as_str) != Some("providers_dict")
+        }
+        _ => true,
+    }
+}
+
 pub fn native_adapters() -> Vec<AdapterDescriptor> {
     AppType::all()
         .map(|app| AdapterDescriptor {
@@ -403,6 +438,37 @@ mod tests {
             adapter.reference == native_adapter_reference(&adapter.app_id.parse().unwrap())
                 && adapter.fields.is_empty()
         }));
+    }
+
+    #[test]
+    fn lite_keeps_full_version_native_categories_read_only() {
+        let native_provider = |app: AppType| ProviderRecord {
+            id: "provider".to_owned(),
+            revision: 1,
+            app_id: app.as_str().to_owned(),
+            adapter: native_adapter_reference(&app),
+            name: "Provider".to_owned(),
+            settings: Map::new(),
+            category: None,
+            metadata: json!({}),
+            extensions: Map::new(),
+        };
+
+        let mut omo = native_provider(AppType::OpenCode);
+        omo.category = Some("omo".to_owned());
+        assert!(!is_lite_writable(&omo));
+
+        let mut desktop_proxy = native_provider(AppType::ClaudeDesktop);
+        desktop_proxy.metadata = json!({"claudeDesktopMode": "proxy"});
+        assert!(!is_lite_writable(&desktop_proxy));
+
+        let mut hermes_dictionary = native_provider(AppType::Hermes);
+        hermes_dictionary
+            .settings
+            .insert("_cc_source".to_owned(), json!("providers_dict"));
+        assert!(!is_lite_writable(&hermes_dictionary));
+
+        assert!(is_lite_writable(&native_provider(AppType::Pi)));
     }
 
     #[test]

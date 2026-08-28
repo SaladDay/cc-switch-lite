@@ -9,22 +9,30 @@ import {
   Check,
   Download,
   LoaderCircle,
-  Moon,
   Plus,
+  Settings,
   Store,
-  Sun,
 } from "lucide-react";
 
 import { DeleteProviderDialog } from "./components/DeleteProviderDialog";
 import { ImportProviderDialog } from "./components/ImportProviderDialog";
 import { MarketplaceDialog } from "./components/MarketplaceDialog";
 import { ProviderDialog } from "./components/ProviderDialog";
+import { SettingsPage } from "./components/SettingsPage";
 import { AppSwitcher } from "./components/AppSwitcher";
 import {
   ProviderList,
   type ProviderListItem,
 } from "./components/providers/ProviderList";
 import { Button } from "./components/ui/button";
+import { APPS, appDefinition, isAdditiveApp } from "./lib/apps";
+import {
+  initialTheme,
+  initialVisibleApps,
+  THEME_STORAGE_KEY,
+  VISIBLE_APPS_STORAGE_KEY,
+  type Theme,
+} from "./lib/preferences";
 import type {
   AdapterDescriptor,
   AdapterReference,
@@ -37,76 +45,13 @@ import type {
 import { isNativeAdapter, sameAdapterIdentity } from "./lib/provider-types";
 import { errorMessage, providersApi } from "./lib/providers";
 
-interface AppDefinition {
-  id: AppId;
-  label: string;
-  emptyTitle: string;
-}
-
-const APPS: AppDefinition[] = [
-  {
-    id: "claude",
-    label: "Claude Code",
-    emptyTitle: "Add your first Claude Code provider",
-  },
-  {
-    id: "claude-desktop",
-    label: "Claude Desktop",
-    emptyTitle: "Add your first Claude Desktop provider",
-  },
-  {
-    id: "codex",
-    label: "Codex",
-    emptyTitle: "Add your first Codex provider",
-  },
-  {
-    id: "gemini",
-    label: "Gemini CLI",
-    emptyTitle: "Add your first Gemini CLI provider",
-  },
-  {
-    id: "grokbuild",
-    label: "Grok Build",
-    emptyTitle: "Add your first Grok Build provider",
-  },
-  {
-    id: "opencode",
-    label: "OpenCode",
-    emptyTitle: "Add your first OpenCode provider",
-  },
-  {
-    id: "openclaw",
-    label: "OpenClaw",
-    emptyTitle: "Add your first OpenClaw provider",
-  },
-  {
-    id: "hermes",
-    label: "Hermes",
-    emptyTitle: "Add your first Hermes provider",
-  },
-  {
-    id: "pi",
-    label: "Pi",
-    emptyTitle: "Add your first Pi provider",
-  },
-];
-
 const APP_STORAGE_KEY = "cc-switch-lite:last-app";
-const THEME_STORAGE_KEY = "cc-switch-lite:theme";
 const DRAG_BAR_HEIGHT = 28;
 const HEADER_HEIGHT = 64;
 
 function initialApp(): AppId {
   const stored = window.localStorage.getItem(APP_STORAGE_KEY);
   return APPS.some((app) => app.id === stored) ? (stored as AppId) : "claude";
-}
-
-function initialDarkMode(): boolean {
-  const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
-  if (stored) return stored === "dark";
-  return (
-    globalThis.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false
-  );
 }
 
 export function sameJsonValue(left: JsonValue, right: JsonValue): boolean {
@@ -139,16 +84,35 @@ export function sameJsonValue(left: JsonValue, right: JsonValue): boolean {
   );
 }
 
-function visibleEndpoint(
-  adapter: AdapterDescriptor,
-  provider: ProviderRecord,
-): string {
-  const field = adapter.fields.find(
-    (candidate) => candidate.key === "baseUrl" && candidate.kind !== "secret",
-  );
-  if (!field) return "";
-  const value = provider.settings.baseUrl;
-  if (typeof value !== "string" || value === "") return "";
+function endpointCandidate(value: JsonValue): string | undefined {
+  if (typeof value === "string") {
+    const match = value.match(
+      /(?:base_url|baseUrl|baseURL)\s*[:=]\s*["']([^"']+)["']/,
+    );
+    return match?.[1];
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const candidate = endpointCandidate(item);
+      if (candidate) return candidate;
+    }
+    return undefined;
+  }
+  if (typeof value !== "object" || value === null) return undefined;
+  for (const key of ["baseUrl", "baseURL", "base_url", "apiBase"]) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim()) return candidate;
+  }
+  for (const candidate of Object.values(value)) {
+    const endpoint = endpointCandidate(candidate);
+    if (endpoint) return endpoint;
+  }
+  return undefined;
+}
+
+function visibleEndpoint(provider: ProviderRecord): string {
+  const value = endpointCandidate(provider.settings);
+  if (!value) return "";
   try {
     return new URL(value).origin;
   } catch {
@@ -169,7 +133,8 @@ function adapterMatchesProvider(
 export default function App() {
   const [activeApp, setActiveApp] = useState<AppId>(initialApp);
   const [supportedApps, setSupportedApps] = useState<AppId[]>([]);
-  const [isDark, setIsDark] = useState(initialDarkMode);
+  const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [visibleApps, setVisibleApps] = useState(initialVisibleApps);
   const [adapters, setAdapters] = useState<AdapterDescriptor[]>([]);
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -178,6 +143,7 @@ export default function App() {
   const [currentError, setCurrentError] = useState<string | null>(null);
   const [editing, setEditing] = useState<ProviderRecord | "new" | null>(null);
   const [marketplaceOpen, setMarketplaceOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [deleting, setDeleting] = useState<ProviderRecord | null>(null);
   const [mutationBusy, setMutationBusy] = useState(false);
@@ -193,19 +159,41 @@ export default function App() {
   activeAppRef.current = activeApp;
   const addProviderButtonRef = useRef<HTMLButtonElement>(null);
   const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
-  const definition = APPS.find((app) => app.id === activeApp) ?? APPS[0];
+  const definition = appDefinition(activeApp);
   const isClaude = activeApp === "claude";
+  const additive = isAdditiveApp(activeApp);
   const currentLabel = "In Use";
   const importLabel = isClaude
     ? "Import Claude Code user configuration"
     : `Import current ${definition.label} configuration`;
   const activeAdapters = adapters.filter((item) => item.appId === activeApp);
-  const liveAdapters = activeAdapters.filter(
+  const nativeLiveAdapter = activeAdapters.find((item) =>
+    isNativeAdapter(item.reference),
+  );
+  const pluginLiveAdapters = activeAdapters.filter(
+    (item) => item.reference.pluginId !== "org.cc-switch.builtin",
+  );
+  const liveAdapters = nativeLiveAdapter
+    ? [nativeLiveAdapter, ...pluginLiveAdapters]
+    : activeAdapters;
+  const nativeCreationAdapters = activeAdapters.filter((item) =>
+    isNativeAdapter(item.reference),
+  );
+  const formCreationAdapters = activeAdapters.filter(
     (item) => !isNativeAdapter(item.reference),
   );
-  const adapter =
-    activeAdapters.find((item) => isNativeAdapter(item.reference)) ??
-    activeAdapters[0];
+  const creationAdapters =
+    activeApp === "claude" || activeApp === "codex"
+      ? [...formCreationAdapters, ...nativeCreationAdapters]
+      : [...nativeCreationAdapters, ...formCreationAdapters];
+  const adapter = creationAdapters[0];
+  const selectedVisibleApps = supportedApps.filter(
+    (appId) => visibleApps[appId],
+  );
+  const visibleSupportedApps =
+    selectedVisibleApps.length > 0
+      ? selectedVisibleApps
+      : supportedApps.slice(0, 1);
   const editingAdapter =
     editing === "new"
       ? adapter
@@ -253,9 +241,29 @@ export default function App() {
   );
 
   useEffect(() => {
-    document.documentElement.classList.toggle("dark", isDark);
-    window.localStorage.setItem(THEME_STORAGE_KEY, isDark ? "dark" : "light");
-  }, [isDark]);
+    const media = globalThis.matchMedia?.("(prefers-color-scheme: dark)");
+    const apply = () => {
+      const dark = theme === "dark" || (theme === "system" && media?.matches);
+      document.documentElement.classList.toggle("dark", Boolean(dark));
+    };
+    apply();
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    if (theme !== "system" || !media) return;
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, [theme]);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      VISIBLE_APPS_STORAGE_KEY,
+      JSON.stringify(visibleApps),
+    );
+    if (supportedApps.length === 0 || visibleApps[activeApp]) return;
+    const next = supportedApps.find((appId) => visibleApps[appId]);
+    if (!next) return;
+    setActiveApp(next);
+    window.localStorage.setItem(APP_STORAGE_KEY, next);
+  }, [activeApp, supportedApps, visibleApps]);
 
   useEffect(() => {
     let ignore = false;
@@ -330,6 +338,17 @@ export default function App() {
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
   }, [activeApp, refreshCurrent]);
+
+  useEffect(() => {
+    const openSettingsShortcut = (event: KeyboardEvent) => {
+      if (event.metaKey && event.key === ",") {
+        event.preventDefault();
+        if (!mutationBusy && liveBusy === null) setSettingsOpen(true);
+      }
+    };
+    window.addEventListener("keydown", openSettingsShortcut);
+    return () => window.removeEventListener("keydown", openSettingsShortcut);
+  }, [liveBusy, mutationBusy]);
 
   const selectApp = (app: AppId) => {
     setActiveApp(app);
@@ -421,7 +440,9 @@ export default function App() {
     setLiveError(null);
     setNotice(null);
     try {
-      if (selectedAdapter) {
+      if (selectedAdapter && isNativeAdapter(selectedAdapter)) {
+        await providersApi.importNative(activeApp);
+      } else if (selectedAdapter) {
         await providersApi.importLive(activeApp, selectedAdapter);
       } else {
         await providersApi.importLive(activeApp);
@@ -448,7 +469,10 @@ export default function App() {
       return;
     }
     if (liveAdapters.length === 0) return;
-    void importLiveProvider();
+    const onlyAdapter = liveAdapters[0].reference;
+    void importLiveProvider(
+      isNativeAdapter(onlyAdapter) ? onlyAdapter : undefined,
+    );
   };
 
   const switchProvider = async (provider: ProviderRecord) => {
@@ -471,23 +495,56 @@ export default function App() {
     }
   };
 
+  const removeProviderFromLive = async (provider: ProviderRecord) => {
+    setLiveBusy(provider.id);
+    setLiveError(null);
+    setNotice(null);
+    try {
+      await providersApi.removeFromLive(
+        activeApp,
+        provider.id,
+        provider.revision,
+      );
+      setProviders(await providersApi.list(activeApp));
+      await refreshCurrent(activeApp);
+      setNotice(`${provider.name} was removed from ${definition.label}.`);
+    } catch (error) {
+      setLiveError(errorMessage(error));
+    } finally {
+      setLiveBusy(null);
+    }
+  };
+
   const providerItems: ProviderListItem[] = providers.map((provider) => {
     const providerAdapter = adapters.find((item) =>
       adapterMatchesProvider(item, provider),
     );
+    const hermesManaged =
+      activeApp === "hermes" &&
+      provider.settings._cc_source === "providers_dict";
+    const readOnly = hermesManaged || provider.liteConfigWritable === false;
+    const isCurrent = currentProviders.some(
+      (current) =>
+        current.id === provider.id && current.revision === provider.revision,
+    );
     return {
       provider,
       adapterAvailable: providerAdapter !== undefined,
+      canEdit: providerAdapter !== undefined && !readOnly,
       canSwitch:
+        providerAdapter !== undefined && !readOnly && currentError === null,
+      canRemove:
         providerAdapter !== undefined &&
-        !isNativeAdapter(providerAdapter.reference),
-      endpoint: providerAdapter
-        ? visibleEndpoint(providerAdapter, provider)
-        : "",
-      isCurrent: currentProviders.some(
-        (current) =>
-          current.id === provider.id && current.revision === provider.revision,
-      ),
+        isNativeAdapter(providerAdapter.reference) &&
+        additive &&
+        !readOnly &&
+        currentError === null,
+      canDelete: !readOnly && currentError === null && (additive || !isCurrent),
+      isAdditive: additive,
+      isReadOnly: readOnly,
+      readOnlyLabel: hermesManaged ? "Hermes managed" : "Not supported in Lite",
+      endpoint: providerAdapter ? visibleEndpoint(provider) : "",
+      isCurrent,
     };
   });
 
@@ -528,16 +585,13 @@ export default function App() {
             <Button
               variant="ghost"
               size="icon"
-              onClick={() => setIsDark((current) => !current)}
-              title={isDark ? "Use light theme" : "Use dark theme"}
-              aria-label={isDark ? "Use light theme" : "Use dark theme"}
+              disabled={mutationBusy || liveBusy !== null}
+              onClick={() => setSettingsOpen(true)}
+              title="Settings"
+              aria-label="Open settings"
               className="hover:bg-black/5 dark:hover:bg-white/5"
             >
-              {isDark ? (
-                <Sun className="h-4 w-4" />
-              ) : (
-                <Moon className="h-4 w-4" />
-              )}
+              <Settings className="h-4 w-4" />
             </Button>
           </div>
 
@@ -545,7 +599,7 @@ export default function App() {
             <div className="flex min-w-0 flex-1 items-center justify-end overflow-hidden py-4">
               <AppSwitcher
                 activeApp={activeApp}
-                apps={supportedApps}
+                apps={visibleSupportedApps}
                 disabled={mutationBusy || liveBusy !== null}
                 onSwitch={selectApp}
               />
@@ -635,6 +689,7 @@ export default function App() {
                 onCreate={() => openEditor("new")}
                 onImport={beginImport}
                 onSwitch={switchProvider}
+                onRemove={removeProviderFromLive}
                 onEdit={openEditor}
                 onDelete={(provider) => {
                   setMutationError(null);
@@ -654,12 +709,27 @@ export default function App() {
       {editing && editingAdapter && (
         <ProviderDialog
           key={editing === "new" ? `${activeApp}-new` : editing.id}
-          adapters={editing === "new" ? activeAdapters : [editingAdapter]}
+          adapters={editing === "new" ? creationAdapters : [editingAdapter]}
           provider={editing === "new" ? undefined : editing}
           busy={mutationBusy}
           error={mutationError}
           onCancel={() => setEditing(null)}
           onSave={saveProvider}
+        />
+      )}
+
+      {settingsOpen && (
+        <SettingsPage
+          theme={theme}
+          visibleApps={visibleApps}
+          supportedApps={supportedApps}
+          onThemeChange={setTheme}
+          onVisibleAppsChange={setVisibleApps}
+          onOpenMarketplace={() => {
+            setSettingsOpen(false);
+            setMarketplaceOpen(true);
+          }}
+          onClose={() => setSettingsOpen(false)}
         />
       )}
 

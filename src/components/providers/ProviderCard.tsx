@@ -1,5 +1,6 @@
 import type { Ref } from "react";
 
+import { appDefinition } from "../../lib/apps";
 import type { AppId, ProviderRecord } from "../../lib/provider-types";
 import { cn } from "../../lib/utils";
 import { ProviderIcon } from "../ProviderIcon";
@@ -9,7 +10,13 @@ export interface ProviderListItem {
   provider: ProviderRecord;
   endpoint: string;
   adapterAvailable: boolean;
+  canEdit: boolean;
   canSwitch: boolean;
+  canRemove: boolean;
+  canDelete: boolean;
+  isAdditive: boolean;
+  isReadOnly: boolean;
+  readOnlyLabel: string;
   isCurrent: boolean;
 }
 
@@ -20,6 +27,7 @@ interface ProviderCardProps extends ProviderListItem {
   switching: boolean;
   deleteButtonRef?: Ref<HTMLButtonElement>;
   onSwitch: (provider: ProviderRecord) => void;
+  onRemove: (provider: ProviderRecord) => void;
   onEdit: (provider: ProviderRecord) => void;
   onDelete: (provider: ProviderRecord) => void;
 }
@@ -28,7 +36,13 @@ export function ProviderCard({
   provider,
   endpoint,
   adapterAvailable,
+  canEdit,
   canSwitch,
+  canRemove,
+  canDelete,
+  isAdditive,
+  isReadOnly,
+  readOnlyLabel,
   isCurrent,
   appId,
   currentLabel,
@@ -36,14 +50,16 @@ export function ProviderCard({
   switching,
   deleteButtonRef,
   onSwitch,
+  onRemove,
   onEdit,
   onDelete,
 }: ProviderCardProps) {
   const displayEndpoint = adapterAvailable
     ? endpoint || "Default endpoint"
     : "Adapter unavailable";
-  const currentAriaLabel =
-    appId === "claude"
+  const currentAriaLabel = isAdditive
+    ? `${provider.name} is in ${appDefinition(appId).label}`
+    : appId === "claude"
       ? `${provider.name} is the Claude Code user default`
       : `${provider.name} is current`;
 
@@ -67,7 +83,7 @@ export function ProviderCard({
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg border border-border bg-muted transition-transform duration-300 group-hover:scale-105">
             <ProviderIcon
-              icon={appId === "claude" ? "claude" : "openai"}
+              icon={appDefinition(appId).icon}
               name={provider.name}
               size={20}
             />
@@ -81,6 +97,11 @@ export function ProviderCard({
               >
                 {provider.name}
               </h3>
+              {isReadOnly && (
+                <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-600 dark:text-amber-300">
+                  {readOnlyLabel}
+                </span>
+              )}
             </div>
             <p
               className="inline-flex max-w-full items-center overflow-hidden text-left text-sm text-muted-foreground"
@@ -99,12 +120,18 @@ export function ProviderCard({
               isCurrent={isCurrent}
               currentLabel={currentLabel}
               currentAriaLabel={currentAriaLabel}
-              canEdit={adapterAvailable}
+              canEdit={canEdit}
               canSwitch={canSwitch}
+              canRemove={canRemove}
+              canDelete={canDelete}
+              isAdditive={isAdditive}
+              isReadOnly={isReadOnly}
+              readOnlyLabel={readOnlyLabel}
               busy={busy}
               switching={switching}
               deleteButtonRef={deleteButtonRef}
               onSwitch={() => onSwitch(provider)}
+              onRemove={() => onRemove(provider)}
               onEdit={() => onEdit(provider)}
               onDelete={() => onDelete(provider)}
             />

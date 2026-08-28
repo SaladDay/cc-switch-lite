@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 mod live;
 mod native_live;
 mod operation;
@@ -11,9 +13,9 @@ use plugin::{
     PluginManager, PluginRequest, PluginResponse, RegistryDraft, RegistrySource,
 };
 use provider::{
-    built_in_adapters, native_adapter_reference, AdapterDescriptor, AdapterReference,
-    CurrentProvider, ProviderDraft, ProviderRecord, ProviderUpdate, BUILTIN_PLUGIN_ID,
-    CONTRACT_MAJOR,
+    built_in_adapters, is_lite_writable, native_adapter_reference, AdapterDescriptor,
+    AdapterReference, CurrentProvider, ProviderDraft, ProviderRecord, ProviderUpdate,
+    BUILTIN_PLUGIN_ID, CONTRACT_MAJOR,
 };
 use serde::Serialize;
 use store::{ProviderStore, StoreError};
@@ -73,7 +75,14 @@ fn list_providers(
     store: State<'_, ProviderStore>,
     app_id: String,
 ) -> CommandResult<Vec<ProviderRecord>> {
-    store.list(&app_id).map_err(Into::into)
+    let mut providers = store.list(&app_id)?;
+    for provider in &mut providers {
+        provider.extensions.insert(
+            "liteConfigWritable".to_owned(),
+            serde_json::Value::Bool(is_lite_writable(provider)),
+        );
+    }
+    Ok(providers)
 }
 
 #[tauri::command]
@@ -315,11 +324,68 @@ fn switch_provider(
 }
 
 #[tauri::command]
+fn remove_provider_from_live(
+    store: State<'_, ProviderStore>,
+    live: State<'_, LiveConfig>,
+    app_id: String,
+    id: String,
+    expected_revision: u64,
+) -> CommandResult<()> {
+    store.remove_from_live_with_provider(
+        &app_id,
+        &id,
+        expected_revision,
+        |provider| {
+            let app = provider
+                .app_id
+                .parse::<cc_switch_core::AppType>()
+                .map_err(|_| {
+                    CommandError::from(PluginError::Invalid(
+                        "provider application is not supported".to_owned(),
+                    ))
+                })?;
+            if !provider
+                .adapter
+                .same_identity(&native_adapter_reference(&app))
+            {
+                return Err(CommandError::from(PluginError::Invalid(
+                    "only native additive providers can be removed from live configuration"
+                        .to_owned(),
+                )));
+            }
+            live.remove_native_recoverable(provider)
+                .map_err(CommandError::from)
+        },
+        |receipt| live.rollback(receipt).map_err(|error| error.to_string()),
+    )?
+}
+
+#[tauri::command]
 fn current_providers(
     store: State<'_, ProviderStore>,
+    live: State<'_, LiveConfig>,
     app_id: String,
 ) -> CommandResult<Vec<CurrentProvider>> {
-    store.current(&app_id).map_err(Into::into)
+    let app = app_id.parse::<cc_switch_core::AppType>().map_err(|_| {
+        CommandError::from(StoreError::InvalidProvider(format!(
+            "application '{app_id}' is not supported"
+        )))
+    })?;
+    if !app.is_additive_mode() {
+        return store.current(&app_id).map_err(Into::into);
+    }
+
+    let live_ids = match live.import_native_drafts(&app_id) {
+        Ok(providers) => providers
+            .into_iter()
+            .map(|provider| provider.native_id)
+            .collect::<HashSet<_>>(),
+        Err(LiveError::Missing(_)) => HashSet::new(),
+        Err(error) => return Err(error.into()),
+    };
+    store
+        .current_with_native_live_ids(&app_id, &live_ids)
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -412,6 +478,7 @@ pub fn run() {
             import_live_provider,
             import_live_providers,
             switch_provider,
+            remove_provider_from_live,
             current_providers,
             list_plugin_registries,
             save_plugin_registry,

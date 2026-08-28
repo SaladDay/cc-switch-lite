@@ -31,8 +31,16 @@ export const providersApi = {
     invoke<void>("delete_provider", { appId, id, expectedRevision }),
   importLive: (appId: string, adapter: AdapterReference | null = null) =>
     invoke<ProviderRecord>("import_live_provider", { appId, adapter }),
+  importNative: (appId: string) =>
+    invoke<ProviderRecord[]>("import_live_providers", { appId }),
   switch: (appId: string, id: string, expectedRevision: number) =>
     invoke<void>("switch_provider", { appId, id, expectedRevision }),
+  removeFromLive: (appId: string, id: string, expectedRevision: number) =>
+    invoke<void>("remove_provider_from_live", {
+      appId,
+      id,
+      expectedRevision,
+    }),
   currentProviders: (appId: string) =>
     invoke<CurrentProvider[]>("current_providers", { appId }),
 };
