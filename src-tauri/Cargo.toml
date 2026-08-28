@@ -16,17 +16,20 @@ tauri-build = { version = "2.4.0", features = [] }
 
 [dependencies]
 base64 = "0.22"
-cc-switch-core = { git = "https://github.com/SaladDay/cc-switch-core", rev = "14fd610b5e25c4b1b431eda0e5744863da2ea683" }
+cc-switch-core = { git = "https://github.com/SaladDay/cc-switch-core", rev = "a445112c4f844a357a8aac561efa007010e6ac0a" }
 ed25519-dalek = { version = "2.2", default-features = false, features = ["fast", "std", "zeroize"] }
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 futures-util = "0.3"
 hmac = "0.12"
+json5 = "0.4"
+json-five = "0.3.1"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
+serde_yaml = "0.9"
 sha2 = "0.10"
 tauri = { version = "2.8.2", features = [] }
 thiserror = "2.0"

@@ -1,4 +1,5 @@
 mod live;
+mod native_live;
 mod operation;
 mod plugin;
 mod provider;
@@ -133,13 +134,70 @@ fn update_provider(
 #[tauri::command]
 fn delete_provider(
     store: State<'_, ProviderStore>,
+    live: State<'_, LiveConfig>,
     app_id: String,
     id: String,
     expected_revision: u64,
 ) -> CommandResult<()> {
+    let app = app_id.parse::<cc_switch_core::AppType>().map_err(|_| {
+        CommandError::from(StoreError::InvalidProvider(format!(
+            "application '{app_id}' is not supported"
+        )))
+    })?;
+    if app.is_additive_mode() {
+        return store.delete_additive_with_provider(
+            &app_id,
+            &id,
+            expected_revision,
+            |provider| {
+                if provider
+                    .adapter
+                    .same_identity(&native_adapter_reference(&app))
+                {
+                    remove_owned_additive_live(provider, |provider| {
+                        live.remove_native_recoverable(provider)
+                            .map_err(CommandError::from)
+                    })
+                } else {
+                    Ok(None)
+                }
+            },
+            |receipt| match receipt {
+                Some(receipt) => live.rollback(receipt).map_err(|error| error.to_string()),
+                None => Ok(()),
+            },
+        )?;
+    }
     store
         .delete(&app_id, &id, expected_revision)
         .map_err(Into::into)
+}
+
+fn remove_owned_additive_live<T, E>(
+    provider: &ProviderRecord,
+    remove: impl FnOnce(&ProviderRecord) -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    let db_only = provider
+        .metadata
+        .get("liveConfigManaged")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false);
+    if db_only {
+        return Ok(None);
+    }
+    remove(provider).map(Some)
+}
+
+#[tauri::command]
+fn import_live_providers(
+    store: State<'_, ProviderStore>,
+    live: State<'_, LiveConfig>,
+    app_id: String,
+) -> CommandResult<Vec<ProviderRecord>> {
+    store.import_native_batch_from(&app_id, || {
+        live.import_native_drafts(&app_id)
+            .map_err(CommandError::from)
+    })?
 }
 
 #[tauri::command]
@@ -217,7 +275,17 @@ fn switch_provider(
         &app_id,
         &id,
         expected_revision,
-        |provider| {
+        |provider, common_snippet| {
+            if let Ok(app) = provider.app_id.parse::<cc_switch_core::AppType>() {
+                if provider
+                    .adapter
+                    .same_identity(&native_adapter_reference(&app))
+                {
+                    return live
+                        .switch_native_recoverable(provider, common_snippet)
+                        .map_err(CommandError::from);
+                }
+            }
             if provider.adapter.plugin_id == BUILTIN_PLUGIN_ID {
                 return live
                     .switch_recoverable(provider)
@@ -230,7 +298,7 @@ fn switch_provider(
                     &provider.adapter,
                     &PluginRequest::Plan {
                         contract_major: CONTRACT_MAJOR,
-                        provider: provider.clone(),
+                        provider: Box::new(provider.clone()),
                         snapshots,
                     },
                 )?;
@@ -342,6 +410,7 @@ pub fn run() {
             update_provider,
             delete_provider,
             import_live_provider,
+            import_live_providers,
             switch_provider,
             current_providers,
             list_plugin_registries,
@@ -359,6 +428,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Map};
 
     #[test]
     fn lite_boundary_follows_every_core_application() {
@@ -390,5 +460,43 @@ mod tests {
         assert!(adapters
             .iter()
             .all(|adapter| adapter.reference.plugin_id == "org.cc-switch.builtin"));
+    }
+
+    #[test]
+    fn db_only_additive_providers_do_not_own_same_id_live_entries() {
+        use std::cell::Cell;
+
+        let app = cc_switch_core::AppType::OpenCode;
+        let mut provider = ProviderRecord {
+            id: "external-id".to_owned(),
+            revision: 1,
+            app_id: app.as_str().to_owned(),
+            adapter: native_adapter_reference(&app),
+            name: "DB only".to_owned(),
+            settings: Map::new(),
+            category: None,
+            metadata: json!({"liveConfigManaged": false}),
+            extensions: Map::new(),
+        };
+
+        let called = Cell::new(false);
+        let result = remove_owned_additive_live(&provider, |_| {
+            called.set(true);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert!(result.is_none());
+        assert!(!called.get());
+
+        provider.metadata = json!({"liveConfigManaged": true});
+        assert_eq!(
+            remove_owned_additive_live(&provider, |_| Ok::<_, ()>(())).unwrap(),
+            Some(())
+        );
+        provider.metadata = json!({});
+        assert_eq!(
+            remove_owned_additive_live(&provider, |_| Ok::<_, ()>(())).unwrap(),
+            Some(())
+        );
     }
 }

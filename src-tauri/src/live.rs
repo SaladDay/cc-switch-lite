@@ -13,6 +13,7 @@ use thiserror::Error;
 use toml_edit::{value, DocumentMut, Item, Table};
 
 use crate::{
+    native_live::NativeLiveConfig,
     operation::{
         read_optional, read_optional_no_follow, sha256, ContentExpectation, LivePaths,
         LogicalTarget, OperationError, OperationExecutor, OperationPlan, OperationReceipt,
@@ -20,7 +21,8 @@ use crate::{
     },
     plugin::{PluginCapability, PluginRoute, PluginSlot, PluginSnapshot},
     provider::{
-        adapter_for_reference, built_in_adapters, validate_settings, ProviderDraft, ProviderRecord,
+        adapter_for_reference, built_in_adapters, validate_settings, NativeImport, ProviderDraft,
+        ProviderRecord,
     },
 };
 
@@ -104,8 +106,9 @@ impl LiveError {
 }
 
 pub struct LiveConfig {
+    #[cfg(test)]
     claude_dir: PathBuf,
-    codex_dir: PathBuf,
+    native: NativeLiveConfig,
     lock_path: PathBuf,
     ownership_path: PathBuf,
     gate: Mutex<()>,
@@ -135,9 +138,11 @@ impl LiveConfig {
             "CODEX_HOME",
         )?;
         let ownership_path = lock_path.with_file_name("codex-route-ownership.json");
+        let native = NativeLiveConfig::from_home(home, claude_dir.clone(), codex_dir.clone())?;
         Ok(Self {
+            #[cfg(test)]
             claude_dir,
-            codex_dir,
+            native,
             lock_path,
             ownership_path,
             gate: Mutex::new(()),
@@ -147,9 +152,14 @@ impl LiveConfig {
     #[cfg(test)]
     fn with_roots(claude_dir: PathBuf, codex_dir: PathBuf, lock_path: PathBuf) -> Self {
         let ownership_path = lock_path.with_file_name("codex-route-ownership.json");
+        let home = claude_dir
+            .parent()
+            .unwrap_or(claude_dir.as_path())
+            .to_owned();
+        let native = NativeLiveConfig::for_tests(&home, claude_dir.clone(), codex_dir.clone());
         Self {
             claude_dir,
-            codex_dir,
+            native,
             lock_path,
             ownership_path,
             gate: Mutex::new(()),
@@ -157,11 +167,72 @@ impl LiveConfig {
     }
 
     fn paths(&self) -> LivePaths {
-        LivePaths {
-            claude_settings: self.claude_dir.join("settings.json"),
-            codex_auth: self.codex_dir.join("auth.json"),
-            codex_config: self.codex_dir.join("config.toml"),
+        self.native.paths()
+    }
+
+    pub fn import_native_drafts(&self, app_id: &str) -> Result<Vec<NativeImport>, LiveError> {
+        let app = app_id.parse::<cc_switch_core::AppType>().map_err(|_| {
+            LiveError::InvalidProvider("application is not available in Lite".to_owned())
+        })?;
+        self.with_lock(|| {
+            self.native
+                .resolved_for_app(app.clone())?
+                .import_drafts(app)
+        })
+    }
+
+    pub fn switch_native_recoverable(
+        &self,
+        provider: &ProviderRecord,
+        common_snippet: Option<&str>,
+    ) -> Result<LiveWriteReceipt, LiveError> {
+        let app = provider
+            .app_id
+            .parse::<cc_switch_core::AppType>()
+            .map_err(|_| {
+                LiveError::InvalidProvider("application is not available in Lite".to_owned())
+            })?;
+        if !provider
+            .adapter
+            .same_identity(&crate::provider::native_adapter_reference(&app))
+        {
+            return Err(LiveError::InvalidProvider(
+                "provider does not use its native application adapter".to_owned(),
+            ));
         }
+        self.with_lock(|| {
+            let native = self.native.resolved_for_app(app)?;
+            let paths = native.paths();
+            let plan = native.apply_plan(provider, common_snippet)?;
+            self.execute_recoverable_plan(&paths, &plan, None)
+        })
+    }
+
+    pub fn remove_native_recoverable(
+        &self,
+        provider: &ProviderRecord,
+    ) -> Result<LiveWriteReceipt, LiveError> {
+        let app = provider
+            .app_id
+            .parse::<cc_switch_core::AppType>()
+            .map_err(|_| {
+                LiveError::InvalidProvider("application is not available in Lite".to_owned())
+            })?;
+        if !app.is_additive_mode()
+            || !provider
+                .adapter
+                .same_identity(&crate::provider::native_adapter_reference(&app))
+        {
+            return Err(LiveError::InvalidProvider(
+                "provider does not use an additive native adapter".to_owned(),
+            ));
+        }
+        self.with_lock(|| {
+            let native = self.native.resolved_for_app(app)?;
+            let paths = native.paths();
+            let plan = native.remove_plan(provider)?;
+            self.execute_recoverable_plan(&paths, &plan, None)
+        })
     }
 
     pub fn import_draft(&self, app_id: &str) -> Result<ProviderDraft, LiveError> {
@@ -377,7 +448,7 @@ impl LiveConfig {
             writes: vec![PlannedWrite {
                 target: LogicalTarget::ClaudeSettings,
                 expected: ContentExpectation::for_contents(original),
-                contents: pretty_json_object(root)?,
+                contents: Some(pretty_json_object(root)?),
             }],
         })
     }
@@ -440,7 +511,7 @@ impl LiveConfig {
             writes: vec![PlannedWrite {
                 target: LogicalTarget::CodexConfig,
                 expected: ContentExpectation::for_contents(original_config),
-                contents: config.to_string(),
+                contents: Some(config.to_string()),
             }],
         })
     }
@@ -887,6 +958,7 @@ fn plugin_can_write(capabilities: &[PluginCapability], target: LogicalTarget) ->
             capabilities.contains(&PluginCapability::WriteClaudeSettings)
         }
         LogicalTarget::CodexConfig => capabilities.contains(&PluginCapability::WriteCodexConfig),
+        _ => false,
     }
 }
 
@@ -1283,6 +1355,8 @@ mod tests {
             adapter: descriptor.reference,
             name: "Work".to_owned(),
             settings: settings.as_object().unwrap().clone(),
+            category: None,
+            metadata: Value::Object(Map::new()),
             extensions: Map::new(),
         }
     }

@@ -41,6 +41,10 @@ pub struct ProviderRecord {
     pub adapter: AdapterReference,
     pub name: String,
     pub settings: Map<String, Value>,
+    #[serde(skip)]
+    pub category: Option<String>,
+    #[serde(skip)]
+    pub metadata: Value,
     #[serde(default, flatten)]
     pub extensions: Map<String, Value>,
 }
@@ -68,6 +72,14 @@ pub struct ProviderDraft {
     pub adapter: AdapterReference,
     pub name: String,
     pub settings: Map<String, Value>,
+}
+
+pub(crate) struct NativeImport {
+    pub native_id: String,
+    pub draft: ProviderDraft,
+    pub name_is_explicit: bool,
+    pub category: Option<String>,
+    pub metadata: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

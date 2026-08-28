@@ -377,7 +377,7 @@ pub enum PluginRequest {
     },
     Plan {
         contract_major: u32,
-        provider: ProviderRecord,
+        provider: Box<ProviderRecord>,
         snapshots: Vec<PluginSnapshot>,
     },
     Current {
