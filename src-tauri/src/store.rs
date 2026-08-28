@@ -235,6 +235,7 @@ impl ProviderStore {
         }
 
         let base_time = now_millis()?;
+        let mut identities = HashSet::new();
         for (offset, provider) in file.providers.iter().enumerate() {
             let app = match parse_app(&provider.app_id) {
                 Ok(app) => app,
@@ -243,6 +244,7 @@ impl ProviderStore {
                     continue;
                 }
             };
+            let identity = (app.as_str().to_owned(), provider.id.clone());
             let exists = transaction
                 .query_row(
                     "SELECT 1 FROM providers WHERE id = ?1 AND app_type = ?2",
@@ -251,13 +253,26 @@ impl ProviderStore {
                 )
                 .optional()?
                 .is_some();
-            if exists {
+            if !identities.insert(identity) || exists {
                 archive_legacy_provider(&transaction, offset, "identity_conflict", provider)?;
                 continue;
             }
 
+            let name = match validate_legacy_provider(provider) {
+                Ok(name) => name,
+                Err(_) => {
+                    archive_legacy_provider(&transaction, offset, "invalid_record", provider)?;
+                    continue;
+                }
+            };
             let (settings, adapter, compatibility_settings) =
-                migrate_legacy_provider(provider, &app)?;
+                match migrate_legacy_provider(provider, &app) {
+                    Ok(migrated) => migrated,
+                    Err(_) => {
+                        archive_legacy_provider(&transaction, offset, "invalid_record", provider)?;
+                        continue;
+                    }
+                };
             let created_at = base_time
                 .checked_add(i64::try_from(offset).map_err(|_| {
                     StoreError::InvalidStore(
@@ -280,7 +295,7 @@ impl ProviderStore {
                 params![
                     provider.id,
                     app.as_str(),
-                    validate_name(&provider.name).map_err(StoreError::InvalidProvider)?,
+                    name,
                     serde_json::to_string(&settings)
                         .map_err(|error| StoreError::InvalidStore(error.to_string()))?,
                     created_at,
@@ -612,43 +627,6 @@ impl ProviderStore {
             .record;
         transaction.commit()?;
         Ok(current)
-    }
-
-    pub fn set_current_if_empty(
-        &self,
-        app_id: &str,
-        id: &str,
-        expected_revision: u64,
-    ) -> Result<Option<ProviderRecord>, StoreError> {
-        let app = parse_app(app_id)?;
-        if app.is_additive_mode() {
-            return Ok(None);
-        }
-        let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let provider = self
-            .stored_provider(&transaction, &app, id)?
-            .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
-        ensure_revision(&provider.record, expected_revision)?;
-        let current_count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM providers WHERE app_type = ?1 AND is_current = 1",
-            [app.as_str()],
-            |row| row.get(0),
-        )?;
-        if current_count != 0 {
-            transaction.commit()?;
-            return Ok(None);
-        }
-        transaction.execute(
-            "UPDATE providers SET is_current = 1 WHERE id = ?1 AND app_type = ?2",
-            params![id, app.as_str()],
-        )?;
-        let current = self
-            .stored_provider(&transaction, &app, id)?
-            .ok_or_else(|| StoreError::NotFound(id.to_owned()))?
-            .record;
-        transaction.commit()?;
-        Ok(Some(current))
     }
 
     fn initialize(&self) -> Result<(), StoreError> {
@@ -1136,24 +1114,23 @@ fn validate_legacy_file(file: &LegacyProviderFile) -> Result<(), StoreError> {
             file.version
         )));
     }
-    let mut identities = HashSet::new();
-    for provider in &file.providers {
-        if provider.id.is_empty()
-            || provider.revision == 0
-            || provider.adapter.plugin_id.is_empty()
-            || provider.adapter.plugin_version.is_empty()
-            || provider.adapter.adapter_id.is_empty()
-            || provider.adapter.contract_major == 0
-            || provider.adapter.schema_version == 0
-            || !identities.insert((provider.app_id.as_str(), provider.id.as_str()))
-        {
-            return Err(StoreError::InvalidStore(
-                "a legacy provider record is incomplete or duplicated".to_owned(),
-            ));
-        }
-        validate_name(&provider.name).map_err(StoreError::InvalidProvider)?;
-    }
     Ok(())
+}
+
+fn validate_legacy_provider(provider: &ProviderRecord) -> Result<String, StoreError> {
+    if provider.id.is_empty()
+        || provider.revision == 0
+        || provider.adapter.plugin_id.is_empty()
+        || provider.adapter.plugin_version.is_empty()
+        || provider.adapter.adapter_id.is_empty()
+        || provider.adapter.contract_major == 0
+        || provider.adapter.schema_version == 0
+    {
+        return Err(StoreError::InvalidStore(
+            "a legacy provider record is incomplete".to_owned(),
+        ));
+    }
+    validate_name(&provider.name).map_err(StoreError::InvalidProvider)
 }
 
 fn migrate_legacy_provider(
@@ -2098,6 +2075,22 @@ mod tests {
                         "settings": {"auth": {}, "config": ""}
                     },
                     {
+                        "id": "invalid-claude",
+                        "revision": 1,
+                        "appId": "claude",
+                        "adapter": native_adapter_reference(&AppType::Claude),
+                        "name": "",
+                        "settings": {}
+                    },
+                    {
+                        "id": "codex-kept",
+                        "revision": 2,
+                        "appId": "codex",
+                        "adapter": native_adapter_reference(&AppType::Codex),
+                        "name": "",
+                        "settings": {"auth": {}, "config": ""}
+                    },
+                    {
                         "id": "future-kept",
                         "revision": 1,
                         "appId": "future-client",
@@ -2108,7 +2101,7 @@ mod tests {
                             "contractMajor": 1,
                             "schemaVersion": 1
                         },
-                        "name": "Future kept",
+                        "name": "",
                         "settings": {"token": "secret"}
                     }
                 ]
@@ -2131,11 +2124,15 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<(String, String)>, _>>()
             .unwrap();
-        assert_eq!(archived.len(), 2);
+        assert_eq!(archived.len(), 4);
         assert_eq!(archived[0].0, "identity_conflict");
         assert!(archived[0].1.contains("Conflicting"));
-        assert_eq!(archived[1].0, "unsupported_app");
-        assert!(archived[1].1.contains("Future kept"));
+        assert_eq!(archived[1].0, "invalid_record");
+        assert!(archived[1].1.contains("invalid-claude"));
+        assert_eq!(archived[2].0, "identity_conflict");
+        assert!(archived[2].1.contains("\"revision\":2"));
+        assert_eq!(archived[3].0, "unsupported_app");
+        assert!(archived[3].1.contains("future-kept"));
     }
 
     #[test]
@@ -2214,18 +2211,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(store.current("claude").unwrap()[0].id, alternate.id);
-        let original = store
-            .list("claude")
-            .unwrap()
-            .into_iter()
-            .find(|provider| provider.id == claude.id)
-            .unwrap();
-        assert!(store
-            .set_current_if_empty("claude", &original.id, original.revision)
-            .unwrap()
-            .is_none());
-        assert_eq!(store.current("claude").unwrap()[0].id, alternate.id);
-
         let codex = AppType::Codex;
         let descriptor = native_descriptor(&codex);
         let imported = store

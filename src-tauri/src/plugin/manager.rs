@@ -197,23 +197,6 @@ impl PluginManager {
         reference: &AdapterReference,
         request: &PluginRequest,
     ) -> Result<PluginResponse, PluginError> {
-        self.invoke_with_limit(reference, request, false)
-    }
-
-    pub fn invoke_current(
-        &self,
-        reference: &AdapterReference,
-        request: &PluginRequest,
-    ) -> Result<PluginResponse, PluginError> {
-        self.invoke_with_limit(reference, request, true)
-    }
-
-    fn invoke_with_limit(
-        &self,
-        reference: &AdapterReference,
-        request: &PluginRequest,
-        current_limit: bool,
-    ) -> Result<PluginResponse, PluginError> {
         let installed = self.state.installed(&reference.plugin_id)?;
         if reference.plugin_version != installed.version
             && installed
@@ -240,13 +223,8 @@ impl PluginManager {
             .get(&manifest.component)
             .ok_or_else(|| PluginError::InvalidState("component digest is missing".to_owned()))?;
         let component_path = self.state.component_path(&manifest);
-        if current_limit {
-            self.runtime
-                .invoke_current(&component_path, component_digest, request)
-        } else {
-            self.runtime
-                .invoke(&component_path, component_digest, request)
-        }
+        self.runtime
+            .invoke(&component_path, component_digest, request)
     }
 
     pub async fn refresh(&self) -> Result<MarketplaceCatalog, PluginError> {

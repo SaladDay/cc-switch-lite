@@ -20,8 +20,7 @@ use crate::{
     },
     plugin::{PluginCapability, PluginRoute, PluginSlot, PluginSnapshot},
     provider::{
-        adapter_for_reference, built_in_adapters, validate_settings, CurrentProvider,
-        ProviderDraft, ProviderRecord,
+        adapter_for_reference, built_in_adapters, validate_settings, ProviderDraft, ProviderRecord,
     },
 };
 
@@ -266,57 +265,6 @@ impl LiveConfig {
             } else {
                 Err(OperationError::Rollback(failures.join("; ")).into())
             }
-        })
-    }
-
-    pub fn current_providers(
-        &self,
-        app_id: &str,
-        providers: &[ProviderRecord],
-    ) -> Result<Vec<CurrentProvider>, LiveError> {
-        self.with_lock(|| {
-            let paths = self.paths();
-            let live = match app_id {
-                "claude" => Self::read_claude_settings(
-                    read_optional(&paths.claude_settings)?.as_deref(),
-                    false,
-                )?,
-                "codex" => Self::read_codex_settings(
-                    read_optional(&paths.codex_config)?.as_deref(),
-                    read_optional(&paths.codex_auth)?.as_deref(),
-                    false,
-                    self.read_ownership()?.as_ref(),
-                )?,
-                _ => {
-                    return Err(LiveError::InvalidProvider(
-                        "application is not available in Lite".to_owned(),
-                    ));
-                }
-            };
-            let Some(live) = live else {
-                return Ok(Vec::new());
-            };
-
-            if app_id == "codex" {
-                if let Some(id) = live.get("hostProviderId").and_then(Value::as_str) {
-                    if let Some(provider) = providers.iter().find(|provider| {
-                        provider.id == id
-                            && managed_settings_match(app_id, &provider.settings, &live)
-                    }) {
-                        return Ok(vec![CurrentProvider::from(provider)]);
-                    }
-                }
-            }
-
-            Ok(providers
-                .iter()
-                .filter(|provider| {
-                    provider.app_id == app_id
-                        && adapter_for_reference(&provider.app_id, &provider.adapter).is_some()
-                })
-                .filter(|provider| managed_settings_match(app_id, &provider.settings, &live))
-                .map(CurrentProvider::from)
-                .collect())
         })
     }
 
@@ -1303,38 +1251,8 @@ fn insert_optional_string(target: &mut Map<String, Value>, key: &str, value: Opt
     }
 }
 
-fn managed_settings_match(
-    app_id: &str,
-    provider: &Map<String, Value>,
-    live: &Map<String, Value>,
-) -> bool {
-    provider.get("apiKey").and_then(Value::as_str).unwrap_or("")
-        == live.get("apiKey").and_then(Value::as_str).unwrap_or("")
-        && provider
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            == live
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-        && normalize_base_url_for_app(app_id, provider.get("baseUrl").and_then(Value::as_str))
-            == normalize_base_url_for_app(app_id, live.get("baseUrl").and_then(Value::as_str))
-}
-
 fn normalize_base_url(value: Option<&str>) -> &str {
     value.unwrap_or("").trim().trim_end_matches('/')
-}
-
-fn normalize_base_url_for_app<'a>(app_id: &str, value: Option<&'a str>) -> &'a str {
-    let normalized = normalize_base_url(value);
-    if app_id == "codex" && normalized.is_empty() {
-        DEFAULT_CODEX_BASE_URL
-    } else {
-        normalized
-    }
 }
 
 #[cfg(test)]
@@ -1481,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_host_managed_provider_is_not_imported_switched_or_current() {
+    fn claude_host_managed_provider_is_not_imported_or_switched() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let live = live(directory.path());
         let paths = live.paths();
@@ -1499,10 +1417,6 @@ mod tests {
             live.switch(&provider),
             Err(LiveError::UnsupportedConfig(_))
         ));
-        assert!(live
-            .current_providers("claude", std::slice::from_ref(&provider))
-            .unwrap()
-            .is_empty());
         assert_eq!(fs::read_to_string(paths.claude_settings).unwrap(), original);
     }
 
@@ -1963,48 +1877,6 @@ mod tests {
             live.import_draft("claude"),
             Err(LiveError::UnsupportedConfig(_))
         ));
-    }
-
-    #[test]
-    fn codex_default_endpoint_remains_current_after_switch() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let live = live(directory.path());
-        let provider = provider("codex", json!({"apiKey": "secret"}));
-
-        live.switch(&provider).expect("switch Codex provider");
-        let current = live
-            .current_providers("codex", std::slice::from_ref(&provider))
-            .expect("read current provider");
-
-        assert_eq!(current, [CurrentProvider::from(&provider)]);
-    }
-
-    #[test]
-    fn current_returns_all_matches_for_an_external_live_config() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let live = live(directory.path());
-        let paths = live.paths();
-        fs::create_dir_all(paths.claude_settings.parent().unwrap()).unwrap();
-        fs::write(
-            &paths.claude_settings,
-            r#"{"env":{"ANTHROPIC_API_KEY":"secret"}}"#,
-        )
-        .unwrap();
-        let first = provider("claude", json!({"apiKey": "secret"}));
-        let mut second = first.clone();
-        second.id = "fc92289a-73f8-40ab-bf1a-58fb57f1c36e".to_owned();
-
-        let current = live
-            .current_providers("claude", &[first.clone(), second.clone()])
-            .unwrap();
-
-        assert_eq!(
-            current,
-            [
-                CurrentProvider::from(&first),
-                CurrentProvider::from(&second)
-            ]
-        );
     }
 
     #[test]

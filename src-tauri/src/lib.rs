@@ -4,8 +4,6 @@ mod plugin;
 mod provider;
 mod store;
 
-use std::collections::HashMap;
-
 use live::{LiveConfig, LiveError};
 use plugin::{
     InstallSelection, InstalledPlugin, MarketplaceCatalog, PluginCapability, PluginError,
@@ -64,8 +62,6 @@ impl From<PluginError> for CommandError {
 }
 
 type CommandResult<T> = Result<T, CommandError>;
-const MAX_CURRENT_CALLS: usize = 32;
-const MAX_CURRENT_CALLS_PER_PLUGIN: usize = 8;
 #[tauri::command]
 fn list_provider_adapters(plugins: State<'_, PluginManager>) -> Vec<AdapterDescriptor> {
     plugins.adapters()
@@ -253,83 +249,9 @@ fn switch_provider(
 #[tauri::command]
 fn current_providers(
     store: State<'_, ProviderStore>,
-    live: State<'_, LiveConfig>,
-    plugins: State<'_, PluginManager>,
     app_id: String,
 ) -> CommandResult<Vec<CurrentProvider>> {
-    let current = store.current(&app_id)?;
-    if !current.is_empty() || !matches!(app_id.as_str(), "claude" | "codex") {
-        return Ok(current);
-    }
-
-    let providers = store.list(&app_id)?;
-    let built_in = providers
-        .iter()
-        .filter(|provider| provider.adapter.plugin_id == BUILTIN_PLUGIN_ID)
-        .filter(|provider| {
-            crate::provider::adapter_for_reference(&provider.app_id, &provider.adapter).is_some()
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut detected = live
-        .current_providers(&app_id, &built_in)
-        .map_err(CommandError::from)?;
-    let plugin_providers = providers
-        .iter()
-        .filter(|provider| provider.adapter.plugin_id != BUILTIN_PLUGIN_ID)
-        .collect::<Vec<_>>();
-    let mut calls_by_plugin = HashMap::<&str, usize>::new();
-    for provider in &plugin_providers {
-        *calls_by_plugin
-            .entry(&provider.adapter.plugin_id)
-            .or_default() += 1;
-    }
-    if plugin_providers.len() > MAX_CURRENT_CALLS
-        || calls_by_plugin
-            .values()
-            .any(|calls| *calls > MAX_CURRENT_CALLS_PER_PLUGIN)
-    {
-        return Ok(Vec::new());
-    }
-    for provider in plugin_providers {
-        let matches = (|| {
-            let capabilities =
-                plugins.capabilities_for_reference(&provider.app_id, &provider.adapter)?;
-            let response = live
-                .with_plugin_snapshots(&app_id, &capabilities, |snapshots| {
-                    plugins.invoke_current(
-                        &provider.adapter,
-                        &PluginRequest::Current {
-                            contract_major: CONTRACT_MAJOR,
-                            app_id: app_id.clone(),
-                            adapter_id: provider.adapter.adapter_id.clone(),
-                            settings: provider.settings.clone(),
-                            snapshots,
-                        },
-                    )
-                })
-                .map_err(CommandError::from)??;
-            match response {
-                PluginResponse::Current { matches } => Ok(matches),
-                _ => Err(CommandError::from(PluginError::Runtime)),
-            }
-        })();
-        match matches {
-            Ok(true) => detected.push(CurrentProvider::from(provider)),
-            Ok(false) => {}
-            Err(_) => return Ok(Vec::new()),
-        }
-    }
-    detected.sort_by(|left, right| left.id.cmp(&right.id));
-    detected.dedup_by(|left, right| left.id == right.id);
-    if detected.len() != 1 {
-        return Ok(Vec::new());
-    }
-    let candidate = &detected[0];
-    match store.set_current_if_empty(&app_id, &candidate.id, candidate.revision)? {
-        Some(current) => Ok(vec![CurrentProvider::from(&current)]),
-        None => store.current(&app_id).map_err(Into::into),
-    }
+    store.current(&app_id).map_err(Into::into)
 }
 
 #[tauri::command]
