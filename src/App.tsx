@@ -34,6 +34,7 @@ import type {
   ProviderChanges,
   ProviderRecord,
 } from "./lib/provider-types";
+import { isNativeAdapter } from "./lib/provider-types";
 import { errorMessage, providersApi } from "./lib/providers";
 
 interface AppDefinition {
@@ -199,10 +200,12 @@ export default function App() {
     ? "Import Claude Code user configuration"
     : `Import current ${definition.label} configuration`;
   const activeAdapters = adapters.filter((item) => item.appId === activeApp);
+  const liveAdapters = activeAdapters.filter(
+    (item) => !isNativeAdapter(item.reference),
+  );
   const adapter =
-    activeAdapters.find(
-      (item) => item.reference.pluginId === "org.cc-switch.builtin",
-    ) ?? activeAdapters[0];
+    activeAdapters.find((item) => isNativeAdapter(item.reference)) ??
+    activeAdapters[0];
   const editingAdapter =
     editing === "new"
       ? adapter
@@ -418,10 +421,12 @@ export default function App() {
     setLiveError(null);
     setNotice(null);
     try {
-      const imported = selectedAdapter
-        ? await providersApi.importLive(activeApp, selectedAdapter)
-        : await providersApi.importLive(activeApp);
-      setProviders((current) => [...current, imported]);
+      if (selectedAdapter) {
+        await providersApi.importLive(activeApp, selectedAdapter);
+      } else {
+        await providersApi.importLive(activeApp);
+      }
+      setProviders(await providersApi.list(activeApp));
       await refreshCurrent(activeApp);
       setNotice(
         isClaude
@@ -438,10 +443,11 @@ export default function App() {
 
   const beginImport = () => {
     setLiveError(null);
-    if (activeAdapters.length > 1) {
+    if (liveAdapters.length > 1) {
       setImportDialogOpen(true);
       return;
     }
+    if (liveAdapters.length === 0) return;
     void importLiveProvider();
   };
 
@@ -451,6 +457,7 @@ export default function App() {
     setNotice(null);
     try {
       await providersApi.switch(activeApp, provider.id, provider.revision);
+      setProviders(await providersApi.list(activeApp));
       await refreshCurrent(activeApp);
       setNotice(
         isClaude
@@ -471,6 +478,9 @@ export default function App() {
     return {
       provider,
       adapterAvailable: providerAdapter !== undefined,
+      canSwitch:
+        providerAdapter !== undefined &&
+        !isNativeAdapter(providerAdapter.reference),
       endpoint: providerAdapter
         ? visibleEndpoint(providerAdapter, provider)
         : "",
@@ -549,7 +559,10 @@ export default function App() {
                   variant="ghost"
                   size="sm"
                   disabled={
-                    !adapter || loading || mutationBusy || liveBusy !== null
+                    liveAdapters.length === 0 ||
+                    loading ||
+                    mutationBusy ||
+                    liveBusy !== null
                   }
                   onClick={beginImport}
                   className="hover:bg-black/5 dark:hover:bg-white/5"
@@ -613,6 +626,9 @@ export default function App() {
                   isClaude ? "Import user default" : "Import current"
                 }
                 disabled={!adapter || mutationBusy || liveBusy !== null}
+                importDisabled={
+                  liveAdapters.length === 0 || mutationBusy || liveBusy !== null
+                }
                 busy={mutationBusy || liveBusy !== null}
                 importing={liveBusy === "import"}
                 switchingId={liveBusy}
@@ -656,7 +672,7 @@ export default function App() {
 
       {importDialogOpen && (
         <ImportProviderDialog
-          adapters={activeAdapters}
+          adapters={liveAdapters}
           busy={liveBusy === "import"}
           error={liveError}
           onCancel={() => setImportDialogOpen(false)}

@@ -57,19 +57,27 @@ export interface ProviderDraft {
   appId: string;
   adapter: AdapterReference;
   name: string;
-  settings: Record<string, string>;
+  settings: Record<string, JsonValue>;
 }
 
 export interface ProviderChanges {
   name: string;
-  settings: Record<string, string>;
+  settings: Record<string, JsonValue>;
   adapter?: AdapterReference;
 }
 
 export interface ProviderUpdate {
   expectedRevision: number;
   name: string;
-  settings: Record<string, string>;
+  settings: Record<string, JsonValue>;
+}
+
+export function isNativeAdapter(reference: AdapterReference): boolean {
+  return (
+    reference.pluginId === "org.cc-switch.builtin" &&
+    reference.adapterId.startsWith("builtin.") &&
+    reference.adapterId.endsWith(".native")
+  );
 }
 
 export interface CommandError {

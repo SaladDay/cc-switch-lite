@@ -1,4 +1,10 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -305,6 +311,51 @@ describe("App", () => {
     expect(screen.getByRole("heading", { name: "Work" })).toBeVisible();
   });
 
+  it("creates a native provider from configuration JSON", async () => {
+    const user = userEvent.setup();
+    const nativeAdapter: AdapterDescriptor = {
+      appId: "claude",
+      displayName: "Native configuration",
+      reference: {
+        ...adapters[0].reference,
+        adapterId: "builtin.claude.native",
+      },
+      fields: [],
+    };
+    const nativeProvider: ProviderRecord = {
+      ...workProvider,
+      adapter: nativeAdapter.reference,
+      settings: { env: { ANTHROPIC_API_KEY: "secret" } },
+    };
+    api.listAdapters.mockResolvedValue([nativeAdapter]);
+    api.create.mockResolvedValue(nativeProvider);
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Add Claude Code provider" }),
+    );
+    const dialog = screen.getByRole("dialog", { name: "Add provider" });
+    await user.type(within(dialog).getByLabelText("Provider name"), "Work");
+    const configuration = within(dialog).getByLabelText("Configuration JSON");
+    fireEvent.change(configuration, {
+      target: {
+        value: JSON.stringify({ env: { ANTHROPIC_API_KEY: "secret" } }),
+      },
+    });
+    await user.click(
+      within(dialog).getByRole("button", { name: "Save provider" }),
+    );
+
+    await waitFor(() =>
+      expect(api.create).toHaveBeenCalledWith({
+        appId: "claude",
+        adapter: nativeAdapter.reference,
+        name: "Work",
+        settings: { env: { ANTHROPIC_API_KEY: "secret" } },
+      }),
+    );
+  });
+
   it("creates a provider with an installed plugin adapter", async () => {
     const user = userEvent.setup();
     const pluginAdapter: AdapterDescriptor = {
@@ -565,6 +616,7 @@ describe("App", () => {
   it("imports the current live provider through the host", async () => {
     const user = userEvent.setup();
     api.importLive.mockResolvedValue(workProvider);
+    api.list.mockResolvedValueOnce([]).mockResolvedValue([workProvider]);
     api.currentProviders
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([current(workProvider)]);
@@ -599,6 +651,7 @@ describe("App", () => {
     const imported = { ...workProvider, adapter: pluginAdapter.reference };
     api.listAdapters.mockResolvedValue([...adapters, pluginAdapter]);
     api.importLive.mockResolvedValue(imported);
+    api.list.mockResolvedValueOnce([]).mockResolvedValue([imported]);
     render(<App />);
 
     await user.click(

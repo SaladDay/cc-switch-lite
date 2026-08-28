@@ -4,8 +4,6 @@ mod plugin;
 mod provider;
 mod store;
 
-use std::collections::{HashMap, HashSet};
-
 use live::{LiveConfig, LiveError};
 use plugin::{
     InstallSelection, InstalledPlugin, MarketplaceCatalog, PluginCapability, PluginError,
@@ -64,8 +62,6 @@ impl From<PluginError> for CommandError {
 }
 
 type CommandResult<T> = Result<T, CommandError>;
-const MAX_CURRENT_CALLS: usize = 32;
-const MAX_CURRENT_CALLS_PER_PLUGIN: usize = 8;
 #[tauri::command]
 fn list_provider_adapters(plugins: State<'_, PluginManager>) -> Vec<AdapterDescriptor> {
     plugins.adapters()
@@ -192,6 +188,14 @@ fn import_live_provider(
             .map_err(CommandError::from)?;
         Ok::<_, CommandError>((draft, descriptor))
     })??;
+    if app_id
+        .parse::<cc_switch_core::AppType>()
+        .is_ok_and(|app| !app.is_additive_mode())
+    {
+        return store
+            .set_current(&app_id, &imported.id, imported.revision)
+            .map_err(Into::into);
+    }
     Ok(imported)
 }
 
@@ -204,7 +208,7 @@ fn switch_provider(
     id: String,
     expected_revision: u64,
 ) -> CommandResult<()> {
-    store.with_provider(&app_id, &id, expected_revision, |provider| {
+    let switched = store.with_provider(&app_id, &id, expected_revision, |provider| {
         if provider.adapter.plugin_id == BUILTIN_PLUGIN_ID {
             return live.switch(provider).map_err(CommandError::from);
         }
@@ -226,86 +230,23 @@ fn switch_provider(
         })
         .map_err(CommandError::from)?
         .map_err(CommandError::from)
-    })??;
+    })?;
+    switched?;
+    if app_id
+        .parse::<cc_switch_core::AppType>()
+        .is_ok_and(|app| !app.is_additive_mode())
+    {
+        store.set_current(&app_id, &id, expected_revision)?;
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn current_providers(
     store: State<'_, ProviderStore>,
-    live: State<'_, LiveConfig>,
-    plugins: State<'_, PluginManager>,
     app_id: String,
 ) -> CommandResult<Vec<CurrentProvider>> {
-    let mut current = store.current(&app_id)?;
-    let detected = store.with_providers(&app_id, |providers| {
-        let built_in = providers
-            .iter()
-            .filter(|provider| provider.adapter.plugin_id == BUILTIN_PLUGIN_ID)
-            .filter(|provider| {
-                crate::provider::adapter_for_reference(&provider.app_id, &provider.adapter)
-                    .is_some()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut detected = live
-            .current_providers(&app_id, &built_in)
-            .map_err(CommandError::from)?;
-        let mut failed_plugins = HashSet::new();
-        let mut calls_by_plugin = HashMap::<String, usize>::new();
-        let mut total_calls = 0usize;
-        for provider in providers
-            .iter()
-            .filter(|provider| provider.adapter.plugin_id != BUILTIN_PLUGIN_ID)
-        {
-            let plugin_id = provider.adapter.plugin_id.clone();
-            if total_calls >= MAX_CURRENT_CALLS || failed_plugins.contains(&plugin_id) {
-                continue;
-            }
-            let plugin_calls = calls_by_plugin.entry(plugin_id.clone()).or_default();
-            if *plugin_calls >= MAX_CURRENT_CALLS_PER_PLUGIN {
-                continue;
-            }
-            *plugin_calls += 1;
-            total_calls += 1;
-            let matches = (|| {
-                let capabilities =
-                    plugins.capabilities_for_reference(&provider.app_id, &provider.adapter)?;
-                let response = live
-                    .with_plugin_snapshots(&app_id, &capabilities, |snapshots| {
-                        plugins.invoke_current(
-                            &provider.adapter,
-                            &PluginRequest::Current {
-                                contract_major: CONTRACT_MAJOR,
-                                app_id: app_id.clone(),
-                                adapter_id: provider.adapter.adapter_id.clone(),
-                                settings: provider.settings.clone(),
-                                snapshots,
-                            },
-                        )
-                    })
-                    .map_err(CommandError::from)??;
-                match response {
-                    PluginResponse::Current { matches } => Ok(matches),
-                    _ => Err(CommandError::from(PluginError::Runtime)),
-                }
-            })();
-            match matches {
-                Ok(true) => detected.push(CurrentProvider::from(provider)),
-                Ok(false) => {}
-                Err(_) => {
-                    failed_plugins.insert(plugin_id);
-                }
-            }
-        }
-        Ok::<_, CommandError>(detected)
-    })??;
-    for candidate in detected {
-        if !current.iter().any(|item| item.id == candidate.id) {
-            current.push(candidate);
-        }
-    }
-    Ok(current)
+    store.current(&app_id).map_err(Into::into)
 }
 
 #[tauri::command]
@@ -378,7 +319,9 @@ pub fn run() {
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             let home_dir = app.path().home_dir()?;
-            app.manage(ProviderStore::from_home(&home_dir)?);
+            let store = ProviderStore::from_home(&home_dir)?;
+            store.migrate_legacy(&app_data_dir.join("providers.json"))?;
+            app.manage(store);
             app.manage(PluginManager::new(app_data_dir.join("plugins"))?);
             app.manage(LiveConfig::from_home(
                 &home_dir,

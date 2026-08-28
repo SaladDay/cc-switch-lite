@@ -10,8 +10,8 @@ use semver::Version;
 use url::{Host, Url};
 
 use crate::provider::{
-    adapter_for_reference as built_in_adapter, built_in_adapters, validate_settings,
-    AdapterDescriptor, AdapterReference, ProviderRecord, CONTRACT_MAJOR,
+    adapter_for_reference as built_in_adapter, built_in_adapters, native_adapters,
+    validate_settings, AdapterDescriptor, AdapterReference, ProviderRecord, CONTRACT_MAJOR,
 };
 
 use super::{
@@ -107,7 +107,8 @@ impl PluginManager {
     }
 
     pub fn adapters(&self) -> Vec<AdapterDescriptor> {
-        let mut descriptors = built_in_adapters();
+        let mut descriptors = native_adapters();
+        descriptors.extend(built_in_adapters());
         if let Ok(installed_plugins) = self.state.list_installed() {
             for installed in installed_plugins {
                 if let Ok(manifest) = self.checked_manifest(&installed, &installed.version) {
@@ -200,6 +201,7 @@ impl PluginManager {
         self.invoke_with_limit(reference, request, false)
     }
 
+    #[allow(dead_code)]
     pub fn invoke_current(
         &self,
         reference: &AdapterReference,

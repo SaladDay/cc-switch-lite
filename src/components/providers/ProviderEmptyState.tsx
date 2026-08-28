@@ -7,6 +7,7 @@ interface ProviderEmptyStateProps {
   description: string;
   importLabel: string;
   disabled: boolean;
+  importDisabled: boolean;
   importing: boolean;
   onCreate: () => void;
   onImport: () => void;
@@ -17,6 +18,7 @@ export function ProviderEmptyState({
   description,
   importLabel,
   disabled,
+  importDisabled,
   importing,
   onCreate,
   onImport,
@@ -33,7 +35,7 @@ export function ProviderEmptyState({
         {description}
       </p>
       <div className="mt-6 flex flex-col gap-2">
-        <Button onClick={onImport} disabled={disabled}>
+        <Button onClick={onImport} disabled={importDisabled}>
           {importing ? (
             <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
           ) : (

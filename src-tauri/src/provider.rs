@@ -137,6 +137,17 @@ pub fn native_adapter_reference(app: &AppType) -> AdapterReference {
     }
 }
 
+pub fn native_adapters() -> Vec<AdapterDescriptor> {
+    AppType::all()
+        .map(|app| AdapterDescriptor {
+            app_id: app.as_str().to_owned(),
+            display_name: "Native configuration".to_owned(),
+            reference: native_adapter_reference(&app),
+            fields: Vec::new(),
+        })
+        .collect()
+}
+
 fn field(
     key: &str,
     label: &str,
@@ -349,6 +360,26 @@ mod tests {
             .all(|adapter| adapter.fields.iter().any(|field| {
                 field.key == "apiKey" && field.kind == FieldKind::Secret && field.required
             })));
+    }
+
+    #[test]
+    fn native_adapters_cover_every_core_application() {
+        let adapters = native_adapters();
+
+        assert_eq!(adapters.len(), 9);
+        assert_eq!(
+            adapters
+                .iter()
+                .map(|adapter| adapter.app_id.clone())
+                .collect::<Vec<_>>(),
+            AppType::all()
+                .map(|app| app.as_str().to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert!(adapters.iter().all(|adapter| {
+            adapter.reference == native_adapter_reference(&adapter.app_id.parse().unwrap())
+                && adapter.fields.is_empty()
+        }));
     }
 
     #[test]

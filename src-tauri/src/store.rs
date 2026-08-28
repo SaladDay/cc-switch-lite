@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
+    io::Read,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -8,8 +9,10 @@ use std::{
 use cc_switch_core::AppType;
 use hmac::{Hmac, Mac};
 use rusqlite::{
-    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+    params, types::ValueRef, Connection, OpenFlags, OptionalExtension, Row, Transaction,
+    TransactionBehavior,
 };
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::Sha256;
 use thiserror::Error;
@@ -24,7 +27,20 @@ use crate::provider::{
 const SAFE_JS_INTEGER_MASK: u64 = (1_u64 << 53) - 1;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const ADAPTER_BINDINGS_TABLE: &str = "cc_switch_lite_provider_adapters";
+const MIGRATIONS_TABLE: &str = "cc_switch_lite_migrations";
+const LEGACY_PROVIDER_MIGRATION: &str = "providers-json-v1";
+const LEGACY_STORE_VERSION: u32 = 1;
+const MAX_LEGACY_STORE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_NATIVE_SETTINGS_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyProviderFile {
+    version: u32,
+    providers: Vec<ProviderRecord>,
+    #[serde(default, flatten)]
+    _extensions: Map<String, Value>,
+}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -74,7 +90,7 @@ pub struct ProviderStore {
 
 impl ProviderStore {
     pub fn from_home(home: &Path) -> Result<Self, StoreError> {
-        Self::open(home.join(".cc-switch").join("cc-switch.db"))
+        Self::open(database_path(home))
     }
 
     pub fn open(path: PathBuf) -> Result<Self, StoreError> {
@@ -88,28 +104,15 @@ impl ProviderStore {
 
     pub fn list(&self, app_id: &str) -> Result<Vec<ProviderRecord>, StoreError> {
         let app = parse_app(app_id)?;
-        let connection = self.connect()?;
-        Ok(self
-            .stored_providers(&connection, Some(&app))?
-            .into_iter()
-            .map(|provider| provider.record)
-            .collect())
-    }
-
-    pub fn with_providers<T, E>(
-        &self,
-        app_id: &str,
-        action: impl FnOnce(&[ProviderRecord]) -> Result<T, E>,
-    ) -> Result<Result<T, E>, StoreError> {
-        let app = parse_app(app_id)?;
-        let connection = self.connect()?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction()?;
         let providers = self
-            .stored_providers(&connection, Some(&app))?
+            .stored_providers(&transaction, Some(&app))?
             .into_iter()
             .map(|provider| provider.record)
-            .collect::<Vec<_>>();
-        drop(connection);
-        Ok(action(&providers))
+            .collect();
+        transaction.commit()?;
+        Ok(providers)
     }
 
     pub fn with_provider<T, E>(
@@ -121,7 +124,7 @@ impl ProviderStore {
     ) -> Result<Result<T, E>, StoreError> {
         let app = parse_app(app_id)?;
         let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = connection.transaction()?;
         let provider = self
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
@@ -135,14 +138,108 @@ impl ProviderStore {
         &self,
         action: impl FnOnce(&[ProviderRecord]) -> Result<T, E>,
     ) -> Result<Result<T, E>, StoreError> {
-        let connection = self.connect()?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction()?;
         let providers = self
-            .stored_providers(&connection, None)?
+            .stored_providers(&transaction, None)?
             .into_iter()
             .map(|provider| provider.record)
             .collect::<Vec<_>>();
-        drop(connection);
+        transaction.commit()?;
         Ok(action(&providers))
+    }
+
+    pub fn migrate_legacy(&self, path: &Path) -> Result<(), StoreError> {
+        let connection = self.connect()?;
+        let already_migrated = connection
+            .query_row(
+                &format!("SELECT 1 FROM {MIGRATIONS_TABLE} WHERE id = ?1"),
+                [LEGACY_PROVIDER_MIGRATION],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if already_migrated {
+            return Ok(());
+        }
+        drop(connection);
+
+        let Some(file) = read_legacy_file(path)? else {
+            return Ok(());
+        };
+        validate_legacy_file(&file)?;
+
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let already_migrated = transaction
+            .query_row(
+                &format!("SELECT 1 FROM {MIGRATIONS_TABLE} WHERE id = ?1"),
+                [LEGACY_PROVIDER_MIGRATION],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if already_migrated {
+            transaction.commit()?;
+            return Ok(());
+        }
+
+        let base_time = now_millis()?;
+        for (offset, provider) in file.providers.iter().enumerate() {
+            let app = parse_app(&provider.app_id)?;
+            let exists = transaction
+                .query_row(
+                    "SELECT 1 FROM providers WHERE id = ?1 AND app_type = ?2",
+                    params![provider.id, app.as_str()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                return Err(StoreError::InvalidStore(format!(
+                    "legacy provider '{}' conflicts with an existing shared provider",
+                    provider.id
+                )));
+            }
+
+            let (settings, adapter) = migrate_legacy_provider(provider, &app)?;
+            let created_at = base_time
+                .checked_add(i64::try_from(offset).map_err(|_| {
+                    StoreError::InvalidStore(
+                        "legacy provider count exceeds SQLite range".to_owned(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    StoreError::InvalidStore("legacy provider timestamp overflow".to_owned())
+                })?;
+            let sort_index: i64 = transaction.query_row(
+                "SELECT COALESCE(MAX(sort_index) + 1, 0) FROM providers WHERE app_type = ?1",
+                [app.as_str()],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "INSERT INTO providers
+                 (id, app_type, name, settings_config, created_at, sort_index, meta,
+                  is_current, in_failover_queue)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}', 0, 0)",
+                params![
+                    provider.id,
+                    app.as_str(),
+                    validate_name(&provider.name).map_err(StoreError::InvalidProvider)?,
+                    serde_json::to_string(&settings)
+                        .map_err(|error| StoreError::InvalidStore(error.to_string()))?,
+                    created_at,
+                    sort_index,
+                ],
+            )?;
+            self.save_adapter_binding(&transaction, &provider.id, &app, created_at, &adapter)?;
+        }
+        transaction.execute(
+            &format!("INSERT INTO {MIGRATIONS_TABLE} (id, completed_at) VALUES (?1, ?2)"),
+            params![LEGACY_PROVIDER_MIGRATION, now_millis()?],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn create_resolved_from<E>(
@@ -155,9 +252,8 @@ impl ProviderStore {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
-        let (name, settings) = validate_draft(&app, &draft, &descriptor)?;
-        self.insert_provider(&app, name, settings, &descriptor.reference)
-            .map(Ok)
+        let (name, settings, adapter) = validate_draft(&app, &draft, &descriptor)?;
+        self.insert_provider(&app, name, settings, &adapter).map(Ok)
     }
 
     pub fn create_native(&self, draft: ProviderDraft) -> Result<ProviderRecord, StoreError> {
@@ -304,22 +400,30 @@ impl ProviderStore {
         if app.is_additive_mode() {
             return Ok(Vec::new());
         }
-        let connection = self.connect()?;
-        Ok(self
-            .stored_providers(&connection, Some(&app))?
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction()?;
+        let current = self
+            .stored_providers(&transaction, Some(&app))?
             .into_iter()
             .filter(|provider| provider.is_current)
             .map(|provider| CurrentProvider::from(&provider.record))
-            .collect())
+            .collect::<Vec<_>>();
+        if current.len() > 1 {
+            return Err(StoreError::InvalidStore(format!(
+                "application '{}' has more than one current provider",
+                app.as_str()
+            )));
+        }
+        transaction.commit()?;
+        Ok(current)
     }
 
-    #[cfg(test)]
     pub fn set_current(
         &self,
         app_id: &str,
         id: &str,
         expected_revision: u64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<ProviderRecord, StoreError> {
         let app = parse_app(app_id)?;
         if app.is_additive_mode() {
             return Err(StoreError::InvalidProvider(format!(
@@ -344,8 +448,12 @@ impl ProviderStore {
         if changed != 1 {
             return Err(StoreError::Conflict(id.to_owned()));
         }
+        let current = self
+            .stored_provider(&transaction, &app, id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_owned()))?
+            .record;
         transaction.commit()?;
-        Ok(())
+        Ok(current)
     }
 
     fn initialize(&self) -> Result<(), StoreError> {
@@ -401,6 +509,10 @@ impl ProviderStore {
                 provider_created_at INTEGER NOT NULL,
                 adapter_json TEXT NOT NULL,
                 PRIMARY KEY (provider_id, app_type)
+            );
+            CREATE TABLE IF NOT EXISTS {MIGRATIONS_TABLE} (
+                id TEXT PRIMARY KEY,
+                completed_at INTEGER NOT NULL
             );"
         ))?;
         self.verify_provider_schema(&connection)?;
@@ -462,8 +574,7 @@ impl ProviderStore {
         app: Option<&AppType>,
     ) -> Result<Vec<StoredProvider>, StoreError> {
         let sql = format!(
-            "SELECT p.id, p.app_type, p.name, p.settings_config, p.is_current,
-                    b.adapter_json
+            "SELECT p.*, b.adapter_json AS lite_adapter_json
              FROM providers p
              LEFT JOIN {ADAPTER_BINDINGS_TABLE} b
                ON b.provider_id = p.id
@@ -473,19 +584,10 @@ impl ProviderStore {
              ORDER BY COALESCE(p.sort_index, 999999), p.created_at ASC, p.id ASC"
         );
         let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map([app.map(AppType::as_str)], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, bool>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })?;
+        let mut rows = statement.query([app.map(AppType::as_str)])?;
         let mut providers = Vec::new();
-        for row in rows {
-            providers.push(self.stored_from_columns(row?)?);
+        while let Some(row) = rows.next()? {
+            providers.push(self.stored_from_row(connection, row)?);
         }
         Ok(providers)
     }
@@ -506,8 +608,7 @@ impl ProviderStore {
         id: &str,
     ) -> Result<Option<StoredProvider>, StoreError> {
         let sql = format!(
-            "SELECT p.id, p.app_type, p.name, p.settings_config, p.is_current,
-                    b.adapter_json
+            "SELECT p.*, b.adapter_json AS lite_adapter_json
              FROM providers p
              LEFT JOIN {ADAPTER_BINDINGS_TABLE} b
                ON b.provider_id = p.id
@@ -516,34 +617,24 @@ impl ProviderStore {
              WHERE p.id = ?1 AND (?2 IS NULL OR p.app_type = ?2)
              LIMIT 1"
         );
-        let columns = transaction
-            .query_row(&sql, params![id, app.map(AppType::as_str)], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, bool>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                ))
-            })
-            .optional()?;
-        columns
-            .map(|columns| self.stored_from_columns(columns))
+        let mut statement = transaction.prepare(&sql)?;
+        let mut rows = statement.query(params![id, app.map(AppType::as_str)])?;
+        rows.next()?
+            .map(|row| self.stored_from_row(transaction, row))
             .transpose()
     }
 
-    fn stored_from_columns(
+    fn stored_from_row(
         &self,
-        (id, app_id, name, raw_settings, is_current, raw_adapter): (
-            String,
-            String,
-            String,
-            String,
-            bool,
-            Option<String>,
-        ),
+        connection: &Connection,
+        row: &Row<'_>,
     ) -> Result<StoredProvider, StoreError> {
+        let id: String = row.get("id")?;
+        let app_id: String = row.get("app_type")?;
+        let name: String = row.get("name")?;
+        let raw_settings: String = row.get("settings_config")?;
+        let is_current: bool = row.get("is_current")?;
+        let raw_adapter: Option<String> = row.get("lite_adapter_json")?;
         let app = parse_app(&app_id)?;
         let settings: Value = serde_json::from_str(&raw_settings).map_err(|_| {
             StoreError::InvalidStore(format!("provider '{id}' has invalid settings"))
@@ -557,8 +648,7 @@ impl ProviderStore {
             })?,
             None => native_adapter_reference(&app),
         };
-        let revision =
-            snapshot_revision(&id, &app, &name, &settings, &adapter, &self.revision_key)?;
+        let revision = snapshot_revision(connection, row, &id, &app, &self.revision_key)?;
         Ok(StoredProvider {
             record: ProviderRecord {
                 id,
@@ -604,11 +694,203 @@ fn parse_app(app_id: &str) -> Result<AppType, StoreError> {
     })
 }
 
+fn database_path(home: &Path) -> PathBuf {
+    let default = home.join(".cc-switch").join("cc-switch.db");
+
+    #[cfg(windows)]
+    if !default.exists() {
+        if let Ok(legacy_home) = std::env::var("HOME") {
+            let legacy_home = legacy_home.trim();
+            let legacy = PathBuf::from(legacy_home)
+                .join(".cc-switch")
+                .join("cc-switch.db");
+            if !legacy_home.is_empty() && legacy.exists() {
+                return legacy;
+            }
+        }
+    }
+
+    default
+}
+
+fn read_legacy_file(path: &Path) -> Result<Option<LegacyProviderFile>, StoreError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(StoreError::InvalidStore(
+                "legacy provider store must not be a symbolic link".to_owned(),
+            ));
+        }
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => {
+            return Err(StoreError::InvalidStore(
+                "legacy provider store must be a regular file".to_owned(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(StoreError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    if metadata.len() > MAX_LEGACY_STORE_BYTES {
+        return Err(StoreError::InvalidStore(format!(
+            "legacy provider store exceeds the {MAX_LEGACY_STORE_BYTES} byte limit"
+        )));
+    }
+
+    let file = File::open(path).map_err(|source| StoreError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_LEGACY_STORE_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(|source| StoreError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    if contents.len() as u64 > MAX_LEGACY_STORE_BYTES {
+        return Err(StoreError::InvalidStore(format!(
+            "legacy provider store exceeds the {MAX_LEGACY_STORE_BYTES} byte limit"
+        )));
+    }
+    serde_json::from_slice(&contents)
+        .map(Some)
+        .map_err(|error| StoreError::InvalidStore(format!("legacy provider store: {error}")))
+}
+
+fn validate_legacy_file(file: &LegacyProviderFile) -> Result<(), StoreError> {
+    if file.version != LEGACY_STORE_VERSION {
+        return Err(StoreError::InvalidStore(format!(
+            "unsupported legacy provider store version {}",
+            file.version
+        )));
+    }
+    let mut identities = HashSet::new();
+    for provider in &file.providers {
+        if provider.id.is_empty()
+            || provider.revision == 0
+            || provider.adapter.plugin_id.is_empty()
+            || provider.adapter.plugin_version.is_empty()
+            || provider.adapter.adapter_id.is_empty()
+            || provider.adapter.contract_major == 0
+            || provider.adapter.schema_version == 0
+            || !identities.insert((provider.app_id.as_str(), provider.id.as_str()))
+        {
+            return Err(StoreError::InvalidStore(
+                "a legacy provider record is incomplete or duplicated".to_owned(),
+            ));
+        }
+        parse_app(&provider.app_id)?;
+        validate_name(&provider.name).map_err(StoreError::InvalidProvider)?;
+    }
+    Ok(())
+}
+
+fn migrate_legacy_provider(
+    provider: &ProviderRecord,
+    app: &AppType,
+) -> Result<(Value, AdapterReference), StoreError> {
+    let legacy = crate::provider::adapter_for_reference(&provider.app_id, &provider.adapter);
+    if legacy.is_none() {
+        let settings = Value::Object(provider.settings.clone());
+        validate_native_settings(&provider.settings)?;
+        return Ok((settings, provider.adapter.clone()));
+    }
+
+    let settings =
+        legacy_settings_as_native(app, &provider.name, &provider.settings, &provider.id)?;
+    Ok((settings, native_adapter_reference(app)))
+}
+
+fn legacy_settings_as_native(
+    app: &AppType,
+    name: &str,
+    settings: &Map<String, Value>,
+    identity: &str,
+) -> Result<Value, StoreError> {
+    let api_key = settings
+        .get("apiKey")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            StoreError::InvalidProvider(format!(
+                "legacy provider '{identity}' is missing its API key"
+            ))
+        })?;
+    let base_url = settings
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let model = settings
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+
+    let settings = match app {
+        AppType::Claude => {
+            let mut env = Map::new();
+            env.insert(
+                "ANTHROPIC_API_KEY".to_owned(),
+                Value::String(api_key.to_owned()),
+            );
+            if let Some(base_url) = base_url {
+                env.insert(
+                    "ANTHROPIC_BASE_URL".to_owned(),
+                    Value::String(base_url.to_owned()),
+                );
+            }
+            if let Some(model) = model {
+                env.insert(
+                    "ANTHROPIC_MODEL".to_owned(),
+                    Value::String(model.to_owned()),
+                );
+            }
+            Value::Object(Map::from_iter([("env".to_owned(), Value::Object(env))]))
+        }
+        AppType::Codex => {
+            let mut document = toml_edit::DocumentMut::new();
+            document["model_provider"] = toml_edit::value("custom");
+            if let Some(model) = model {
+                document["model"] = toml_edit::value(model);
+            }
+            let mut route = toml_edit::Table::new();
+            route["name"] = toml_edit::value(name);
+            route["base_url"] = toml_edit::value(base_url.unwrap_or("https://api.openai.com/v1"));
+            route["wire_api"] = toml_edit::value("responses");
+            route["requires_openai_auth"] = toml_edit::value(true);
+            let mut routes = toml_edit::Table::new();
+            routes.insert("custom", toml_edit::Item::Table(route));
+            document["model_providers"] = toml_edit::Item::Table(routes);
+
+            Value::Object(Map::from_iter([
+                (
+                    "auth".to_owned(),
+                    Value::Object(Map::from_iter([(
+                        "OPENAI_API_KEY".to_owned(),
+                        Value::String(api_key.to_owned()),
+                    )])),
+                ),
+                ("config".to_owned(), Value::String(document.to_string())),
+            ]))
+        }
+        _ => {
+            return Err(StoreError::InvalidProvider(format!(
+                "legacy built-in adapter cannot target '{}'",
+                app.as_str()
+            )));
+        }
+    };
+    Ok(settings)
+}
+
 fn validate_draft(
     app: &AppType,
     draft: &ProviderDraft,
     descriptor: &AdapterDescriptor,
-) -> Result<(String, Value), StoreError> {
+) -> Result<(String, Value, AdapterReference), StoreError> {
     if draft.app_id != app.as_str()
         || descriptor.app_id != app.as_str()
         || draft.adapter != descriptor.reference
@@ -617,16 +899,19 @@ fn validate_draft(
             "the provider targets a different application or adapter".to_owned(),
         ));
     }
+    validate_settings(descriptor, &draft.settings).map_err(StoreError::InvalidProvider)?;
+    let name = validate_name(&draft.name).map_err(StoreError::InvalidProvider)?;
     if descriptor.reference.plugin_id == BUILTIN_PLUGIN_ID
         && descriptor.reference != native_adapter_reference(app)
     {
-        return Err(StoreError::InvalidProvider(
-            "the legacy Lite adapter cannot write CC Switch native provider data".to_owned(),
-        ));
+        let settings = legacy_settings_as_native(app, &name, &draft.settings, "new provider")?;
+        return Ok((name, settings, native_adapter_reference(app)));
     }
-    validate_settings(descriptor, &draft.settings).map_err(StoreError::InvalidProvider)?;
-    let name = validate_name(&draft.name).map_err(StoreError::InvalidProvider)?;
-    Ok((name, Value::Object(draft.settings.clone())))
+    Ok((
+        name,
+        Value::Object(draft.settings.clone()),
+        descriptor.reference.clone(),
+    ))
 }
 
 fn validate_native_settings(settings: &Map<String, Value>) -> Result<(), StoreError> {
@@ -658,28 +943,71 @@ fn now_millis() -> Result<i64, StoreError> {
 }
 
 fn snapshot_revision(
+    connection: &Connection,
+    provider_row: &Row<'_>,
     id: &str,
     app: &AppType,
-    name: &str,
-    settings: &Value,
-    adapter: &AdapterReference,
     key: &[u8],
 ) -> Result<u64, StoreError> {
     let mut hasher =
         Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts revision keys of any length");
-    for value in [id, app.as_str(), name] {
-        hasher.update(&(value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    for value in [serde_json::to_vec(settings), serde_json::to_vec(adapter)] {
-        let value = value.map_err(|error| StoreError::InvalidStore(error.to_string()))?;
-        hasher.update(&(value.len() as u64).to_le_bytes());
-        hasher.update(&value);
+    hash_row(&mut hasher, provider_row)?;
+
+    let endpoints_exist = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_endpoints'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    hasher.update(&[u8::from(endpoints_exist)]);
+    if endpoints_exist {
+        let mut statement = connection.prepare(
+            "SELECT * FROM provider_endpoints
+             WHERE provider_id = ?1 AND app_type = ?2 ORDER BY id ASC",
+        )?;
+        let mut rows = statement.query(params![id, app.as_str()])?;
+        while let Some(row) = rows.next()? {
+            hash_row(&mut hasher, row)?;
+        }
     }
     let digest = hasher.finalize().into_bytes();
     let mut first = [0_u8; 8];
     first.copy_from_slice(&digest[..8]);
     Ok((u64::from_le_bytes(first) & SAFE_JS_INTEGER_MASK).max(1))
+}
+
+fn hash_row(hasher: &mut Hmac<Sha256>, row: &Row<'_>) -> Result<(), rusqlite::Error> {
+    let statement = row.as_ref();
+    hasher.update(&(statement.column_count() as u64).to_le_bytes());
+    for index in 0..statement.column_count() {
+        let name = statement.column_name(index)?;
+        hasher.update(&(name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        match row.get_ref(index)? {
+            ValueRef::Null => hasher.update(&[0]),
+            ValueRef::Integer(value) => {
+                hasher.update(&[1]);
+                hasher.update(&value.to_le_bytes());
+            }
+            ValueRef::Real(value) => {
+                hasher.update(&[2]);
+                hasher.update(&value.to_bits().to_le_bytes());
+            }
+            ValueRef::Text(value) => {
+                hasher.update(&[3]);
+                hasher.update(&(value.len() as u64).to_le_bytes());
+                hasher.update(value);
+            }
+            ValueRef::Blob(value) => {
+                hasher.update(&[4]);
+                hasher.update(&(value.len() as u64).to_le_bytes());
+                hasher.update(value);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -762,6 +1090,40 @@ mod tests {
     }
 
     #[test]
+    fn legacy_builtin_form_drafts_are_saved_in_the_native_schema() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let descriptor = crate::provider::built_in_adapters()
+            .into_iter()
+            .find(|adapter| adapter.app_id == "claude")
+            .unwrap();
+        let draft = ProviderDraft {
+            app_id: "claude".to_owned(),
+            adapter: descriptor.reference.clone(),
+            name: "Simple form".to_owned(),
+            settings: Map::from_iter([
+                ("apiKey".to_owned(), Value::String("secret".to_owned())),
+                (
+                    "baseUrl".to_owned(),
+                    Value::String("https://example.com".to_owned()),
+                ),
+            ]),
+        };
+
+        let created = store
+            .create_resolved_from("claude", || Ok::<_, StoreError>((draft, descriptor)))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(created.adapter, native_adapter_reference(&AppType::Claude));
+        assert_eq!(created.settings["env"]["ANTHROPIC_API_KEY"], "secret");
+        assert_eq!(
+            created.settings["env"]["ANTHROPIC_BASE_URL"],
+            "https://example.com"
+        );
+    }
+
+    #[test]
     fn native_crud_preserves_full_application_columns() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("cc-switch.db");
@@ -839,10 +1201,10 @@ mod tests {
         let path = directory.path().join("cc-switch.db");
         let store = ProviderStore::open(path.clone()).unwrap();
         let created = create_native(&store, &AppType::Codex, "Work");
-        Connection::open(path)
-            .unwrap()
+        let connection = Connection::open(&path).unwrap();
+        connection
             .execute(
-                "UPDATE providers SET settings_config='{\"env\":\"changed-by-full\"}'
+                "UPDATE providers SET notes='changed-by-full'
                  WHERE id=?1 AND app_type='codex'",
                 [&created.id],
             )
@@ -850,6 +1212,128 @@ mod tests {
 
         let result = store.delete("codex", &created.id, created.revision);
         assert!(matches!(result, Err(StoreError::Conflict(_))));
+
+        let refreshed = store.list("codex").unwrap().pop().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE provider_endpoints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider_id TEXT NOT NULL,
+                    app_type TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    added_at INTEGER,
+                    FOREIGN KEY (provider_id, app_type)
+                        REFERENCES providers(id, app_type) ON DELETE CASCADE
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO provider_endpoints (provider_id, app_type, url, added_at)
+                 VALUES (?1, 'codex', 'https://example.com', 1)",
+                [&created.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.delete("codex", &created.id, refreshed.revision),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let refreshed = store.list("codex").unwrap().pop().unwrap();
+        connection
+            .execute(
+                "ALTER TABLE providers ADD COLUMN future_full_field TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE providers SET future_full_field='changed'
+                 WHERE id=?1 AND app_type='codex'",
+                [&created.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.delete("codex", &created.id, refreshed.revision),
+            Err(StoreError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn migrates_the_legacy_lite_store_once_without_losing_plugin_identity() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cc-switch.db");
+        let legacy_path = directory.path().join("providers.json");
+        let plugin_adapter = AdapterReference {
+            plugin_id: "example.plugin".to_owned(),
+            plugin_version: "1.2.3".to_owned(),
+            adapter_id: "example.claude".to_owned(),
+            contract_major: 1,
+            schema_version: 2,
+            extensions: Map::from_iter([("future".to_owned(), Value::Bool(true))]),
+        };
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "providers": [
+                    {
+                        "id": "legacy-claude",
+                        "revision": 4,
+                        "appId": "claude",
+                        "adapter": crate::provider::built_in_adapters()[0].reference,
+                        "name": "Claude legacy",
+                        "settings": {
+                            "apiKey": "claude-secret",
+                            "baseUrl": "https://claude.example",
+                            "model": "claude-model"
+                        }
+                    },
+                    {
+                        "id": "legacy-plugin",
+                        "revision": 9,
+                        "appId": "claude",
+                        "adapter": plugin_adapter,
+                        "name": "Plugin legacy",
+                        "settings": {"token": "plugin-secret"}
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = ProviderStore::open(path.clone()).unwrap();
+
+        store.migrate_legacy(&legacy_path).unwrap();
+        store.migrate_legacy(&legacy_path).unwrap();
+        let providers = store.list("claude").unwrap();
+
+        assert_eq!(providers.len(), 2);
+        let native = providers
+            .iter()
+            .find(|provider| provider.id == "legacy-claude")
+            .unwrap();
+        assert_eq!(native.adapter, native_adapter_reference(&AppType::Claude));
+        assert_eq!(native.settings["env"]["ANTHROPIC_API_KEY"], "claude-secret");
+        let plugin = providers
+            .iter()
+            .find(|provider| provider.id == "legacy-plugin")
+            .unwrap();
+        assert_eq!(plugin.adapter.plugin_id, "example.plugin");
+        assert_eq!(plugin.adapter.extensions["future"], true);
+        assert_eq!(plugin.settings["token"], "plugin-secret");
+        assert!(legacy_path.exists());
+        assert_eq!(
+            Connection::open(path)
+                .unwrap()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {MIGRATIONS_TABLE}"),
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
