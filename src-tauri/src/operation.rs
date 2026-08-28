@@ -5,125 +5,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use cc_switch_core::fs::{atomic_write, FileError};
-use serde::{Deserialize, Deserializer, Serialize};
+use cc_switch_core::{
+    fs::{atomic_write, FileError},
+    ConfigFormat, MAX_OPERATION_CONTENT_BYTES,
+};
+pub use cc_switch_core::{
+    ContentExpectation, LogicalTarget, OperationPlan, PlannedWrite, OPERATION_CONTRACT_MAJOR,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use toml_edit::DocumentMut;
 
-pub const OPERATION_CONTRACT_MAJOR: u32 = 1;
-const MAX_OPERATIONS: usize = 4;
-const MAX_CONTENT_BYTES: usize = 1024 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum LogicalTarget {
-    ClaudeSettings,
-    ClaudeDesktopNormalConfig,
-    ClaudeDesktopThreepConfig,
-    ClaudeDesktopProfile,
-    ClaudeDesktopMeta,
-    CodexAuth,
-    CodexConfig,
-    CodexModelCatalog,
-    GeminiEnv,
-    GeminiSettings,
-    GrokConfig,
-    OpenCodeConfig,
-    OpenClawConfig,
-    HermesConfig,
-    PiModels,
-}
-
-impl LogicalTarget {
-    pub(crate) fn app_id(self) -> &'static str {
-        match self {
-            Self::ClaudeSettings => "claude",
-            Self::ClaudeDesktopNormalConfig
-            | Self::ClaudeDesktopThreepConfig
-            | Self::ClaudeDesktopProfile
-            | Self::ClaudeDesktopMeta => "claude-desktop",
-            Self::CodexAuth | Self::CodexConfig | Self::CodexModelCatalog => "codex",
-            Self::GeminiEnv | Self::GeminiSettings => "gemini",
-            Self::GrokConfig => "grokbuild",
-            Self::OpenCodeConfig => "opencode",
-            Self::OpenClawConfig => "openclaw",
-            Self::HermesConfig => "hermes",
-            Self::PiModels => "pi",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", rename_all = "camelCase")]
-pub enum ContentExpectation {
-    Missing,
-    Sha256 { digest: String },
-}
-
-impl<'de> Deserialize<'de> for ContentExpectation {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(tag = "state", rename_all = "camelCase")]
-        enum Wire {
-            Missing {
-                #[serde(flatten)]
-                extra: std::collections::BTreeMap<String, serde_json::Value>,
-            },
-            Sha256 {
-                digest: String,
-                #[serde(flatten)]
-                extra: std::collections::BTreeMap<String, serde_json::Value>,
-            },
-        }
-
-        match Wire::deserialize(deserializer)? {
-            Wire::Missing { extra } if extra.is_empty() => Ok(Self::Missing),
-            Wire::Sha256 { digest, extra } if extra.is_empty() => Ok(Self::Sha256 { digest }),
-            Wire::Missing { .. } | Wire::Sha256 { .. } => Err(serde::de::Error::custom(
-                "unknown content expectation field",
-            )),
-        }
-    }
-}
-
-impl ContentExpectation {
-    pub fn for_contents(contents: Option<&[u8]>) -> Self {
-        match contents {
-            Some(contents) => Self::Sha256 {
-                digest: sha256(contents),
-            },
-            None => Self::Missing,
-        }
-    }
-
-    fn matches(&self, contents: Option<&[u8]>) -> bool {
-        match (self, contents) {
-            (Self::Missing, None) => true,
-            (Self::Sha256 { digest }, Some(contents)) => *digest == sha256(contents),
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PlannedWrite {
-    pub target: LogicalTarget,
-    pub expected: ContentExpectation,
-    pub contents: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct OperationPlan {
-    pub contract_major: u32,
-    pub app_id: String,
-    pub writes: Vec<PlannedWrite>,
-}
+const MAX_CONTENT_BYTES: usize = MAX_OPERATION_CONTENT_BYTES;
 
 #[derive(Debug, Clone)]
 pub struct LivePaths {
@@ -337,55 +230,9 @@ impl<'a> OperationExecutor<'a> {
     }
 
     fn validate(&self, plan: &OperationPlan) -> Result<(), OperationError> {
-        if plan.contract_major != OPERATION_CONTRACT_MAJOR {
-            return Err(OperationError::InvalidPlan(format!(
-                "unsupported contract major {}",
-                plan.contract_major
-            )));
-        }
-        if !cc_switch_core::AppType::all().any(|app| app.as_str() == plan.app_id) {
-            return Err(OperationError::InvalidPlan(
-                "application is not available in Lite".to_owned(),
-            ));
-        }
-        if plan.writes.is_empty() || plan.writes.len() > MAX_OPERATIONS {
-            return Err(OperationError::InvalidPlan(format!(
-                "a plan must contain between 1 and {MAX_OPERATIONS} writes"
-            )));
-        }
-
-        let mut targets = HashSet::new();
+        plan.validate()
+            .map_err(|error| OperationError::InvalidPlan(error.to_string()))?;
         for write in &plan.writes {
-            if write.target.app_id() != plan.app_id {
-                return Err(OperationError::InvalidPlan(
-                    "a write targets a different application".to_owned(),
-                ));
-            }
-            if !targets.insert(write.target) {
-                return Err(OperationError::InvalidPlan(
-                    "a logical target appears more than once".to_owned(),
-                ));
-            }
-            if write
-                .contents
-                .as_ref()
-                .is_some_and(|contents| contents.len() > MAX_CONTENT_BYTES)
-            {
-                return Err(OperationError::InvalidPlan(format!(
-                    "a write exceeds the {MAX_CONTENT_BYTES} byte limit"
-                )));
-            }
-            if let ContentExpectation::Sha256 { digest } = &write.expected {
-                if digest.len() != 64
-                    || !digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-                {
-                    return Err(OperationError::InvalidPlan(
-                        "a SHA-256 precondition is malformed".to_owned(),
-                    ));
-                }
-            }
             validate_contents(write.target, write.contents.as_deref())?;
         }
         Ok(())
@@ -601,31 +448,10 @@ fn canonicalize_missing_path(path: &Path) -> Result<PathBuf, OperationError> {
 
 fn validate_contents(target: LogicalTarget, contents: Option<&str>) -> Result<(), OperationError> {
     let Some(contents) = contents else {
-        return if matches!(
-            target,
-            LogicalTarget::ClaudeDesktopProfile
-                | LogicalTarget::CodexAuth
-                | LogicalTarget::CodexModelCatalog
-        ) {
-            Ok(())
-        } else {
-            Err(OperationError::InvalidPlan(
-                "only Lite-managed authentication, profile, or catalog files may be removed"
-                    .to_owned(),
-            ))
-        };
+        return Ok(());
     };
-    match target {
-        LogicalTarget::ClaudeSettings
-        | LogicalTarget::ClaudeDesktopNormalConfig
-        | LogicalTarget::ClaudeDesktopThreepConfig
-        | LogicalTarget::ClaudeDesktopProfile
-        | LogicalTarget::ClaudeDesktopMeta
-        | LogicalTarget::CodexAuth
-        | LogicalTarget::CodexModelCatalog
-        | LogicalTarget::GeminiSettings
-        | LogicalTarget::OpenCodeConfig
-        | LogicalTarget::PiModels => {
+    match target.format() {
+        ConfigFormat::Json => {
             let value: serde_json::Value = serde_json::from_str(contents).map_err(|error| {
                 OperationError::InvalidPlan(format!("JSON write is invalid: {error}"))
             })?;
@@ -635,12 +461,12 @@ fn validate_contents(target: LogicalTarget, contents: Option<&str>) -> Result<()
                 ));
             }
         }
-        LogicalTarget::CodexConfig | LogicalTarget::GrokConfig => {
+        ConfigFormat::Toml => {
             contents
                 .parse::<DocumentMut>()
                 .map_err(|_| OperationError::InvalidPlan("TOML write is invalid".to_owned()))?;
         }
-        LogicalTarget::OpenClawConfig => {
+        ConfigFormat::Json5 => {
             let value: serde_json::Value = json5::from_str(contents)
                 .map_err(|_| OperationError::InvalidPlan("JSON5 write is invalid".to_owned()))?;
             if !value.is_object() {
@@ -649,8 +475,8 @@ fn validate_contents(target: LogicalTarget, contents: Option<&str>) -> Result<()
                 ));
             }
         }
-        LogicalTarget::GeminiEnv => validate_env_contents(contents)?,
-        LogicalTarget::HermesConfig => {
+        ConfigFormat::Env => validate_env_contents(contents)?,
+        ConfigFormat::Yaml => {
             if duplicate_yaml_top_level_key(contents).is_some() {
                 return Err(OperationError::InvalidPlan(
                     "YAML write contains a duplicate top-level key".to_owned(),
