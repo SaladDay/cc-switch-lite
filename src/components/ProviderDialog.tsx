@@ -1,12 +1,14 @@
 import { useState, type FormEvent } from "react";
-import { X } from "lucide-react";
+import { LoaderCircle, Plus, Save } from "lucide-react";
 
 import type {
   AdapterDescriptor,
   ProviderChanges,
   ProviderRecord,
 } from "../lib/provider-types";
-import { useModalDialog } from "../lib/use-modal-dialog";
+import { FullScreenPanel } from "./FullScreenPanel";
+import { Button } from "./ui/button";
+import { Input } from "./ui/input";
 
 interface ProviderDialogProps {
   adapters: AdapterDescriptor[];
@@ -39,7 +41,6 @@ export function ProviderDialog({
 }: ProviderDialogProps) {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const adapter = adapters[selectedIndex];
-  const dialogRef = useModalDialog({ busy, onCancel });
   const [name, setName] = useState(provider?.name ?? "");
   const [settings, setSettings] = useState(() =>
     initialSettings(adapter, provider),
@@ -56,40 +57,45 @@ export function ProviderDialog({
   };
 
   return (
-    <dialog
-      ref={dialogRef}
-      aria-modal="true"
-      aria-labelledby="provider-dialog-title"
-      onCancel={(event) => {
-        event.preventDefault();
-        if (!busy) onCancel();
-      }}
-      className="glass-card fixed inset-0 z-50 m-auto max-h-[calc(100vh-3rem)] w-[calc(100%-3rem)] max-w-lg overflow-y-auto rounded-2xl p-0 text-foreground shadow-2xl"
+    <FullScreenPanel
+      title={title}
+      titleId="provider-dialog-title"
+      description={`${adapter.displayName}. Credentials remain in CC Switch Lite until this provider is activated.`}
+      closeLabel="Close provider dialog"
+      busy={busy}
+      onClose={onCancel}
+      contentClassName="pt-3"
+      footer={
+        <>
+          <Button variant="outline" onClick={onCancel} disabled={busy}>
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            form="provider-form"
+            disabled={busy}
+            className="bg-primary text-primary-foreground hover:bg-primary/90"
+          >
+            {busy ? (
+              <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+            ) : provider ? (
+              <Save className="mr-2 h-4 w-4" />
+            ) : (
+              <Plus className="mr-2 h-4 w-4" />
+            )}
+            {busy ? "Saving…" : "Save provider"}
+          </Button>
+        </>
+      }
     >
-      <div className="flex items-start justify-between border-b border-border px-6 py-5">
-        <div>
-          <h2 id="provider-dialog-title" className="text-lg font-semibold">
-            {title}
-          </h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {adapter.displayName}
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={onCancel}
-          disabled={busy}
-          className="inline-flex size-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
-          aria-label="Close provider dialog"
-        >
-          <X className="size-4" />
-        </button>
-      </div>
-
-      <form onSubmit={submit} className="space-y-5 px-6 py-6">
+      <form
+        id="provider-form"
+        onSubmit={submit}
+        className="glass space-y-6 rounded-xl border border-white/10 p-6"
+      >
         {!provider && adapters.length > 1 && (
-          <label className="block text-sm font-medium">
-            Adapter
+          <label className="block space-y-2 text-sm font-medium">
+            <span>Adapter</span>
             <select
               value={selectedIndex}
               onChange={(event) => {
@@ -97,7 +103,7 @@ export function ProviderDialog({
                 setSelectedIndex(index);
                 setSettings(initialSettings(adapters[index]));
               }}
-              className="mt-2 h-10 w-full rounded-xl border border-border bg-background px-3 text-sm outline-none transition focus:border-primary"
+              className="flex h-9 w-full rounded-md border border-border-default bg-background px-3 py-1 text-sm text-foreground shadow-sm outline-none transition-colors focus:ring-2 focus:ring-blue-500/20 dark:focus:ring-blue-400/20"
             >
               {adapters.map((candidate, index) => (
                 <option
@@ -111,16 +117,15 @@ export function ProviderDialog({
           </label>
         )}
 
-        <label className="block text-sm font-medium">
-          Provider name
-          <input
+        <label className="block space-y-2 text-sm font-medium">
+          <span>Provider name</span>
+          <Input
             autoFocus
             required
             maxLength={80}
             value={name}
             onChange={(event) => setName(event.target.value)}
             placeholder="Work"
-            className="mt-2 h-10 w-full rounded-xl border border-border bg-background px-3 text-sm outline-none transition focus:border-primary"
           />
         </label>
 
@@ -128,7 +133,7 @@ export function ProviderDialog({
           const inputId = `provider-setting-${field.key}`;
           const helpId = `${inputId}-help`;
           return (
-            <div key={field.key}>
+            <div key={field.key} className="space-y-2">
               <label htmlFor={inputId} className="block text-sm font-medium">
                 {field.label}
                 {!field.required && (
@@ -137,7 +142,7 @@ export function ProviderDialog({
                   </span>
                 )}
               </label>
-              <input
+              <Input
                 id={inputId}
                 aria-describedby={helpId}
                 required={field.required}
@@ -156,12 +161,10 @@ export function ProviderDialog({
                   }))
                 }
                 placeholder={field.placeholder}
-                autoComplete={field.kind === "secret" ? "off" : undefined}
-                className="mt-2 h-10 w-full rounded-xl border border-border bg-background px-3 text-sm outline-none transition focus:border-primary"
               />
               <p
                 id={helpId}
-                className="mt-1.5 text-xs font-normal leading-5 text-muted-foreground"
+                className="text-xs font-normal leading-5 text-muted-foreground"
               >
                 {field.help}
               </p>
@@ -172,30 +175,12 @@ export function ProviderDialog({
         {error && (
           <p
             role="alert"
-            className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300"
+            className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300"
           >
             {error}
           </p>
         )}
-
-        <div className="flex justify-end gap-3 border-t border-border pt-5">
-          <button
-            type="button"
-            onClick={onCancel}
-            disabled={busy}
-            className="h-10 rounded-xl border border-border px-4 text-sm font-medium transition-colors hover:bg-muted disabled:opacity-50"
-          >
-            Cancel
-          </button>
-          <button
-            type="submit"
-            disabled={busy}
-            className="h-10 rounded-xl bg-primary px-4 text-sm font-medium text-primary-foreground shadow-sm transition-opacity disabled:opacity-60"
-          >
-            {busy ? "Saving…" : "Save provider"}
-          </button>
-        </div>
       </form>
-    </dialog>
+    </FullScreenPanel>
   );
 }

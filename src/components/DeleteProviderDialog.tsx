@@ -1,5 +1,8 @@
+import { AlertTriangle, LoaderCircle } from "lucide-react";
+
 import type { ProviderRecord } from "../lib/provider-types";
 import { useModalDialog } from "../lib/use-modal-dialog";
+import { Button } from "./ui/button";
 
 interface DeleteProviderDialogProps {
   provider: ProviderRecord;
@@ -29,41 +32,53 @@ export function DeleteProviderDialog({
         event.preventDefault();
         if (!busy) onCancel();
       }}
-      className="glass-card fixed inset-0 z-50 m-auto w-[calc(100%-3rem)] max-w-sm rounded-2xl p-6 text-foreground shadow-2xl"
+      className="fixed inset-0 z-[60] m-auto max-h-[90vh] w-full max-w-sm overflow-hidden border border-border-default bg-background p-0 text-foreground shadow-lg sm:rounded-lg"
     >
-      <h2 id="delete-dialog-title" className="text-lg font-semibold">
-        Delete provider?
-      </h2>
-      <p
-        id="delete-dialog-description"
-        className="mt-2 text-sm leading-6 text-muted-foreground"
-      >
-        {provider.name} will be removed from Lite storage. Live configuration is
-        not touched.
-      </p>
-      {error && (
-        <p role="alert" className="mt-3 text-sm text-red-600 dark:text-red-300">
-          {error}
-        </p>
-      )}
-      <div className="mt-6 flex justify-end gap-3">
-        <button
-          autoFocus
-          type="button"
-          disabled={busy}
-          onClick={onCancel}
-          className="h-10 rounded-xl border border-border px-4 text-sm font-medium hover:bg-muted disabled:opacity-50"
-        >
-          Cancel
-        </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={onConfirm}
-          className="h-10 rounded-xl bg-red-600 px-4 text-sm font-medium text-white disabled:opacity-60"
-        >
-          {busy ? "Deleting…" : "Delete provider"}
-        </button>
+      <div className="flex max-h-[90vh] min-h-0 flex-col">
+        <div className="flex flex-shrink-0 flex-col px-6 pt-5 text-center sm:text-left">
+          <h2
+            id="delete-dialog-title"
+            className="flex items-center gap-2 text-lg font-semibold leading-tight tracking-tight"
+          >
+            <AlertTriangle className="h-5 w-5 text-destructive" />
+            Delete provider?
+          </h2>
+        </div>
+        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-6 pt-3 text-center sm:text-left">
+          <p
+            id="delete-dialog-description"
+            className="break-words whitespace-pre-line text-sm leading-relaxed text-muted-foreground"
+          >
+            {provider.name} will be removed from Lite storage. Live
+            configuration is not touched.
+          </p>
+          {error && (
+            <p role="alert" className="text-sm text-red-600 dark:text-red-300">
+              {error}
+            </p>
+          )}
+        </div>
+
+        <div className="flex flex-col-reverse items-center gap-2 px-6 py-5 pt-2 sm:flex-row sm:justify-end">
+          <Button
+            autoFocus
+            type="button"
+            variant="outline"
+            disabled={busy}
+            onClick={onCancel}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            variant="destructive"
+            disabled={busy}
+            onClick={onConfirm}
+          >
+            {busy && <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />}
+            {busy ? "Deleting…" : "Delete provider"}
+          </Button>
+        </div>
       </div>
     </dialog>
   );
