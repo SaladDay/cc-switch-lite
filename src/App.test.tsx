@@ -518,7 +518,7 @@ describe("App", () => {
 
     await waitFor(() => expect(api.importLive).toHaveBeenCalledWith("claude"));
     expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
-    expect(screen.getAllByText("User default")[0]).toBeVisible();
+    expect(screen.getAllByText("In Use")[0]).toBeVisible();
     expect(screen.getByRole("status")).toHaveTextContent(
       "Imported the Claude Code user configuration.",
     );

@@ -6,19 +6,13 @@ import {
   type CSSProperties,
 } from "react";
 import {
-  Asterisk,
-  Bot,
   Check,
   Download,
-  KeyRound,
   LoaderCircle,
   Moon,
-  Pencil,
   Plus,
   Store,
   Sun,
-  Trash2,
-  type LucideIcon,
 } from "lucide-react";
 
 import { DeleteProviderDialog } from "./components/DeleteProviderDialog";
@@ -26,6 +20,10 @@ import { ImportProviderDialog } from "./components/ImportProviderDialog";
 import { MarketplaceDialog } from "./components/MarketplaceDialog";
 import { ProviderDialog } from "./components/ProviderDialog";
 import { AppSwitcher } from "./components/AppSwitcher";
+import {
+  ProviderList,
+  type ProviderListItem,
+} from "./components/providers/ProviderList";
 import { Button } from "./components/ui/button";
 import type {
   AdapterDescriptor,
@@ -42,8 +40,6 @@ interface AppDefinition {
   id: AppId;
   label: string;
   emptyTitle: string;
-  icon: LucideIcon;
-  iconClassName: string;
 }
 
 const APPS: AppDefinition[] = [
@@ -51,15 +47,11 @@ const APPS: AppDefinition[] = [
     id: "claude",
     label: "Claude Code",
     emptyTitle: "Add your first Claude Code provider",
-    icon: Asterisk,
-    iconClassName: "text-[#d97757]",
   },
   {
     id: "codex",
     label: "Codex",
     emptyTitle: "Add your first Codex provider",
-    icon: Bot,
-    iconClassName: "text-foreground",
   },
 ];
 
@@ -166,7 +158,7 @@ export default function App() {
   const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const definition = APPS.find((app) => app.id === activeApp) ?? APPS[0];
   const isClaude = activeApp === "claude";
-  const currentLabel = isClaude ? "User default" : "Current";
+  const currentLabel = "In Use";
   const importLabel = isClaude
     ? "Import Claude Code user configuration"
     : `Import current ${definition.label} configuration`;
@@ -181,7 +173,6 @@ export default function App() {
       : editing
         ? adapters.find((item) => adapterMatchesProvider(item, editing))
         : undefined;
-  const ActiveIcon = definition.icon;
   const contentTopOffset = DRAG_BAR_HEIGHT + HEADER_HEIGHT;
   const addActionButtonClass =
     "bg-orange-500 hover:bg-orange-600 dark:bg-orange-500 dark:hover:bg-orange-600 text-white shadow-lg shadow-orange-500/30 dark:shadow-orange-500/40 rounded-full w-8 h-8";
@@ -427,6 +418,23 @@ export default function App() {
     }
   };
 
+  const providerItems: ProviderListItem[] = providers.map((provider) => {
+    const providerAdapter = adapters.find((item) =>
+      adapterMatchesProvider(item, provider),
+    );
+    return {
+      provider,
+      adapterAvailable: providerAdapter !== undefined,
+      endpoint: providerAdapter
+        ? visibleEndpoint(providerAdapter, provider)
+        : "",
+      isCurrent: currentProviders.some(
+        (current) =>
+          current.id === provider.id && current.revision === provider.revision,
+      ),
+    };
+  });
+
   return (
     <div
       className="flex h-screen flex-col overflow-hidden bg-background pb-4 text-foreground selection:bg-primary/30"
@@ -525,219 +533,59 @@ export default function App() {
         </div>
       </header>
 
-      <main className="mx-auto min-h-0 w-full max-w-5xl flex-1 overflow-y-auto px-6 py-10">
-        <div className="mb-7 flex items-end justify-between gap-6">
-          <div>
-            <h2 className="text-2xl font-semibold tracking-tight">
-              {definition.label} providers
-            </h2>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Credentials stay in CC Switch Lite until you choose to switch.
-            </p>
-          </div>
-          <span className="rounded-full bg-muted px-3 py-1 text-xs font-medium text-muted-foreground">
-            {providers.length}{" "}
-            {providers.length === 1 ? "provider" : "providers"}
-          </span>
-        </div>
+      <main className="flex min-h-0 flex-1 flex-col overflow-y-auto animate-fade-in">
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-6">
+          <div className="flex-1 overflow-y-auto overflow-x-hidden px-1 pb-12">
+            <div className="space-y-4">
+              {(adapterError || liveError || loadError || currentError) && (
+                <div
+                  role="alert"
+                  className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-600 dark:text-red-300"
+                >
+                  {adapterError || liveError || loadError || currentError}
+                </div>
+              )}
 
-        {(adapterError || liveError || loadError || currentError) && (
-          <div
-            role="alert"
-            className="mb-6 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-600 dark:text-red-300"
-          >
-            {adapterError || liveError || loadError || currentError}
-          </div>
-        )}
+              {notice && (
+                <div
+                  role="status"
+                  className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300"
+                >
+                  <Check className="size-4" aria-hidden="true" />
+                  {notice}
+                </div>
+              )}
 
-        {notice && (
-          <div
-            role="status"
-            className="mb-6 flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300"
-          >
-            <Check className="size-4" aria-hidden="true" />
-            {notice}
-          </div>
-        )}
-
-        {loading ? (
-          <div
-            className="grid min-h-72 place-items-center"
-            aria-label="Loading providers"
-          >
-            <LoaderCircle className="size-6 animate-spin text-muted-foreground" />
-          </div>
-        ) : providers.length === 0 ? (
-          <section
-            className="glass-card mx-auto mt-12 w-full max-w-xl rounded-2xl px-8 py-12 text-center shadow-card"
-            aria-labelledby="empty-state-title"
-          >
-            <div className="mx-auto mb-5 grid size-14 place-items-center rounded-2xl bg-muted">
-              <ActiveIcon
-                className={`size-7 ${definition.iconClassName}`}
-                strokeWidth={2}
-                aria-hidden="true"
+              <ProviderList
+                appId={activeApp}
+                items={providerItems}
+                isLoading={loading}
+                emptyTitle={definition.emptyTitle}
+                currentLabel={currentLabel}
+                importLabel={
+                  isClaude ? "Import user default" : "Import current"
+                }
+                disabled={!adapter || mutationBusy || liveBusy !== null}
+                busy={mutationBusy || liveBusy !== null}
+                importing={liveBusy === "import"}
+                switchingId={liveBusy}
+                onCreate={() => openEditor("new")}
+                onImport={beginImport}
+                onSwitch={switchProvider}
+                onEdit={openEditor}
+                onDelete={(provider) => {
+                  setMutationError(null);
+                  setDeleting(provider);
+                }}
+                setDeleteButtonRef={(providerId, element) => {
+                  if (element)
+                    deleteButtonRefs.current.set(providerId, element);
+                  else deleteButtonRefs.current.delete(providerId);
+                }}
               />
             </div>
-            <h2
-              id="empty-state-title"
-              className="text-xl font-semibold tracking-tight"
-            >
-              {definition.emptyTitle}
-            </h2>
-            <p className="mx-auto mt-2 max-w-sm text-sm leading-6 text-muted-foreground">
-              Add one manually, or import the API provider from your current
-              live configuration.
-            </p>
-            <div className="mt-6 flex justify-center gap-3">
-              <button
-                type="button"
-                disabled={!adapter || liveBusy !== null}
-                onClick={beginImport}
-                className="inline-flex h-10 items-center gap-2 rounded-xl border border-border px-4 text-sm font-medium transition-colors hover:bg-muted disabled:opacity-50"
-              >
-                {liveBusy === "import" ? (
-                  <LoaderCircle className="size-4 animate-spin" />
-                ) : (
-                  <Download className="size-4" />
-                )}
-                {isClaude ? "Import user default" : "Import current"}
-              </button>
-              <button
-                type="button"
-                disabled={!adapter || liveBusy !== null}
-                onClick={() => openEditor("new")}
-                className="inline-flex h-10 items-center gap-2 rounded-xl bg-primary px-4 text-sm font-medium text-primary-foreground shadow-sm disabled:opacity-50"
-              >
-                <Plus className="size-4" />
-                Add provider
-              </button>
-            </div>
-          </section>
-        ) : (
-          <section className="grid grid-cols-2 gap-4" aria-label="Providers">
-            {providers.map((provider) => {
-              const providerAdapter = adapters.find((item) =>
-                adapterMatchesProvider(item, provider),
-              );
-              const endpoint = providerAdapter
-                ? visibleEndpoint(providerAdapter, provider)
-                : "";
-              const isCurrent = currentProviders.some(
-                (current) =>
-                  current.id === provider.id &&
-                  current.revision === provider.revision,
-              );
-              return (
-                <article
-                  key={provider.id}
-                  className={`glass-card rounded-2xl p-5 shadow-card ${
-                    isCurrent ? "ring-1 ring-primary/50" : ""
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="flex min-w-0 items-start gap-3">
-                      <div className="grid size-10 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground">
-                        <KeyRound className="size-5" aria-hidden="true" />
-                      </div>
-                      <div className="min-w-0">
-                        <div className="flex min-w-0 items-center gap-2">
-                          <h3 className="truncate font-semibold">
-                            {provider.name}
-                          </h3>
-                          {isCurrent && (
-                            <span
-                              className="inline-flex shrink-0 items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary"
-                              title={
-                                isClaude
-                                  ? "Project, local, or managed settings can override this user default"
-                                  : undefined
-                              }
-                            >
-                              <Check className="size-3" aria-hidden="true" />
-                              {currentLabel}
-                            </span>
-                          )}
-                        </div>
-                        <p className="mt-1 truncate text-xs text-muted-foreground">
-                          {!providerAdapter
-                            ? "Adapter unavailable"
-                            : endpoint || "Default endpoint"}
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex shrink-0 gap-1">
-                      <button
-                        type="button"
-                        disabled={!providerAdapter || liveBusy !== null}
-                        onClick={() => openEditor(provider)}
-                        className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-                        aria-label={`Edit ${provider.name}`}
-                      >
-                        <Pencil className="size-4" />
-                      </button>
-                      <button
-                        ref={(element) => {
-                          if (element)
-                            deleteButtonRefs.current.set(provider.id, element);
-                          else deleteButtonRefs.current.delete(provider.id);
-                        }}
-                        type="button"
-                        disabled={liveBusy !== null}
-                        onClick={() => {
-                          setMutationError(null);
-                          setDeleting(provider);
-                        }}
-                        className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-red-500/10 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-40"
-                        aria-label={`Delete ${provider.name}`}
-                      >
-                        <Trash2 className="size-4" />
-                      </button>
-                    </div>
-                  </div>
-                  <div className="mt-5 flex items-center justify-between gap-3 border-t border-border pt-4">
-                    <span className="text-xs text-muted-foreground">
-                      Stored locally
-                    </span>
-                    <button
-                      type="button"
-                      disabled={
-                        !providerAdapter || isCurrent || liveBusy !== null
-                      }
-                      onClick={() => switchProvider(provider)}
-                      className={`inline-flex h-8 min-w-24 items-center justify-center gap-1.5 rounded-lg px-3 text-xs font-medium transition-colors disabled:cursor-not-allowed ${
-                        isCurrent
-                          ? "bg-primary/10 text-primary"
-                          : "bg-primary text-primary-foreground disabled:opacity-40"
-                      }`}
-                      aria-label={
-                        isCurrent
-                          ? isClaude
-                            ? `${provider.name} is the Claude Code user default`
-                            : `${provider.name} is current`
-                          : `Switch to ${provider.name}`
-                      }
-                    >
-                      {liveBusy === provider.id ? (
-                        <>
-                          <LoaderCircle className="size-3.5 animate-spin" />
-                          Switching…
-                        </>
-                      ) : isCurrent ? (
-                        <>
-                          <Check className="size-3.5" />
-                          {currentLabel}
-                        </>
-                      ) : (
-                        "Switch"
-                      )}
-                    </button>
-                  </div>
-                </article>
-              );
-            })}
-          </section>
-        )}
+          </div>
+        </div>
       </main>
 
       {editing && editingAdapter && (
