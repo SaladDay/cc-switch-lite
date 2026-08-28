@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   CurrentProvider,
+  AppId,
   AdapterDescriptor,
   AdapterReference,
   CommandError,
@@ -18,13 +19,14 @@ import type {
 } from "./plugin-types";
 
 export const providersApi = {
+  supportedApps: () => invoke<AppId[]>("supported_apps"),
   listAdapters: () => invoke<AdapterDescriptor[]>("list_provider_adapters"),
   list: (appId: string) =>
     invoke<ProviderRecord[]>("list_providers", { appId }),
   create: (provider: ProviderDraft) =>
     invoke<ProviderRecord>("create_provider", { provider }),
-  update: (id: string, provider: ProviderUpdate) =>
-    invoke<ProviderRecord>("update_provider", { id, provider }),
+  update: (appId: string, id: string, provider: ProviderUpdate) =>
+    invoke<ProviderRecord>("update_provider", { appId, id, provider }),
   delete: (appId: string, id: string, expectedRevision: number) =>
     invoke<void>("delete_provider", { appId, id, expectedRevision }),
   importLive: (appId: string, adapter: AdapterReference | null = null) =>

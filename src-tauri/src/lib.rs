@@ -12,26 +12,21 @@ use plugin::{
     PluginManager, PluginRequest, PluginResponse, RegistryDraft, RegistrySource,
 };
 use provider::{
-    built_in_adapters, AdapterDescriptor, AdapterReference, CurrentProvider, ProviderDraft,
-    ProviderRecord, ProviderUpdate, BUILTIN_PLUGIN_ID, CONTRACT_MAJOR,
+    built_in_adapters, native_adapter_reference, AdapterDescriptor, AdapterReference,
+    CurrentProvider, ProviderDraft, ProviderRecord, ProviderUpdate, BUILTIN_PLUGIN_ID,
+    CONTRACT_MAJOR,
 };
 use serde::Serialize;
 use store::{ProviderStore, StoreError};
 use tauri::{Manager, State};
 
-fn lite_apps() -> [cc_switch_core::AppType; 2] {
-    [
-        cc_switch_core::AppType::Claude,
-        cc_switch_core::AppType::Codex,
-    ]
+fn lite_apps() -> impl Iterator<Item = cc_switch_core::AppType> {
+    cc_switch_core::AppType::all()
 }
 
 #[tauri::command]
 fn supported_apps() -> Vec<String> {
-    lite_apps()
-        .into_iter()
-        .map(|app| app.as_str().to_owned())
-        .collect()
+    lite_apps().map(|app| app.as_str().to_owned()).collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -71,7 +66,6 @@ impl From<PluginError> for CommandError {
 type CommandResult<T> = Result<T, CommandError>;
 const MAX_CURRENT_CALLS: usize = 32;
 const MAX_CURRENT_CALLS_PER_PLUGIN: usize = 8;
-
 #[tauri::command]
 fn list_provider_adapters(plugins: State<'_, PluginManager>) -> Vec<AdapterDescriptor> {
     plugins.adapters()
@@ -92,6 +86,11 @@ fn create_provider(
     provider: ProviderDraft,
 ) -> CommandResult<ProviderRecord> {
     let app_id = provider.app_id.clone();
+    if let Ok(app) = app_id.parse::<cc_switch_core::AppType>() {
+        if provider.adapter == native_adapter_reference(&app) {
+            return store.create_native(provider).map_err(Into::into);
+        }
+    }
     let created = store.create_resolved_from(&app_id, || {
         let descriptor = plugins
             .adapter_for_reference(&app_id, &provider.adapter)?
@@ -106,11 +105,12 @@ fn create_provider(
 fn update_provider(
     store: State<'_, ProviderStore>,
     plugins: State<'_, PluginManager>,
+    app_id: String,
     id: String,
     provider: ProviderUpdate,
 ) -> CommandResult<ProviderRecord> {
     store
-        .update_from(&id, provider, |current, update| {
+        .update_from(&app_id, &id, provider, |current, update| {
             let descriptor = plugins
                 .adapter_for_reference(&current.app_id, &current.adapter)?
                 .ok_or(PluginError::NotFound)?;
@@ -237,13 +237,18 @@ fn current_providers(
     plugins: State<'_, PluginManager>,
     app_id: String,
 ) -> CommandResult<Vec<CurrentProvider>> {
-    let current = store.with_providers(&app_id, |providers| {
+    let mut current = store.current(&app_id)?;
+    let detected = store.with_providers(&app_id, |providers| {
         let built_in = providers
             .iter()
             .filter(|provider| provider.adapter.plugin_id == BUILTIN_PLUGIN_ID)
+            .filter(|provider| {
+                crate::provider::adapter_for_reference(&provider.app_id, &provider.adapter)
+                    .is_some()
+            })
             .cloned()
             .collect::<Vec<_>>();
-        let mut current = live
+        let mut detected = live
             .current_providers(&app_id, &built_in)
             .map_err(CommandError::from)?;
         let mut failed_plugins = HashSet::new();
@@ -286,15 +291,20 @@ fn current_providers(
                 }
             })();
             match matches {
-                Ok(true) => current.push(CurrentProvider::from(provider)),
+                Ok(true) => detected.push(CurrentProvider::from(provider)),
                 Ok(false) => {}
                 Err(_) => {
                     failed_plugins.insert(plugin_id);
                 }
             }
         }
-        Ok::<_, CommandError>(current)
+        Ok::<_, CommandError>(detected)
     })??;
+    for candidate in detected {
+        if !current.iter().any(|item| item.id == candidate.id) {
+            current.push(candidate);
+        }
+    }
     Ok(current)
 }
 
@@ -367,9 +377,8 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
-            let store_path = app_data_dir.join("providers.json");
             let home_dir = app.path().home_dir()?;
-            app.manage(ProviderStore::new(store_path));
+            app.manage(ProviderStore::from_home(&home_dir)?);
             app.manage(PluginManager::new(app_data_dir.join("plugins"))?);
             app.manage(LiveConfig::from_home(
                 &home_dir,
@@ -404,19 +413,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lite_boundary_contains_only_claude_and_codex() {
-        assert_eq!(supported_apps(), ["claude", "codex"]);
+    fn lite_boundary_follows_every_core_application() {
+        assert_eq!(
+            supported_apps(),
+            [
+                "claude",
+                "claude-desktop",
+                "codex",
+                "gemini",
+                "grokbuild",
+                "opencode",
+                "openclaw",
+                "hermes",
+                "pi",
+            ]
+        );
     }
 
     #[test]
-    fn built_in_adapters_follow_the_core_application_boundary() {
+    fn built_in_adapters_remain_explicit_live_capabilities() {
         let adapters = built_in_adapters();
         let app_ids: Vec<_> = adapters
             .iter()
             .map(|adapter| adapter.app_id.as_str())
             .collect();
 
-        assert_eq!(app_ids, supported_apps());
+        assert_eq!(app_ids, ["claude", "codex"]);
         assert!(adapters
             .iter()
             .all(|adapter| adapter.reference.plugin_id == "org.cc-switch.builtin"));

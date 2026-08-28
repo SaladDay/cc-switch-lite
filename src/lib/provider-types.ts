@@ -1,4 +1,13 @@
-export type AppId = "claude" | "codex";
+export type AppId =
+  | "claude"
+  | "claude-desktop"
+  | "codex"
+  | "gemini"
+  | "grokbuild"
+  | "opencode"
+  | "openclaw"
+  | "hermes"
+  | "pi";
 
 export type JsonValue =
   string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };

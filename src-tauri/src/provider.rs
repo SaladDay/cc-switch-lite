@@ -121,6 +121,22 @@ impl AdapterDescriptor {
     }
 }
 
+/// Stable ownership marker for providers stored in CC Switch's native schema.
+///
+/// Native providers do not belong to a Lite plugin. The reference is derived
+/// from the core application identifier and is therefore never persisted into
+/// the shared provider row.
+pub fn native_adapter_reference(app: &AppType) -> AdapterReference {
+    AdapterReference {
+        plugin_id: BUILTIN_PLUGIN_ID.to_owned(),
+        plugin_version: BUILTIN_PLUGIN_VERSION.to_owned(),
+        adapter_id: format!("builtin.{}.native", app.as_str()),
+        contract_major: CONTRACT_MAJOR,
+        schema_version: SCHEMA_VERSION,
+        extensions: Map::new(),
+    }
+}
+
 fn field(
     key: &str,
     label: &str,

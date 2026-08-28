@@ -11,6 +11,7 @@ import type {
 import type { MarketplacePlugin } from "./lib/plugin-types";
 
 const api = vi.hoisted(() => ({
+  supportedApps: vi.fn(),
   listAdapters: vi.fn(),
   list: vi.fn(),
   create: vi.fn(),
@@ -145,6 +146,17 @@ describe("App", () => {
     document.documentElement.className = "";
     for (const mock of Object.values(api)) mock.mockReset();
     api.listAdapters.mockResolvedValue(adapters);
+    api.supportedApps.mockResolvedValue([
+      "claude",
+      "claude-desktop",
+      "codex",
+      "gemini",
+      "grokbuild",
+      "opencode",
+      "openclaw",
+      "hermes",
+      "pi",
+    ]);
     api.list.mockResolvedValue([]);
     api.delete.mockResolvedValue(undefined);
     api.switch.mockResolvedValue(undefined);
@@ -158,8 +170,14 @@ describe("App", () => {
     });
   });
 
-  it("shows only the two applications in the Lite boundary", async () => {
+  it("shows every application from the shared core boundary", async () => {
     render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Add your first Claude Code provider",
+      }),
+    ).toBeVisible();
 
     const switcher = within(
       screen.getByRole("navigation", { name: "Applications" }),
@@ -168,19 +186,35 @@ describe("App", () => {
       switcher.getByRole("button", { name: "Claude Code" }),
     ).toHaveAttribute("aria-pressed", "true");
     expect(switcher.getByRole("button", { name: "Codex" })).toBeVisible();
-    expect(switcher.getAllByRole("button")).toHaveLength(2);
+    expect(switcher.getByRole("button", { name: "Pi" })).toBeVisible();
+    expect(switcher.getAllByRole("button")).toHaveLength(9);
+  });
+
+  it("uses the core response as the application membership source", async () => {
+    api.supportedApps.mockResolvedValue(["pi"]);
+    render(<App />);
+
     expect(
       await screen.findByRole("heading", {
-        name: "Add your first Claude Code provider",
+        name: "Add your first Pi provider",
       }),
     ).toBeVisible();
+    const switcher = within(
+      screen.getByRole("navigation", { name: "Applications" }),
+    );
+    expect(switcher.getAllByRole("button")).toHaveLength(1);
+    expect(switcher.getByRole("button", { name: "Pi" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(api.list).toHaveBeenLastCalledWith("pi");
   });
 
   it("switches the provider list and remembers the selected application", async () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "Codex" }));
+    await user.click(await screen.findByRole("button", { name: "Codex" }));
 
     expect(
       await screen.findByRole("heading", {
@@ -231,7 +265,7 @@ describe("App", () => {
     );
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "Codex" }));
+    await user.click(await screen.findByRole("button", { name: "Codex" }));
     expect(
       await screen.findByRole("button", { name: "Codex Work is current" }),
     ).toBeDisabled();
@@ -491,7 +525,7 @@ describe("App", () => {
     expect(
       await screen.findByRole("heading", { name: "Primary" }),
     ).toBeVisible();
-    expect(api.update).toHaveBeenCalledWith("provider-1", {
+    expect(api.update).toHaveBeenCalledWith("claude", "provider-1", {
       expectedRevision: 1,
       name: "Primary",
       settings: {
@@ -505,7 +539,9 @@ describe("App", () => {
       name: "Delete provider?",
     });
     expect(
-      within(deleteDialog).getByText(/will be removed from Lite storage/),
+      within(deleteDialog).getByText(
+        /will be removed from the provider catalog/,
+      ),
     ).toHaveClass("break-words");
     await user.click(
       within(deleteDialog).getByRole("button", { name: "Delete provider" }),

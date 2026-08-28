@@ -1,6 +1,6 @@
 # CC Switch Lite
 
-A focused provider switcher for Claude Code and Codex.
+A provider configuration editor for every application supported by CC Switch.
 
 CC Switch Lite shares low-level contracts with CC Switch through
 [`cc-switch-core`](https://github.com/SaladDay/cc-switch-core), while keeping
@@ -36,11 +36,9 @@ permissions must be approved for the exact signed version. Components receive
 no WASI, network, filesystem, environment, process, or shell imports. See
 [`plugin-api/README.md`](plugin-api/README.md) for the guest and package contract.
 
-Provider credentials are currently stored as a local JSON file in Tauri's app
-data directory. Writes are atomic; the file is forced to mode `0600` on Unix
-and uses the app-data directory's inherited ACL on Windows. A private sidecar
-lock serializes changes made by multiple Lite processes; a busy lock is
-reported immediately instead of blocking a command.
+Provider records live in the same `~/.cc-switch/cc-switch.db` database used by
+CC Switch. Lite does not keep a second provider catalog. Updates use SQLite
+transactions and reject stale edits made against an older record revision.
 
 Import reads only the API-provider fields that Lite can reproduce. Switching
 uses a versioned, host-validated operation plan with logical configuration

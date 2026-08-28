@@ -49,7 +49,7 @@ export function DeleteProviderDialog({
             id="delete-dialog-description"
             className="break-words whitespace-pre-line text-sm leading-relaxed text-muted-foreground"
           >
-            {provider.name} will be removed from Lite storage. Live
+            {provider.name} will be removed from the provider catalog. Live
             configuration is not touched.
           </p>
           {error && (
