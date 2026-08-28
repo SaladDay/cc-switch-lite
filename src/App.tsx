@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
 import {
   Asterisk,
   Bot,
@@ -19,6 +25,8 @@ import { DeleteProviderDialog } from "./components/DeleteProviderDialog";
 import { ImportProviderDialog } from "./components/ImportProviderDialog";
 import { MarketplaceDialog } from "./components/MarketplaceDialog";
 import { ProviderDialog } from "./components/ProviderDialog";
+import { AppSwitcher } from "./components/AppSwitcher";
+import { Button } from "./components/ui/button";
 import type {
   AdapterDescriptor,
   AdapterReference,
@@ -57,6 +65,8 @@ const APPS: AppDefinition[] = [
 
 const APP_STORAGE_KEY = "cc-switch-lite:last-app";
 const THEME_STORAGE_KEY = "cc-switch-lite:theme";
+const DRAG_BAR_HEIGHT = 28;
+const HEADER_HEIGHT = 64;
 
 function initialApp(): AppId {
   const stored = window.localStorage.getItem(APP_STORAGE_KEY);
@@ -172,6 +182,9 @@ export default function App() {
         ? adapters.find((item) => adapterMatchesProvider(item, editing))
         : undefined;
   const ActiveIcon = definition.icon;
+  const contentTopOffset = DRAG_BAR_HEIGHT + HEADER_HEIGHT;
+  const addActionButtonClass =
+    "bg-orange-500 hover:bg-orange-600 dark:bg-orange-500 dark:hover:bg-orange-600 text-white shadow-lg shadow-orange-500/30 dark:shadow-orange-500/40 rounded-full w-8 h-8";
 
   const reloadAdapters = useCallback(async () => {
     try {
@@ -415,100 +428,104 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      <header className="grid h-20 grid-cols-[1fr_auto_1fr] items-center border-b border-border px-6">
-        <div className="flex min-w-0 items-center gap-3">
-          <div className="grid size-9 shrink-0 place-items-center rounded-xl bg-primary text-sm font-bold text-primary-foreground shadow-sm">
-            CC
-          </div>
-          <div className="min-w-0">
-            <h1 className="truncate text-lg font-semibold tracking-tight">
-              CC Switch Lite
-            </h1>
-            <p className="text-xs text-muted-foreground">
-              Provider switching, kept small
-            </p>
-          </div>
-        </div>
-
-        <nav
-          className="inline-flex rounded-xl bg-muted p-1"
-          aria-label="Applications"
+    <div
+      className="flex h-screen flex-col overflow-hidden bg-background pb-4 text-foreground selection:bg-primary/30"
+      style={{ overflowX: "hidden", paddingTop: contentTopOffset }}
+    >
+      <div
+        className="fixed left-0 right-0 top-0 z-[70]"
+        data-tauri-drag-region
+        style={{ height: DRAG_BAR_HEIGHT }}
+      />
+      <header
+        className="fixed z-50 w-full bg-background/80 backdrop-blur-md transition-all duration-300"
+        data-tauri-drag-region
+        style={{ top: DRAG_BAR_HEIGHT, height: HEADER_HEIGHT }}
+      >
+        <div
+          className="flex h-full items-center justify-between gap-2 px-6"
+          data-tauri-drag-region
         >
-          {APPS.map((app) => {
-            const Icon = app.icon;
-            const selected = app.id === activeApp;
-            return (
-              <button
-                key={app.id}
-                type="button"
-                disabled={mutationBusy || liveBusy !== null}
-                aria-pressed={selected}
-                onClick={() => selectApp(app.id)}
-                className={`inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg px-4 text-sm font-medium transition-colors duration-200 disabled:cursor-not-allowed disabled:opacity-60 ${
-                  selected
-                    ? "bg-background text-foreground shadow-sm"
-                    : "text-muted-foreground hover:bg-background/60 hover:text-foreground"
-                }`}
-              >
-                <Icon
-                  className={`size-4 ${app.iconClassName}`}
-                  strokeWidth={2.2}
-                />
-                {app.label}
-              </button>
-            );
-          })}
-        </nav>
+          <div
+            className="flex items-center gap-1"
+            style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
+          >
+            <Button
+              variant="ghost"
+              size="icon"
+              disabled={mutationBusy || liveBusy !== null}
+              onClick={() => setMarketplaceOpen(true)}
+              title="Plugin marketplace"
+              aria-label="Open plugin marketplace"
+              className="hover:bg-black/5 dark:hover:bg-white/5"
+            >
+              <Store className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setIsDark((current) => !current)}
+              title={isDark ? "Use light theme" : "Use dark theme"}
+              aria-label={isDark ? "Use light theme" : "Use dark theme"}
+              className="hover:bg-black/5 dark:hover:bg-white/5"
+            >
+              {isDark ? (
+                <Sun className="h-4 w-4" />
+              ) : (
+                <Moon className="h-4 w-4" />
+              )}
+            </Button>
+          </div>
 
-        <div className="flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={() => setIsDark((current) => !current)}
-            className="inline-flex size-9 cursor-pointer items-center justify-center rounded-lg text-muted-foreground transition-colors duration-200 hover:bg-muted hover:text-foreground"
-            aria-label={isDark ? "Use light theme" : "Use dark theme"}
-          >
-            {isDark ? <Sun className="size-4" /> : <Moon className="size-4" />}
-          </button>
-          <button
-            type="button"
-            disabled={mutationBusy || liveBusy !== null}
-            onClick={() => setMarketplaceOpen(true)}
-            className="inline-flex size-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
-            aria-label="Open plugin marketplace"
-            title="Plugin marketplace"
-          >
-            <Store className="size-4" />
-          </button>
-          <button
-            type="button"
-            disabled={!adapter || loading || mutationBusy || liveBusy !== null}
-            onClick={beginImport}
-            className="ml-2 inline-flex h-10 items-center gap-2 rounded-xl border border-border px-3 text-sm font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-            aria-label={importLabel}
-          >
-            {liveBusy === "import" ? (
-              <LoaderCircle className="size-4 animate-spin" />
-            ) : (
-              <Download className="size-4" />
-            )}
-            Import
-          </button>
-          <button
-            ref={addProviderButtonRef}
-            type="button"
-            disabled={!adapter || loading || mutationBusy || liveBusy !== null}
-            onClick={() => openEditor("new")}
-            className="inline-flex h-10 items-center gap-2 rounded-xl bg-primary px-4 text-sm font-medium text-primary-foreground shadow-sm transition-opacity disabled:opacity-50"
-            aria-label={`Add ${definition.label} provider`}
-          >
-            <Plus className="size-4" />
-            Add provider
-          </button>
+          <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5">
+            <div className="flex min-w-0 flex-1 items-center justify-end overflow-hidden py-4">
+              <AppSwitcher
+                activeApp={activeApp}
+                disabled={mutationBusy || liveBusy !== null}
+                onSwitch={selectApp}
+              />
+            </div>
+            <div className="flex shrink-0 items-center py-4">
+              <div
+                className="flex shrink-0 items-center gap-1.5"
+                style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
+              >
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={
+                    !adapter || loading || mutationBusy || liveBusy !== null
+                  }
+                  onClick={beginImport}
+                  className="hover:bg-black/5 dark:hover:bg-white/5"
+                  aria-label={importLabel}
+                >
+                  {liveBusy === "import" ? (
+                    <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Download className="mr-2 h-4 w-4" />
+                  )}
+                  Import
+                </Button>
+                <Button
+                  ref={addProviderButtonRef}
+                  size="icon"
+                  disabled={
+                    !adapter || loading || mutationBusy || liveBusy !== null
+                  }
+                  onClick={() => openEditor("new")}
+                  className={`ml-2 ${addActionButtonClass}`}
+                  aria-label={`Add ${definition.label} provider`}
+                >
+                  <Plus className="h-5 w-5" />
+                </Button>
+              </div>
+            </div>
+          </div>
         </div>
       </header>
 
-      <main className="mx-auto min-h-[calc(100vh-5rem)] max-w-5xl px-6 py-10">
+      <main className="mx-auto min-h-0 w-full max-w-5xl flex-1 overflow-y-auto px-6 py-10">
         <div className="mb-7 flex items-end justify-between gap-6">
           <div>
             <h2 className="text-2xl font-semibold tracking-tight">

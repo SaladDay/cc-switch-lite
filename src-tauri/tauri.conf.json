@@ -12,11 +12,12 @@
   "app": {
     "windows": [
       {
-        "title": "CC Switch Lite",
-        "width": 1100,
-        "height": 720,
-        "minWidth": 720,
-        "minHeight": 520,
+        "title": "",
+        "titleBarStyle": "Overlay",
+        "width": 1000,
+        "height": 650,
+        "minWidth": 900,
+        "minHeight": 600,
         "resizable": true
       }
     ],
