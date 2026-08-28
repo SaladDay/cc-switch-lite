@@ -29,6 +29,7 @@ const SAFE_JS_INTEGER_MASK: u64 = (1_u64 << 53) - 1;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const ADAPTER_BINDINGS_TABLE: &str = "cc_switch_lite_provider_adapters";
 const MIGRATIONS_TABLE: &str = "cc_switch_lite_migrations";
+const MIGRATION_RECORDS_TABLE: &str = "cc_switch_lite_migration_records";
 const STORE_EXTENSIONS_TABLE: &str = "cc_switch_lite_store_extensions";
 const LEGACY_PROVIDER_MIGRATION: &str = "providers-json-v1";
 const LEGACY_STORE_VERSION: u32 = 1;
@@ -64,6 +65,8 @@ pub enum StoreError {
     Conflict(String),
     #[error("provider '{0}' is currently active")]
     CurrentProvider(String),
+    #[error("shared provider update failed and live recovery was incomplete: {0}")]
+    Recovery(String),
 }
 
 impl StoreError {
@@ -75,6 +78,7 @@ impl StoreError {
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
             Self::CurrentProvider(_) => "provider_in_use",
+            Self::Recovery(_) => "recovery_failed",
         }
     }
 }
@@ -83,6 +87,7 @@ impl StoreError {
 struct StoredProvider {
     record: ProviderRecord,
     is_current: bool,
+    native_settings: Value,
 }
 
 struct ProviderBinding<'a> {
@@ -129,7 +134,8 @@ impl ProviderStore {
         id: &str,
         expected_revision: u64,
         action: impl FnOnce(&ProviderRecord) -> Result<T, E>,
-    ) -> Result<Result<T, E>, StoreError> {
+        rollback: impl FnOnce(T) -> Result<(), String>,
+    ) -> Result<Result<(), E>, StoreError> {
         let app = parse_app(app_id)?;
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -137,26 +143,39 @@ impl ProviderStore {
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
         ensure_revision(&provider.record, expected_revision)?;
-        let result = action(&provider.record);
-        if result.is_err() {
-            transaction.rollback()?;
-            return Ok(result);
-        }
-        if !app.is_additive_mode() {
-            transaction.execute(
-                "UPDATE providers SET is_current = 0 WHERE app_type = ?1",
-                [app.as_str()],
-            )?;
-            let changed = transaction.execute(
-                "UPDATE providers SET is_current = 1 WHERE id = ?1 AND app_type = ?2",
-                params![id, app.as_str()],
-            )?;
-            if changed != 1 {
-                return Err(StoreError::Conflict(id.to_owned()));
+        let receipt = match action(&provider.record) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                transaction.rollback()?;
+                return Ok(Err(error));
             }
+        };
+        let finalize = (|| -> Result<(), StoreError> {
+            if !app.is_additive_mode() {
+                transaction.execute(
+                    "UPDATE providers SET is_current = 0 WHERE app_type = ?1",
+                    [app.as_str()],
+                )?;
+                let changed = transaction.execute(
+                    "UPDATE providers SET is_current = 1 WHERE id = ?1 AND app_type = ?2",
+                    params![id, app.as_str()],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::Conflict(id.to_owned()));
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = finalize {
+            if let Err(rollback_error) = rollback(receipt) {
+                return Err(StoreError::Recovery(format!(
+                    "database error: {error}; live recovery error: {rollback_error}"
+                )));
+            }
+            return Err(error);
         }
-        transaction.commit()?;
-        Ok(result)
+        Ok(Ok(()))
     }
 
     pub fn with_all_providers<T, E>(
@@ -164,14 +183,19 @@ impl ProviderStore {
         action: impl FnOnce(&[ProviderRecord]) -> Result<T, E>,
     ) -> Result<Result<T, E>, StoreError> {
         let mut connection = self.connect()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let providers = self
             .stored_providers(&transaction, None)?
             .into_iter()
             .map(|provider| provider.record)
             .collect::<Vec<_>>();
+        let result = action(&providers);
+        if result.is_err() {
+            transaction.rollback()?;
+            return Ok(result);
+        }
         transaction.commit()?;
-        Ok(action(&providers))
+        Ok(result)
     }
 
     pub fn migrate_legacy(&self, path: &Path) -> Result<(), StoreError> {
@@ -212,7 +236,13 @@ impl ProviderStore {
 
         let base_time = now_millis()?;
         for (offset, provider) in file.providers.iter().enumerate() {
-            let app = parse_app(&provider.app_id)?;
+            let app = match parse_app(&provider.app_id) {
+                Ok(app) => app,
+                Err(_) => {
+                    archive_legacy_provider(&transaction, offset, "unsupported_app", provider)?;
+                    continue;
+                }
+            };
             let exists = transaction
                 .query_row(
                     "SELECT 1 FROM providers WHERE id = ?1 AND app_type = ?2",
@@ -222,10 +252,8 @@ impl ProviderStore {
                 .optional()?
                 .is_some();
             if exists {
-                return Err(StoreError::InvalidStore(format!(
-                    "legacy provider '{}' conflicts with an existing shared provider",
-                    provider.id
-                )));
+                archive_legacy_provider(&transaction, offset, "identity_conflict", provider)?;
+                continue;
             }
 
             let (settings, adapter, compatibility_settings) =
@@ -293,17 +321,20 @@ impl ProviderStore {
     pub fn create_resolved_from<E>(
         &self,
         app_id: &str,
-        make_current: bool,
+        make_current_if_empty: bool,
         provider_factory: impl FnOnce() -> Result<(ProviderDraft, AdapterDescriptor), E>,
     ) -> Result<Result<ProviderRecord, E>, StoreError> {
         let app = parse_app(app_id)?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (draft, descriptor) = match provider_factory() {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
         let (name, settings, adapter, compatibility_settings) =
             validate_draft(&app, &draft, &descriptor)?;
-        self.insert_provider(
+        let created = self.insert_provider(
+            &transaction,
             &app,
             name,
             settings,
@@ -312,9 +343,10 @@ impl ProviderStore {
                 extensions: &Map::new(),
                 compatibility_settings: compatibility_settings.as_ref(),
             },
-            make_current,
-        )
-        .map(Ok)
+            make_current_if_empty,
+        )?;
+        transaction.commit()?;
+        Ok(Ok(created))
     }
 
     pub fn create_native(&self, draft: ProviderDraft) -> Result<ProviderRecord, StoreError> {
@@ -326,7 +358,10 @@ impl ProviderStore {
         }
         let name = validate_name(&draft.name).map_err(StoreError::InvalidProvider)?;
         validate_native_settings(&draft.settings)?;
-        self.insert_provider(
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let created = self.insert_provider(
+            &transaction,
             &app,
             name,
             Value::Object(draft.settings),
@@ -336,19 +371,20 @@ impl ProviderStore {
                 compatibility_settings: None,
             },
             false,
-        )
+        )?;
+        transaction.commit()?;
+        Ok(created)
     }
 
     fn insert_provider(
         &self,
+        transaction: &Transaction<'_>,
         app: &AppType,
         name: String,
         settings: Value,
         binding: ProviderBinding<'_>,
-        make_current: bool,
+        make_current_if_empty: bool,
     ) -> Result<ProviderRecord, StoreError> {
-        let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let id = Uuid::new_v4().to_string();
         let created_at = now_millis()?;
         let sort_index: i64 = transaction.query_row(
@@ -356,12 +392,16 @@ impl ProviderStore {
             [app.as_str()],
             |row| row.get(0),
         )?;
-        if make_current && !app.is_additive_mode() {
-            transaction.execute(
-                "UPDATE providers SET is_current = 0 WHERE app_type = ?1",
+        let make_current = if make_current_if_empty && !app.is_additive_mode() {
+            transaction.query_row(
+                "SELECT COUNT(*) = 0 FROM providers
+                 WHERE app_type = ?1 AND is_current = 1",
                 [app.as_str()],
-            )?;
-        }
+                |row| row.get(0),
+            )?
+        } else {
+            false
+        };
         transaction.execute(
             "INSERT INTO providers
              (id, app_type, name, settings_config, created_at, sort_index, meta, is_current, in_failover_queue)
@@ -374,15 +414,14 @@ impl ProviderStore {
                     .map_err(|error| StoreError::InvalidProvider(error.to_string()))?,
                 created_at,
                 sort_index,
-                make_current && !app.is_additive_mode(),
+                make_current,
             ],
         )?;
-        self.save_adapter_binding(&transaction, &id, app, created_at, binding)?;
+        self.save_adapter_binding(transaction, &id, app, created_at, binding)?;
         let created = self
-            .stored_provider(&transaction, app, &id)?
+            .stored_provider(transaction, app, &id)?
             .ok_or_else(|| StoreError::NotFound(id.clone()))?
             .record;
-        transaction.commit()?;
         Ok(created)
     }
 
@@ -438,8 +477,14 @@ impl ProviderStore {
             }
             if descriptor.reference.plugin_id == BUILTIN_PLUGIN_ID {
                 (
-                    legacy_settings_as_native(&app, &update.name, &merged, id)?,
-                    Some(Value::Object(merged)),
+                    apply_legacy_settings_to_native(
+                        &app,
+                        &update.name,
+                        &merged,
+                        id,
+                        Some(current.native_settings),
+                    )?,
+                    Some(legacy_settings_extras(&merged)),
                 )
             } else {
                 (Value::Object(merged), None)
@@ -684,6 +729,13 @@ impl ProviderStore {
                 id TEXT PRIMARY KEY,
                 completed_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS {MIGRATION_RECORDS_TABLE} (
+                migration_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                PRIMARY KEY (migration_id, position)
+            );
             CREATE TABLE IF NOT EXISTS {STORE_EXTENSIONS_TABLE} (
                 id TEXT PRIMARY KEY,
                 extensions_json TEXT NOT NULL
@@ -842,12 +894,15 @@ impl ProviderStore {
             )));
         }
         let settings = match raw_compatibility_settings {
-            Some(raw) => serde_json::from_str(&raw).map_err(|_| {
-                StoreError::InvalidStore(format!(
-                    "provider '{id}' has invalid compatibility settings"
-                ))
-            })?,
-            None => native_settings,
+            Some(raw) => {
+                let extras = serde_json::from_str(&raw).map_err(|_| {
+                    StoreError::InvalidStore(format!(
+                        "provider '{id}' has invalid compatibility settings"
+                    ))
+                })?;
+                legacy_settings_from_native(&app, &native_settings, extras, &id)?
+            }
+            None => native_settings.clone(),
         };
         let settings_object = settings.as_object().cloned().ok_or_else(|| {
             StoreError::InvalidStore(format!("provider '{id}' settings must be an object"))
@@ -879,6 +934,7 @@ impl ProviderStore {
                 extensions,
             },
             is_current,
+            native_settings,
         })
     }
 
@@ -953,6 +1009,31 @@ fn parse_app(app_id: &str) -> Result<AppType, StoreError> {
     app_id.parse::<AppType>().map_err(|_| {
         StoreError::InvalidProvider(format!("application '{app_id}' is not supported"))
     })
+}
+
+fn archive_legacy_provider(
+    transaction: &Transaction<'_>,
+    position: usize,
+    reason: &str,
+    provider: &ProviderRecord,
+) -> Result<(), StoreError> {
+    let position = i64::try_from(position).map_err(|_| {
+        StoreError::InvalidStore("legacy provider count exceeds SQLite range".to_owned())
+    })?;
+    transaction.execute(
+        &format!(
+            "INSERT INTO {MIGRATION_RECORDS_TABLE}
+             (migration_id, position, reason, record_json) VALUES (?1, ?2, ?3, ?4)"
+        ),
+        params![
+            LEGACY_PROVIDER_MIGRATION,
+            position,
+            reason,
+            serde_json::to_string(provider)
+                .map_err(|error| StoreError::InvalidStore(error.to_string()))?,
+        ],
+    )?;
+    Ok(())
 }
 
 fn lock_legacy_store(path: &Path) -> Result<File, StoreError> {
@@ -1070,7 +1151,6 @@ fn validate_legacy_file(file: &LegacyProviderFile) -> Result<(), StoreError> {
                 "a legacy provider record is incomplete or duplicated".to_owned(),
             ));
         }
-        parse_app(&provider.app_id)?;
         validate_name(&provider.name).map_err(StoreError::InvalidProvider)?;
     }
     Ok(())
@@ -1087,20 +1167,26 @@ fn migrate_legacy_provider(
         return Ok((settings, provider.adapter.clone(), None));
     }
 
-    let settings =
-        legacy_settings_as_native(app, &provider.name, &provider.settings, &provider.id)?;
+    let settings = apply_legacy_settings_to_native(
+        app,
+        &provider.name,
+        &provider.settings,
+        &provider.id,
+        None,
+    )?;
     Ok((
         settings,
         provider.adapter.clone(),
-        Some(Value::Object(provider.settings.clone())),
+        Some(legacy_settings_extras(&provider.settings)),
     ))
 }
 
-fn legacy_settings_as_native(
+fn apply_legacy_settings_to_native(
     app: &AppType,
     name: &str,
     settings: &Map<String, Value>,
     identity: &str,
+    native: Option<Value>,
 ) -> Result<Value, StoreError> {
     let api_key = settings
         .get("apiKey")
@@ -1122,7 +1208,24 @@ fn legacy_settings_as_native(
 
     let settings = match app {
         AppType::Claude => {
-            let mut env = Map::new();
+            let mut root = native
+                .unwrap_or_else(|| Value::Object(Map::new()))
+                .as_object()
+                .cloned()
+                .ok_or_else(|| {
+                    StoreError::InvalidProvider(format!(
+                        "provider '{identity}' has invalid Claude settings"
+                    ))
+                })?;
+            let env = root
+                .entry("env".to_owned())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    StoreError::InvalidProvider(format!(
+                        "provider '{identity}' has invalid Claude environment settings"
+                    ))
+                })?;
             env.insert(
                 "ANTHROPIC_API_KEY".to_owned(),
                 Value::String(api_key.to_owned()),
@@ -1132,40 +1235,100 @@ fn legacy_settings_as_native(
                     "ANTHROPIC_BASE_URL".to_owned(),
                     Value::String(base_url.to_owned()),
                 );
+            } else {
+                env.remove("ANTHROPIC_BASE_URL");
             }
             if let Some(model) = model {
                 env.insert(
                     "ANTHROPIC_MODEL".to_owned(),
                     Value::String(model.to_owned()),
                 );
+            } else {
+                env.remove("ANTHROPIC_MODEL");
             }
-            Value::Object(Map::from_iter([("env".to_owned(), Value::Object(env))]))
+            Value::Object(root)
         }
         AppType::Codex => {
-            let mut document = toml_edit::DocumentMut::new();
-            document["model_provider"] = toml_edit::value("custom");
+            let mut root = native
+                .unwrap_or_else(|| Value::Object(Map::new()))
+                .as_object()
+                .cloned()
+                .ok_or_else(|| {
+                    StoreError::InvalidProvider(format!(
+                        "provider '{identity}' has invalid Codex settings"
+                    ))
+                })?;
+            let auth = root
+                .entry("auth".to_owned())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    StoreError::InvalidProvider(format!(
+                        "provider '{identity}' has invalid Codex auth settings"
+                    ))
+                })?;
+            auth.insert(
+                "OPENAI_API_KEY".to_owned(),
+                Value::String(api_key.to_owned()),
+            );
+            let existing_config = root
+                .get("config")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mut document = existing_config
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|_| {
+                    StoreError::InvalidProvider(format!(
+                        "provider '{identity}' has invalid Codex TOML"
+                    ))
+                })?;
+            let route_id = document
+                .get("model_provider")
+                .and_then(toml_edit::Item::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("custom")
+                .to_owned();
+            document["model_provider"] = toml_edit::value(&route_id);
             if let Some(model) = model {
                 document["model"] = toml_edit::value(model);
+            } else {
+                document.remove("model");
             }
-            let mut route = toml_edit::Table::new();
+            if document
+                .get("model_providers")
+                .is_some_and(|item| !item.is_table())
+            {
+                return Err(StoreError::InvalidProvider(format!(
+                    "provider '{identity}' has invalid Codex provider routes"
+                )));
+            }
+            if document.get("model_providers").is_none() {
+                document["model_providers"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            let routes = document["model_providers"].as_table_mut().ok_or_else(|| {
+                StoreError::InvalidProvider(format!(
+                    "provider '{identity}' has invalid Codex provider routes"
+                ))
+            })?;
+            if routes.get(&route_id).is_some_and(|item| !item.is_table()) {
+                return Err(StoreError::InvalidProvider(format!(
+                    "provider '{identity}' has an invalid active Codex route"
+                )));
+            }
+            if routes.get(&route_id).is_none() {
+                routes.insert(&route_id, toml_edit::Item::Table(toml_edit::Table::new()));
+            }
+            let route = routes[&route_id].as_table_mut().ok_or_else(|| {
+                StoreError::InvalidProvider(format!(
+                    "provider '{identity}' has an invalid active Codex route"
+                ))
+            })?;
             route["name"] = toml_edit::value(name);
             route["base_url"] = toml_edit::value(base_url.unwrap_or("https://api.openai.com/v1"));
             route["wire_api"] = toml_edit::value("responses");
             route["requires_openai_auth"] = toml_edit::value(true);
-            let mut routes = toml_edit::Table::new();
-            routes.insert("custom", toml_edit::Item::Table(route));
-            document["model_providers"] = toml_edit::Item::Table(routes);
-
-            Value::Object(Map::from_iter([
-                (
-                    "auth".to_owned(),
-                    Value::Object(Map::from_iter([(
-                        "OPENAI_API_KEY".to_owned(),
-                        Value::String(api_key.to_owned()),
-                    )])),
-                ),
-                ("config".to_owned(), Value::String(document.to_string())),
-            ]))
+            root.insert("config".to_owned(), Value::String(document.to_string()));
+            Value::Object(root)
         }
         _ => {
             return Err(StoreError::InvalidProvider(format!(
@@ -1175,6 +1338,94 @@ fn legacy_settings_as_native(
         }
     };
     Ok(settings)
+}
+
+fn legacy_settings_extras(settings: &Map<String, Value>) -> Value {
+    let mut extras = settings.clone();
+    for key in ["apiKey", "baseUrl", "model"] {
+        extras.remove(key);
+    }
+    Value::Object(extras)
+}
+
+fn legacy_settings_from_native(
+    app: &AppType,
+    native: &Value,
+    extras: Value,
+    identity: &str,
+) -> Result<Value, StoreError> {
+    let native = native.as_object().ok_or_else(|| {
+        StoreError::InvalidStore(format!("provider '{identity}' settings must be an object"))
+    })?;
+    let mut settings = extras.as_object().cloned().ok_or_else(|| {
+        StoreError::InvalidStore(format!(
+            "provider '{identity}' has invalid compatibility settings"
+        ))
+    })?;
+    for key in ["apiKey", "baseUrl", "model"] {
+        settings.remove(key);
+    }
+    match app {
+        AppType::Claude => {
+            let env = native.get("env").and_then(Value::as_object);
+            copy_string_setting(env, "ANTHROPIC_API_KEY", &mut settings, "apiKey");
+            copy_string_setting(env, "ANTHROPIC_BASE_URL", &mut settings, "baseUrl");
+            copy_string_setting(env, "ANTHROPIC_MODEL", &mut settings, "model");
+        }
+        AppType::Codex => {
+            copy_string_setting(
+                native.get("auth").and_then(Value::as_object),
+                "OPENAI_API_KEY",
+                &mut settings,
+                "apiKey",
+            );
+            if let Some(config) = native.get("config").and_then(Value::as_str) {
+                let document = config.parse::<toml_edit::DocumentMut>().map_err(|_| {
+                    StoreError::InvalidStore(format!(
+                        "provider '{identity}' has invalid Codex TOML"
+                    ))
+                })?;
+                if let Some(model) = document.get("model").and_then(toml_edit::Item::as_str) {
+                    settings.insert("model".to_owned(), Value::String(model.to_owned()));
+                }
+                if let Some(route_id) = document
+                    .get("model_provider")
+                    .and_then(toml_edit::Item::as_str)
+                {
+                    if let Some(base_url) = document
+                        .get("model_providers")
+                        .and_then(toml_edit::Item::as_table)
+                        .and_then(|routes| routes.get(route_id))
+                        .and_then(toml_edit::Item::as_table)
+                        .and_then(|route| route.get("base_url"))
+                        .and_then(toml_edit::Item::as_str)
+                    {
+                        settings.insert("baseUrl".to_owned(), Value::String(base_url.to_owned()));
+                    }
+                }
+            }
+        }
+        _ => {
+            return Err(StoreError::InvalidStore(format!(
+                "provider '{identity}' has an incompatible built-in adapter"
+            )));
+        }
+    }
+    Ok(Value::Object(settings))
+}
+
+fn copy_string_setting(
+    source: Option<&Map<String, Value>>,
+    source_key: &str,
+    target: &mut Map<String, Value>,
+    target_key: &str,
+) {
+    if let Some(value) = source
+        .and_then(|source| source.get(source_key))
+        .and_then(Value::as_str)
+    {
+        target.insert(target_key.to_owned(), Value::String(value.to_owned()));
+    }
 }
 
 fn validate_draft(
@@ -1197,12 +1448,13 @@ fn validate_draft(
             .reference
             .same_identity(&native_adapter_reference(app))
     {
-        let settings = legacy_settings_as_native(app, &name, &draft.settings, "new provider")?;
+        let settings =
+            apply_legacy_settings_to_native(app, &name, &draft.settings, "new provider", None)?;
         return Ok((
             name,
             settings,
             draft.adapter.clone(),
-            Some(Value::Object(draft.settings.clone())),
+            Some(legacy_settings_extras(&draft.settings)),
         ));
     }
     Ok((
@@ -1432,6 +1684,61 @@ mod tests {
     }
 
     #[test]
+    fn codex_compatibility_projection_keeps_native_extensions() {
+        let native = serde_json::json!({
+            "auth": {
+                "OPENAI_API_KEY": "rotated-by-full",
+                "futureAuth": {"keep": true}
+            },
+            "config": "model_provider = \"gateway\"\nmodel = \"old\"\nfuture_top = true\n\n[model_providers.gateway]\nname = \"Full\"\nbase_url = \"https://full.example/v1\"\nwire_api = \"responses\"\nfuture_route = \"keep\"\n",
+            "futureRoot": {"keep": true}
+        });
+        let projected = legacy_settings_from_native(
+            &AppType::Codex,
+            &native,
+            serde_json::json!({"futureSetting": {"keep": true}}),
+            "codex-provider",
+        )
+        .unwrap();
+        let mut projected = projected.as_object().unwrap().clone();
+        assert_eq!(projected["apiKey"], "rotated-by-full");
+        assert_eq!(projected["baseUrl"], "https://full.example/v1");
+        assert_eq!(projected["futureSetting"]["keep"], true);
+        projected.insert("apiKey".to_owned(), Value::String("new-key".to_owned()));
+        projected.insert(
+            "baseUrl".to_owned(),
+            Value::String("https://lite.example/v1".to_owned()),
+        );
+
+        let merged = apply_legacy_settings_to_native(
+            &AppType::Codex,
+            "Renamed",
+            &projected,
+            "codex-provider",
+            Some(native),
+        )
+        .unwrap();
+
+        assert_eq!(merged["auth"]["OPENAI_API_KEY"], "new-key");
+        assert_eq!(merged["auth"]["futureAuth"]["keep"], true);
+        assert_eq!(merged["futureRoot"]["keep"], true);
+        let config = merged["config"]
+            .as_str()
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(config["future_top"].as_bool(), Some(true));
+        assert_eq!(
+            config["model_providers"]["gateway"]["base_url"].as_str(),
+            Some("https://lite.example/v1")
+        );
+        assert_eq!(
+            config["model_providers"]["gateway"]["future_route"].as_str(),
+            Some("keep")
+        );
+    }
+
+    #[test]
     fn native_crud_preserves_full_application_columns() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("cc-switch.db");
@@ -1623,7 +1930,8 @@ mod tests {
         let compatibility = providers
             .iter()
             .find(|provider| provider.id == "legacy-claude")
-            .unwrap();
+            .unwrap()
+            .clone();
         assert!(crate::provider::adapter_for_reference("claude", &compatibility.adapter).is_some());
         assert_eq!(compatibility.settings["apiKey"], "claude-secret");
         assert_eq!(compatibility.settings["futureSetting"]["keep"], true);
@@ -1642,6 +1950,61 @@ mod tests {
             .unwrap();
         let native: Value = serde_json::from_str(&native).unwrap();
         assert_eq!(native["env"]["ANTHROPIC_API_KEY"], "claude-secret");
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE providers SET settings_config=?1
+                 WHERE id='legacy-claude' AND app_type='claude'",
+                [serde_json::json!({
+                    "env": {
+                        "ANTHROPIC_API_KEY": "rotated-by-full",
+                        "ANTHROPIC_BASE_URL": "https://full.example",
+                        "futureEnv": {"keep": true}
+                    },
+                    "futureNative": {"keep": true}
+                })
+                .to_string()],
+            )
+            .unwrap();
+        let refreshed = store
+            .list("claude")
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.id == "legacy-claude")
+            .unwrap();
+        assert_eq!(refreshed.settings["apiKey"], "rotated-by-full");
+        assert_eq!(refreshed.settings["baseUrl"], "https://full.example");
+        assert_eq!(refreshed.settings["futureSetting"]["keep"], true);
+        let descriptor = crate::provider::built_in_adapters()
+            .into_iter()
+            .find(|adapter| adapter.app_id == "claude")
+            .unwrap();
+        store
+            .update_from(
+                "claude",
+                "legacy-claude",
+                ProviderUpdate {
+                    expected_revision: refreshed.revision,
+                    name: "Renamed".to_owned(),
+                    settings: refreshed.settings,
+                },
+                |_, _| Ok::<_, StoreError>(descriptor),
+            )
+            .unwrap()
+            .unwrap();
+        let after_lite: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT settings_config FROM providers
+                 WHERE id='legacy-claude' AND app_type='claude'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let after_lite: Value = serde_json::from_str(&after_lite).unwrap();
+        assert_eq!(after_lite["env"]["ANTHROPIC_API_KEY"], "rotated-by-full");
+        assert_eq!(after_lite["env"]["futureEnv"]["keep"], true);
+        assert_eq!(after_lite["futureNative"]["keep"], true);
         let plugin = providers
             .iter()
             .find(|provider| provider.id == "legacy-plugin")
@@ -1698,6 +2061,84 @@ mod tests {
     }
 
     #[test]
+    fn legacy_migration_archives_conflicts_without_blocking_other_records() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let legacy_path = directory.path().join("providers.json");
+        let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO providers
+                 (id, app_type, name, settings_config, created_at, sort_index, meta,
+                  is_current, in_failover_queue)
+                 VALUES ('same-id', 'claude', 'Existing', '{}', 1, 0, '{}', 0, 0)",
+                [],
+            )
+            .unwrap();
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "providers": [
+                    {
+                        "id": "same-id",
+                        "revision": 1,
+                        "appId": "claude",
+                        "adapter": native_adapter_reference(&AppType::Claude),
+                        "name": "Conflicting",
+                        "settings": {}
+                    },
+                    {
+                        "id": "codex-kept",
+                        "revision": 1,
+                        "appId": "codex",
+                        "adapter": native_adapter_reference(&AppType::Codex),
+                        "name": "Codex kept",
+                        "settings": {"auth": {}, "config": ""}
+                    },
+                    {
+                        "id": "future-kept",
+                        "revision": 1,
+                        "appId": "future-client",
+                        "adapter": {
+                            "pluginId": "example.future",
+                            "pluginVersion": "1.0.0",
+                            "adapterId": "future.adapter",
+                            "contractMajor": 1,
+                            "schemaVersion": 1
+                        },
+                        "name": "Future kept",
+                        "settings": {"token": "secret"}
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        store.migrate_legacy(&legacy_path).unwrap();
+
+        assert_eq!(store.list("codex").unwrap()[0].id, "codex-kept");
+        let connection = store.connect().unwrap();
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT reason, record_json FROM {MIGRATION_RECORDS_TABLE} ORDER BY position"
+            ))
+            .unwrap();
+        let archived = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<(String, String)>, _>>()
+            .unwrap();
+        assert_eq!(archived.len(), 2);
+        assert_eq!(archived[0].0, "identity_conflict");
+        assert!(archived[0].1.contains("Conflicting"));
+        assert_eq!(archived[1].0, "unsupported_app");
+        assert!(archived[1].1.contains("Future kept"));
+    }
+
+    #[test]
     fn exclusive_current_rows_cannot_be_deleted_but_additive_rows_can() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
@@ -1713,9 +2154,13 @@ mod tests {
 
         let alternate = create_native(&store, &AppType::Claude, "Alternate");
         store
-            .switch_with_provider("claude", &alternate.id, alternate.revision, |_| {
-                Err::<(), _>("live failed")
-            })
+            .switch_with_provider(
+                "claude",
+                &alternate.id,
+                alternate.revision,
+                |_| Err::<(), _>("live failed"),
+                |_| Ok(()),
+            )
             .unwrap()
             .unwrap_err();
         assert_eq!(store.current("claude").unwrap()[0].id, claude.id);
@@ -1726,9 +2171,46 @@ mod tests {
             .find(|provider| provider.id == alternate.id)
             .unwrap();
         store
-            .switch_with_provider("claude", &alternate.id, alternate.revision, |_| {
-                Ok::<(), &str>(())
-            })
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_current_update
+                 BEFORE UPDATE OF is_current ON providers
+                 WHEN NEW.is_current = 1
+                 BEGIN SELECT RAISE(ABORT, 'current rejected'); END;",
+            )
+            .unwrap();
+        let live_applied = std::cell::Cell::new(false);
+        assert!(store
+            .switch_with_provider(
+                "claude",
+                &alternate.id,
+                alternate.revision,
+                |_| {
+                    live_applied.set(true);
+                    Ok::<(), &str>(())
+                },
+                |_| {
+                    live_applied.set(false);
+                    Ok(())
+                },
+            )
+            .is_err());
+        assert!(!live_applied.get());
+        assert_eq!(store.current("claude").unwrap()[0].id, claude.id);
+        store
+            .connect()
+            .unwrap()
+            .execute("DROP TRIGGER reject_current_update", [])
+            .unwrap();
+        store
+            .switch_with_provider(
+                "claude",
+                &alternate.id,
+                alternate.revision,
+                |_| Ok::<(), &str>(()),
+                |_| Ok(()),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(store.current("claude").unwrap()[0].id, alternate.id);
@@ -1756,6 +2238,18 @@ mod tests {
             })
             .unwrap()
             .unwrap();
+        assert_eq!(store.current("codex").unwrap()[0].id, imported.id);
+        let later = store
+            .create_resolved_from("codex", true, || {
+                let mut later = draft(&codex, "Later", "later-secret");
+                later
+                    .settings
+                    .insert("env".to_owned(), Value::String("later-secret".to_owned()));
+                Ok::<_, StoreError>((later, native_descriptor(&codex)))
+            })
+            .unwrap()
+            .unwrap();
+        assert_ne!(later.id, imported.id);
         assert_eq!(store.current("codex").unwrap()[0].id, imported.id);
 
         let opencode = create_native(&store, &AppType::OpenCode, "OpenCode");

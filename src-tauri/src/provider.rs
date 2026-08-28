@@ -147,6 +147,7 @@ pub fn native_adapter_reference(app: &AppType) -> AdapterReference {
     }
 }
 
+#[cfg(test)]
 pub fn native_adapters() -> Vec<AdapterDescriptor> {
     AppType::all()
         .map(|app| AdapterDescriptor {

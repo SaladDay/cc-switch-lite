@@ -4,7 +4,7 @@ mod plugin;
 mod provider;
 mod store;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use live::{LiveConfig, LiveError};
 use plugin::{
@@ -217,29 +217,37 @@ fn switch_provider(
     id: String,
     expected_revision: u64,
 ) -> CommandResult<()> {
-    store.switch_with_provider(&app_id, &id, expected_revision, |provider| {
-        if provider.adapter.plugin_id == BUILTIN_PLUGIN_ID {
-            return live.switch(provider).map_err(CommandError::from);
-        }
-        let capabilities =
-            plugins.capabilities_for_reference(&provider.app_id, &provider.adapter)?;
-        live.execute_plugin_route(provider, &capabilities, |snapshots| {
-            let response = plugins.invoke(
-                &provider.adapter,
-                &PluginRequest::Plan {
-                    contract_major: CONTRACT_MAJOR,
-                    provider: provider.clone(),
-                    snapshots,
-                },
-            )?;
-            match response {
-                PluginResponse::Routed { route } => Ok(route),
-                _ => Err(PluginError::Runtime),
+    store.switch_with_provider(
+        &app_id,
+        &id,
+        expected_revision,
+        |provider| {
+            if provider.adapter.plugin_id == BUILTIN_PLUGIN_ID {
+                return live
+                    .switch_recoverable(provider)
+                    .map_err(CommandError::from);
             }
-        })
-        .map_err(CommandError::from)?
-        .map_err(CommandError::from)
-    })?
+            let capabilities =
+                plugins.capabilities_for_reference(&provider.app_id, &provider.adapter)?;
+            live.execute_plugin_route_recoverable(provider, &capabilities, |snapshots| {
+                let response = plugins.invoke(
+                    &provider.adapter,
+                    &PluginRequest::Plan {
+                        contract_major: CONTRACT_MAJOR,
+                        provider: provider.clone(),
+                        snapshots,
+                    },
+                )?;
+                match response {
+                    PluginResponse::Routed { route } => Ok(route),
+                    _ => Err(PluginError::Runtime),
+                }
+            })
+            .map_err(CommandError::from)?
+            .map_err(CommandError::from)
+        },
+        |receipt| live.rollback(receipt).map_err(|error| error.to_string()),
+    )?
 }
 
 #[tauri::command]
@@ -266,23 +274,24 @@ fn current_providers(
     let mut detected = live
         .current_providers(&app_id, &built_in)
         .map_err(CommandError::from)?;
-    let mut failed_plugins = HashSet::new();
-    let mut calls_by_plugin = HashMap::<String, usize>::new();
-    let mut total_calls = 0usize;
-    for provider in providers
+    let plugin_providers = providers
         .iter()
         .filter(|provider| provider.adapter.plugin_id != BUILTIN_PLUGIN_ID)
+        .collect::<Vec<_>>();
+    let mut calls_by_plugin = HashMap::<&str, usize>::new();
+    for provider in &plugin_providers {
+        *calls_by_plugin
+            .entry(&provider.adapter.plugin_id)
+            .or_default() += 1;
+    }
+    if plugin_providers.len() > MAX_CURRENT_CALLS
+        || calls_by_plugin
+            .values()
+            .any(|calls| *calls > MAX_CURRENT_CALLS_PER_PLUGIN)
     {
-        let plugin_id = provider.adapter.plugin_id.clone();
-        if total_calls >= MAX_CURRENT_CALLS || failed_plugins.contains(&plugin_id) {
-            continue;
-        }
-        let plugin_calls = calls_by_plugin.entry(plugin_id.clone()).or_default();
-        if *plugin_calls >= MAX_CURRENT_CALLS_PER_PLUGIN {
-            continue;
-        }
-        *plugin_calls += 1;
-        total_calls += 1;
+        return Ok(Vec::new());
+    }
+    for provider in plugin_providers {
         let matches = (|| {
             let capabilities =
                 plugins.capabilities_for_reference(&provider.app_id, &provider.adapter)?;
@@ -308,9 +317,7 @@ fn current_providers(
         match matches {
             Ok(true) => detected.push(CurrentProvider::from(provider)),
             Ok(false) => {}
-            Err(_) => {
-                failed_plugins.insert(plugin_id);
-            }
+            Err(_) => return Ok(Vec::new()),
         }
     }
     detected.sort_by(|left, right| left.id.cmp(&right.id));

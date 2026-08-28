@@ -6,11 +6,9 @@ import type {
   ProviderChanges,
   ProviderRecord,
 } from "../lib/provider-types";
-import { isNativeAdapter } from "../lib/provider-types";
 import { FullScreenPanel } from "./FullScreenPanel";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
-import { Textarea } from "./ui/textarea";
 
 interface ProviderDialogProps {
   adapters: AdapterDescriptor[];
@@ -46,37 +44,10 @@ export function ProviderDialog({
   const [settings, setSettings] = useState(() =>
     initialSettings(adapter, provider),
   );
-  const [settingsJson, setSettingsJson] = useState(() =>
-    JSON.stringify(provider?.settings ?? {}, null, 2),
-  );
-  const [jsonError, setJsonError] = useState<string | null>(null);
-  const native = isNativeAdapter(adapter.reference);
   const title = provider ? "Edit provider" : "Add provider";
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (native) {
-      try {
-        const parsed: unknown = JSON.parse(settingsJson);
-        if (
-          typeof parsed !== "object" ||
-          parsed === null ||
-          Array.isArray(parsed)
-        ) {
-          setJsonError("Provider configuration must be a JSON object.");
-          return;
-        }
-        setJsonError(null);
-        onSave({
-          name,
-          settings: parsed as ProviderChanges["settings"],
-          adapter: provider ? undefined : adapter.reference,
-        });
-      } catch {
-        setJsonError("Provider configuration must contain valid JSON.");
-      }
-      return;
-    }
     onSave({
       name,
       settings,
@@ -88,11 +59,7 @@ export function ProviderDialog({
     <FullScreenPanel
       title={title}
       titleId="provider-dialog-title"
-      description={
-        native
-          ? "Edit the provider's native CC Switch configuration."
-          : `${adapter.displayName}. Credentials remain in CC Switch Lite until this provider is activated.`
-      }
+      description={`${adapter.displayName}. Credentials remain in CC Switch Lite until this provider is activated.`}
       closeLabel="Close provider dialog"
       busy={busy}
       onClose={onCancel}
@@ -134,8 +101,6 @@ export function ProviderDialog({
                 const index = Number(event.target.value);
                 setSelectedIndex(index);
                 setSettings(initialSettings(adapters[index]));
-                setSettingsJson("{}");
-                setJsonError(null);
               }}
               className="flex h-9 w-full rounded-md border border-border-default bg-background px-3 py-1 text-sm text-foreground shadow-sm outline-none transition-colors focus:ring-2 focus:ring-blue-500/20 dark:focus:ring-blue-400/20"
             >
@@ -163,82 +128,56 @@ export function ProviderDialog({
           />
         </label>
 
-        {native && (
-          <div className="space-y-2">
-            <label
-              htmlFor="provider-native-settings"
-              className="block text-sm font-medium"
-            >
-              Configuration JSON
-            </label>
-            <Textarea
-              id="provider-native-settings"
-              required
-              spellCheck={false}
-              value={settingsJson}
-              onChange={(event) => {
-                setSettingsJson(event.target.value);
-                setJsonError(null);
-              }}
-              className="min-h-64 font-mono text-xs"
-            />
-            <p className="text-xs font-normal leading-5 text-muted-foreground">
-              This object is stored as the provider's settings_config value.
-            </p>
-          </div>
-        )}
+        {adapter.fields.map((field) => {
+          const inputId = `provider-setting-${field.key}`;
+          const helpId = `${inputId}-help`;
+          const fieldValue = settings[field.key];
+          return (
+            <div key={field.key} className="space-y-2">
+              <label htmlFor={inputId} className="block text-sm font-medium">
+                {field.label}
+                {!field.required && (
+                  <span className="ml-1 font-normal text-muted-foreground">
+                    Optional
+                  </span>
+                )}
+              </label>
+              <Input
+                id={inputId}
+                aria-describedby={helpId}
+                required={field.required}
+                type={
+                  field.kind === "secret"
+                    ? "password"
+                    : field.kind === "url"
+                      ? "url"
+                      : "text"
+                }
+                value={typeof fieldValue === "string" ? fieldValue : ""}
+                onChange={(event) =>
+                  setSettings((current) => ({
+                    ...current,
+                    [field.key]: event.target.value,
+                  }))
+                }
+                placeholder={field.placeholder}
+              />
+              <p
+                id={helpId}
+                className="text-xs font-normal leading-5 text-muted-foreground"
+              >
+                {field.help}
+              </p>
+            </div>
+          );
+        })}
 
-        {!native &&
-          adapter.fields.map((field) => {
-            const inputId = `provider-setting-${field.key}`;
-            const helpId = `${inputId}-help`;
-            const fieldValue = settings[field.key];
-            return (
-              <div key={field.key} className="space-y-2">
-                <label htmlFor={inputId} className="block text-sm font-medium">
-                  {field.label}
-                  {!field.required && (
-                    <span className="ml-1 font-normal text-muted-foreground">
-                      Optional
-                    </span>
-                  )}
-                </label>
-                <Input
-                  id={inputId}
-                  aria-describedby={helpId}
-                  required={field.required}
-                  type={
-                    field.kind === "secret"
-                      ? "password"
-                      : field.kind === "url"
-                        ? "url"
-                        : "text"
-                  }
-                  value={typeof fieldValue === "string" ? fieldValue : ""}
-                  onChange={(event) =>
-                    setSettings((current) => ({
-                      ...current,
-                      [field.key]: event.target.value,
-                    }))
-                  }
-                  placeholder={field.placeholder}
-                />
-                <p
-                  id={helpId}
-                  className="text-xs font-normal leading-5 text-muted-foreground"
-                >
-                  {field.help}
-                </p>
-              </div>
-            );
-          })}
-
-        {(jsonError || error) && (
+        {error && (
           <p
             role="alert"
             className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300"
           >
-            {jsonError || error}
+            {error}
           </p>
         )}
       </form>
