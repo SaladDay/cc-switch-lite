@@ -145,7 +145,7 @@ impl PluginManager {
         Ok(manifest
             .descriptors()
             .into_iter()
-            .find(|adapter| adapter.app_id == app_id && adapter.reference == *reference))
+            .find(|adapter| adapter.app_id == app_id && adapter.reference.same_identity(reference)))
     }
 
     pub fn capabilities_for_reference(
@@ -201,7 +201,6 @@ impl PluginManager {
         self.invoke_with_limit(reference, request, false)
     }
 
-    #[allow(dead_code)]
     pub fn invoke_current(
         &self,
         reference: &AdapterReference,
@@ -229,7 +228,8 @@ impl PluginManager {
         let manifest = self.checked_manifest(&installed, &reference.plugin_version)?;
         if reference.contract_major != manifest.host_api_major
             || !manifest.descriptors().iter().any(|adapter| {
-                adapter.reference == *reference && adapter.app_id == reference_app(request)
+                adapter.reference.same_identity(reference)
+                    && adapter.app_id == reference_app(request)
             })
         {
             return Err(PluginError::Invalid(

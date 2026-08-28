@@ -80,6 +80,19 @@ export function isNativeAdapter(reference: AdapterReference): boolean {
   );
 }
 
+export function sameAdapterIdentity(
+  left: AdapterReference,
+  right: AdapterReference,
+): boolean {
+  return (
+    left.pluginId === right.pluginId &&
+    left.pluginVersion === right.pluginVersion &&
+    left.adapterId === right.adapterId &&
+    left.contractMajor === right.contractMajor &&
+    left.schemaVersion === right.schemaVersion
+  );
+}
+
 export interface CommandError {
   code: string;
   message: string;

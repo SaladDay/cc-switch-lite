@@ -4,6 +4,8 @@ mod plugin;
 mod provider;
 mod store;
 
+use std::collections::{HashMap, HashSet};
+
 use live::{LiveConfig, LiveError};
 use plugin::{
     InstallSelection, InstalledPlugin, MarketplaceCatalog, PluginCapability, PluginError,
@@ -62,6 +64,8 @@ impl From<PluginError> for CommandError {
 }
 
 type CommandResult<T> = Result<T, CommandError>;
+const MAX_CURRENT_CALLS: usize = 32;
+const MAX_CURRENT_CALLS_PER_PLUGIN: usize = 8;
 #[tauri::command]
 fn list_provider_adapters(plugins: State<'_, PluginManager>) -> Vec<AdapterDescriptor> {
     plugins.adapters()
@@ -83,11 +87,14 @@ fn create_provider(
 ) -> CommandResult<ProviderRecord> {
     let app_id = provider.app_id.clone();
     if let Ok(app) = app_id.parse::<cc_switch_core::AppType>() {
-        if provider.adapter == native_adapter_reference(&app) {
+        if provider
+            .adapter
+            .same_identity(&native_adapter_reference(&app))
+        {
             return store.create_native(provider).map_err(Into::into);
         }
     }
-    let created = store.create_resolved_from(&app_id, || {
+    let created = store.create_resolved_from(&app_id, false, || {
         let descriptor = plugins
             .adapter_for_reference(&app_id, &provider.adapter)?
             .ok_or(PluginError::NotFound)?;
@@ -110,7 +117,18 @@ fn update_provider(
             let descriptor = plugins
                 .adapter_for_reference(&current.app_id, &current.adapter)?
                 .ok_or(PluginError::NotFound)?;
-            plugins.validate_provider(&descriptor, &update.settings)?;
+            let declared = descriptor
+                .fields
+                .iter()
+                .filter_map(|field| {
+                    update
+                        .settings
+                        .get(&field.key)
+                        .cloned()
+                        .map(|value| (field.key.clone(), value))
+                })
+                .collect();
+            plugins.validate_provider(&descriptor, &declared)?;
             Ok::<_, PluginError>(descriptor)
         })?
         .map_err(Into::into)
@@ -148,7 +166,7 @@ fn import_live_provider(
                 ))
             })?,
     };
-    let imported = store.create_resolved_from(&app_id, || {
+    store.create_resolved_from(&app_id, true, || {
         let descriptor = plugins
             .adapter_for_reference(&app_id, &reference)?
             .ok_or(PluginError::NotFound)?;
@@ -174,7 +192,7 @@ fn import_live_provider(
                 _ => return Err(CommandError::from(PluginError::Runtime)),
             }
         };
-        if draft.adapter != reference {
+        if !draft.adapter.same_identity(&reference) {
             return Err(CommandError::from(PluginError::Invalid(
                 "imported provider does not use the requested adapter".to_owned(),
             )));
@@ -187,16 +205,7 @@ fn import_live_provider(
             .validate_provider(&descriptor, &draft.settings)
             .map_err(CommandError::from)?;
         Ok::<_, CommandError>((draft, descriptor))
-    })??;
-    if app_id
-        .parse::<cc_switch_core::AppType>()
-        .is_ok_and(|app| !app.is_additive_mode())
-    {
-        return store
-            .set_current(&app_id, &imported.id, imported.revision)
-            .map_err(Into::into);
-    }
-    Ok(imported)
+    })?
 }
 
 #[tauri::command]
@@ -208,7 +217,7 @@ fn switch_provider(
     id: String,
     expected_revision: u64,
 ) -> CommandResult<()> {
-    let switched = store.with_provider(&app_id, &id, expected_revision, |provider| {
+    store.switch_with_provider(&app_id, &id, expected_revision, |provider| {
         if provider.adapter.plugin_id == BUILTIN_PLUGIN_ID {
             return live.switch(provider).map_err(CommandError::from);
         }
@@ -230,23 +239,90 @@ fn switch_provider(
         })
         .map_err(CommandError::from)?
         .map_err(CommandError::from)
-    })?;
-    switched?;
-    if app_id
-        .parse::<cc_switch_core::AppType>()
-        .is_ok_and(|app| !app.is_additive_mode())
-    {
-        store.set_current(&app_id, &id, expected_revision)?;
-    }
-    Ok(())
+    })?
 }
 
 #[tauri::command]
 fn current_providers(
     store: State<'_, ProviderStore>,
+    live: State<'_, LiveConfig>,
+    plugins: State<'_, PluginManager>,
     app_id: String,
 ) -> CommandResult<Vec<CurrentProvider>> {
-    store.current(&app_id).map_err(Into::into)
+    let current = store.current(&app_id)?;
+    if !current.is_empty() || !matches!(app_id.as_str(), "claude" | "codex") {
+        return Ok(current);
+    }
+
+    let providers = store.list(&app_id)?;
+    let built_in = providers
+        .iter()
+        .filter(|provider| provider.adapter.plugin_id == BUILTIN_PLUGIN_ID)
+        .filter(|provider| {
+            crate::provider::adapter_for_reference(&provider.app_id, &provider.adapter).is_some()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut detected = live
+        .current_providers(&app_id, &built_in)
+        .map_err(CommandError::from)?;
+    let mut failed_plugins = HashSet::new();
+    let mut calls_by_plugin = HashMap::<String, usize>::new();
+    let mut total_calls = 0usize;
+    for provider in providers
+        .iter()
+        .filter(|provider| provider.adapter.plugin_id != BUILTIN_PLUGIN_ID)
+    {
+        let plugin_id = provider.adapter.plugin_id.clone();
+        if total_calls >= MAX_CURRENT_CALLS || failed_plugins.contains(&plugin_id) {
+            continue;
+        }
+        let plugin_calls = calls_by_plugin.entry(plugin_id.clone()).or_default();
+        if *plugin_calls >= MAX_CURRENT_CALLS_PER_PLUGIN {
+            continue;
+        }
+        *plugin_calls += 1;
+        total_calls += 1;
+        let matches = (|| {
+            let capabilities =
+                plugins.capabilities_for_reference(&provider.app_id, &provider.adapter)?;
+            let response = live
+                .with_plugin_snapshots(&app_id, &capabilities, |snapshots| {
+                    plugins.invoke_current(
+                        &provider.adapter,
+                        &PluginRequest::Current {
+                            contract_major: CONTRACT_MAJOR,
+                            app_id: app_id.clone(),
+                            adapter_id: provider.adapter.adapter_id.clone(),
+                            settings: provider.settings.clone(),
+                            snapshots,
+                        },
+                    )
+                })
+                .map_err(CommandError::from)??;
+            match response {
+                PluginResponse::Current { matches } => Ok(matches),
+                _ => Err(CommandError::from(PluginError::Runtime)),
+            }
+        })();
+        match matches {
+            Ok(true) => detected.push(CurrentProvider::from(provider)),
+            Ok(false) => {}
+            Err(_) => {
+                failed_plugins.insert(plugin_id);
+            }
+        }
+    }
+    detected.sort_by(|left, right| left.id.cmp(&right.id));
+    detected.dedup_by(|left, right| left.id == right.id);
+    if detected.len() != 1 {
+        return Ok(Vec::new());
+    }
+    let candidate = &detected[0];
+    match store.set_current_if_empty(&app_id, &candidate.id, candidate.revision)? {
+        Some(current) => Ok(vec![CurrentProvider::from(&current)]),
+        None => store.current(&app_id).map_err(Into::into),
+    }
 }
 
 #[tauri::command]

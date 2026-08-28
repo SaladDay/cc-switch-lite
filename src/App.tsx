@@ -34,7 +34,7 @@ import type {
   ProviderChanges,
   ProviderRecord,
 } from "./lib/provider-types";
-import { isNativeAdapter } from "./lib/provider-types";
+import { isNativeAdapter, sameAdapterIdentity } from "./lib/provider-types";
 import { errorMessage, providersApi } from "./lib/providers";
 
 interface AppDefinition {
@@ -162,7 +162,7 @@ function adapterMatchesProvider(
 ): boolean {
   return (
     adapter.appId === provider.appId &&
-    sameJsonValue(adapter.reference, provider.adapter)
+    sameAdapterIdentity(adapter.reference, provider.adapter)
   );
 }
 

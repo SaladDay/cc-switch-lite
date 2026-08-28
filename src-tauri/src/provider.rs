@@ -22,6 +22,16 @@ pub struct AdapterReference {
     pub extensions: Map<String, Value>,
 }
 
+impl AdapterReference {
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.plugin_id == other.plugin_id
+            && self.plugin_version == other.plugin_version
+            && self.adapter_id == other.adapter_id
+            && self.contract_major == other.contract_major
+            && self.schema_version == other.schema_version
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderRecord {
@@ -239,7 +249,7 @@ pub fn adapter_for_reference(
 ) -> Option<AdapterDescriptor> {
     built_in_adapters()
         .into_iter()
-        .find(|adapter| adapter.app_id == app_id && adapter.reference == *reference)
+        .find(|adapter| adapter.app_id == app_id && adapter.reference.same_identity(reference))
 }
 
 pub fn validate_name(name: &str) -> Result<String, String> {

@@ -742,7 +742,7 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Edit Work" })).toBeDisabled();
   });
 
-  it("treats an adapter with opaque identity fields as unavailable", async () => {
+  it("ignores opaque fields when matching an adapter identity", async () => {
     const futureIdentity = {
       ...workProvider,
       adapter: {
@@ -754,9 +754,10 @@ describe("App", () => {
     api.list.mockResolvedValue([futureIdentity]);
     render(<App />);
 
-    expect(await screen.findByText("Adapter unavailable")).toBeVisible();
-    expect(screen.queryByText("must-not-be-rendered")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Edit Work" })).toBeDisabled();
+    expect(
+      await screen.findByRole("button", { name: "Edit Work" }),
+    ).toBeEnabled();
+    expect(screen.queryByText("Adapter unavailable")).not.toBeInTheDocument();
   });
 
   it("matches adapter identities without Object.hasOwn", () => {

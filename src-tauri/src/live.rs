@@ -237,7 +237,6 @@ impl LiveConfig {
         })
     }
 
-    #[allow(dead_code)]
     pub fn current_providers(
         &self,
         app_id: &str,
@@ -1199,7 +1198,6 @@ fn insert_optional_string(target: &mut Map<String, Value>, key: &str, value: Opt
     }
 }
 
-#[allow(dead_code)]
 fn managed_settings_match(
     app_id: &str,
     provider: &Map<String, Value>,
@@ -1225,7 +1223,6 @@ fn normalize_base_url(value: Option<&str>) -> &str {
     value.unwrap_or("").trim().trim_end_matches('/')
 }
 
-#[allow(dead_code)]
 fn normalize_base_url_for_app<'a>(app_id: &str, value: Option<&'a str>) -> &'a str {
     let normalized = normalize_base_url(value);
     if app_id == "codex" && normalized.is_empty() {

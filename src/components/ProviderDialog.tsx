@@ -24,13 +24,12 @@ interface ProviderDialogProps {
 function initialSettings(
   adapter: AdapterDescriptor,
   provider?: ProviderRecord,
-): Record<string, string> {
-  return Object.fromEntries(
-    adapter.fields.map((field) => {
-      const value = provider?.settings[field.key];
-      return [field.key, typeof value === "string" ? value : ""];
-    }),
-  );
+): ProviderChanges["settings"] {
+  const settings = { ...(provider?.settings ?? {}) };
+  for (const field of adapter.fields) {
+    if (typeof settings[field.key] !== "string") settings[field.key] = "";
+  }
+  return settings;
 }
 
 export function ProviderDialog({
@@ -193,6 +192,7 @@ export function ProviderDialog({
           adapter.fields.map((field) => {
             const inputId = `provider-setting-${field.key}`;
             const helpId = `${inputId}-help`;
+            const fieldValue = settings[field.key];
             return (
               <div key={field.key} className="space-y-2">
                 <label htmlFor={inputId} className="block text-sm font-medium">
@@ -214,7 +214,7 @@ export function ProviderDialog({
                         ? "url"
                         : "text"
                   }
-                  value={settings[field.key] ?? ""}
+                  value={typeof fieldValue === "string" ? fieldValue : ""}
                   onChange={(event) =>
                     setSettings((current) => ({
                       ...current,
