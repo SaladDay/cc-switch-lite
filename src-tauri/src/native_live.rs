@@ -777,15 +777,13 @@ fn writable_native_access(provider: &ProviderRecord) -> Result<NativeProviderAcc
 }
 
 fn core_plan_error(error: NativePlanError) -> LiveError {
-    if matches!(
-        &error,
-        NativePlanError::InvalidDocument { .. }
-            | NativePlanError::WrongDocumentApp { .. }
-            | NativePlanError::InvalidPlan(_)
-    ) {
-        LiveError::InvalidConfig(error.to_string())
-    } else {
-        LiveError::InvalidProvider(error.to_string())
+    match error {
+        NativePlanError::InvalidPlan(error) => LiveError::Operation(
+            crate::operation::OperationError::InvalidPlan(error.to_string()),
+        ),
+        error @ (NativePlanError::InvalidDocument { .. }
+        | NativePlanError::WrongDocumentApp { .. }) => LiveError::InvalidConfig(error.to_string()),
+        error => LiveError::InvalidProvider(error.to_string()),
     }
 }
 
@@ -1377,6 +1375,28 @@ mod tests {
                 None,
             )
             .expect("unmanaged symlink is outside the operation target set");
+    }
+
+    #[test]
+    fn oversized_projected_output_keeps_the_operation_plan_error_code() {
+        let directory = tempfile::tempdir().unwrap();
+        let native = NativeLiveConfig::for_tests(
+            directory.path(),
+            directory.path().join(".claude"),
+            directory.path().join(".codex"),
+        );
+        let error = native
+            .apply_plan(
+                &provider(
+                    AppType::Claude,
+                    "large",
+                    json!({"values": vec![0; 200_000]}),
+                ),
+                None,
+            )
+            .expect_err("pretty output exceeds the operation plan limit");
+
+        assert_eq!(error.code(), "invalid_operation_plan");
     }
 
     #[test]
