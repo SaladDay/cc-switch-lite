@@ -7,7 +7,6 @@ import {
   RefreshCw,
   ShieldCheck,
   Trash2,
-  X,
 } from "lucide-react";
 
 import type {
@@ -18,7 +17,10 @@ import type {
   RegistrySource,
 } from "../lib/plugin-types";
 import { errorMessage, pluginsApi } from "../lib/providers";
-import { useModalDialog } from "../lib/use-modal-dialog";
+import { FullScreenPanel } from "./FullScreenPanel";
+import { Button } from "./ui/button";
+import { Input } from "./ui/input";
+import { Textarea } from "./ui/textarea";
 
 interface MarketplaceDialogProps {
   onCancel: () => void;
@@ -80,7 +82,6 @@ export function MarketplaceDialog({
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const blocking = busy !== null && busy !== "refresh";
-  const dialogRef = useModalDialog({ busy: blocking, onCancel });
 
   const refreshCatalog = async () => {
     setBusy("refresh");
@@ -218,37 +219,16 @@ export function MarketplaceDialog({
   };
 
   return (
-    <dialog
-      ref={dialogRef}
-      aria-modal="true"
-      aria-labelledby="marketplace-dialog-title"
-      onCancel={(event) => {
-        event.preventDefault();
-        if (!blocking) onCancel();
-      }}
-      className="glass-card fixed inset-0 z-50 m-auto h-[min(760px,calc(100vh-3rem))] w-[min(880px,calc(100%-3rem))] overflow-hidden rounded-2xl p-0 text-foreground shadow-2xl"
+    <FullScreenPanel
+      title="Plugin marketplace"
+      titleId="marketplace-dialog-title"
+      description="Signed provider adapters from sources you trust."
+      closeLabel="Close plugin marketplace"
+      busy={blocking}
+      onClose={onCancel}
+      contentClassName="h-full space-y-0 p-0"
     >
-      <div className="flex items-start justify-between border-b border-border px-6 py-5">
-        <div>
-          <h2 id="marketplace-dialog-title" className="text-lg font-semibold">
-            Plugin marketplace
-          </h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Signed provider adapters from sources you trust.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={onCancel}
-          disabled={blocking}
-          className="inline-flex size-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
-          aria-label="Close plugin marketplace"
-        >
-          <X className="size-4" />
-        </button>
-      </div>
-
-      <div className="flex h-[calc(100%-85px)]">
+      <div className="flex h-full min-h-0">
         <nav className="w-44 shrink-0 space-y-1 border-r border-border p-3">
           {(["catalog", "sources"] as const).map((item) => (
             <button
@@ -256,7 +236,7 @@ export function MarketplaceDialog({
               type="button"
               aria-pressed={tab === item}
               onClick={() => setTab(item)}
-              className={`h-10 w-full rounded-xl px-3 text-left text-sm font-medium capitalize transition-colors ${
+              className={`h-10 w-full rounded-lg px-3 text-left text-sm font-medium capitalize transition-colors ${
                 tab === item
                   ? "bg-muted text-foreground"
                   : "text-muted-foreground hover:bg-muted/60 hover:text-foreground"
@@ -281,8 +261,16 @@ export function MarketplaceDialog({
           )}
 
           {loading ? (
-            <div className="grid h-full place-items-center">
-              <LoaderCircle className="size-6 animate-spin text-muted-foreground" />
+            <div
+              role="status"
+              aria-live="polite"
+              className="grid h-full place-items-center"
+            >
+              <span className="sr-only">Loading plugin marketplace</span>
+              <LoaderCircle
+                aria-hidden="true"
+                className="size-6 animate-spin text-muted-foreground"
+              />
             </div>
           ) : tab === "catalog" ? (
             <Catalog
@@ -307,7 +295,7 @@ export function MarketplaceDialog({
           )}
         </div>
       </div>
-    </dialog>
+    </FullScreenPanel>
   );
 }
 
@@ -339,17 +327,17 @@ function Catalog({
             Refresh is manual. Lite never updates plugins in the background.
           </p>
         </div>
-        <button
-          type="button"
+        <Button
+          variant="outline"
+          size="sm"
           disabled={busy !== null}
           onClick={onRefresh}
-          className="inline-flex h-9 items-center gap-2 rounded-xl border border-border px-3 text-sm font-medium hover:bg-muted disabled:opacity-50"
         >
           <RefreshCw
             className={`size-4 ${busy === "refresh" ? "animate-spin" : ""}`}
           />
           Refresh
-        </button>
+        </Button>
       </div>
 
       {catalog.failures.map((failure) => (
@@ -376,14 +364,15 @@ function Catalog({
                     Version {plugin.version} · Source {plugin.registryId}
                   </p>
                 </div>
-                <button
-                  type="button"
+                <Button
+                  variant="outline"
+                  size="sm"
                   disabled={busy !== null}
                   onClick={() => onUninstall(plugin.id)}
-                  className="h-8 shrink-0 rounded-lg border border-border px-3 text-xs font-medium hover:bg-red-500/10 hover:text-red-600 disabled:opacity-50"
+                  className="h-8 shrink-0 text-xs hover:bg-red-500/10 hover:text-red-600"
                 >
                   {busy === `installed:${plugin.id}` ? "Removing…" : "Remove"}
-                </button>
+                </Button>
               </div>
             ))}
           </div>
@@ -430,7 +419,7 @@ function Catalog({
             return (
               <article
                 key={key}
-                className="rounded-2xl border border-border p-4"
+                className="rounded-xl border border-border p-4"
               >
                 <div className="flex items-start justify-between gap-5">
                   <div className="min-w-0">
@@ -450,16 +439,17 @@ function Catalog({
                     </p>
                   </div>
                   {exactInstall ? (
-                    <button
-                      type="button"
+                    <Button
+                      variant="outline"
+                      size="sm"
                       disabled
-                      className="h-9 shrink-0 rounded-xl border border-border px-3 text-sm font-medium text-muted-foreground opacity-70"
+                      className="shrink-0 text-muted-foreground opacity-70"
                     >
                       Installed
-                    </button>
+                    </Button>
                   ) : (
-                    <button
-                      type="button"
+                    <Button
+                      size="sm"
                       disabled={
                         busy !== null ||
                         needsApproval ||
@@ -467,7 +457,7 @@ function Catalog({
                         ownershipCollision
                       }
                       onClick={() => onInstall(plugin)}
-                      className="h-9 shrink-0 rounded-xl bg-primary px-3 text-sm font-medium text-primary-foreground disabled:opacity-40"
+                      className="shrink-0"
                     >
                       {busy === key
                         ? "Verifying…"
@@ -478,7 +468,7 @@ function Catalog({
                             : update
                               ? "Update"
                               : "Install"}
-                    </button>
+                    </Button>
                   )}
                 </div>
                 <div className="mt-4 rounded-xl bg-muted/70 px-3 py-3">
@@ -545,19 +535,19 @@ function Sources({
         </div>
         <label className="block text-sm font-medium">
           Name
-          <input
+          <Input
             required
             maxLength={80}
             value={editing.label}
             onChange={(event) =>
               onEdit({ ...editing, label: event.target.value })
             }
-            className="mt-2 h-10 w-full rounded-xl border border-border bg-background px-3 text-sm outline-none focus:border-primary"
+            className="mt-2"
           />
         </label>
         <label className="block text-sm font-medium">
           Registry index URL
-          <input
+          <Input
             required
             type="url"
             value={editing.indexUrl}
@@ -565,7 +555,7 @@ function Sources({
               onEdit({ ...editing, indexUrl: event.target.value })
             }
             placeholder="https://plugins.example.com/index.json"
-            className="mt-2 h-10 w-full rounded-xl border border-border bg-background px-3 text-sm outline-none focus:border-primary"
+            className="mt-2"
           />
         </label>
         <label className="flex items-center gap-2 text-sm">
@@ -588,8 +578,10 @@ function Sources({
                 it.
               </p>
             </div>
-            <button
+            <Button
               type="button"
+              variant="outline"
+              size="sm"
               onClick={() =>
                 onEdit({
                   ...editing,
@@ -599,17 +591,17 @@ function Sources({
                   ],
                 })
               }
-              className="inline-flex h-8 items-center gap-1 rounded-lg border border-border px-2 text-xs hover:bg-muted"
+              className="h-8 text-xs"
             >
               <Plus className="size-3.5" /> Key
-            </button>
+            </Button>
           </div>
           {editing.trustedPublishers.map((key, index) => (
             <div
               key={index}
               className="grid grid-cols-[1fr_1fr_auto] gap-2 rounded-xl border border-border p-3"
             >
-              <input
+              <Input
                 required
                 aria-label={`Publisher ID ${index + 1}`}
                 value={key.publisherId}
@@ -619,9 +611,9 @@ function Sources({
                   onEdit({ ...editing, trustedPublishers: keys });
                 }}
                 placeholder="Publisher ID"
-                className="h-9 rounded-lg border border-border bg-background px-2 text-xs outline-none focus:border-primary"
+                className="px-2 text-xs"
               />
-              <input
+              <Input
                 required
                 aria-label={`Key ID ${index + 1}`}
                 value={key.keyId}
@@ -631,10 +623,12 @@ function Sources({
                   onEdit({ ...editing, trustedPublishers: keys });
                 }}
                 placeholder="Key ID"
-                className="h-9 rounded-lg border border-border bg-background px-2 text-xs outline-none focus:border-primary"
+                className="px-2 text-xs"
               />
-              <button
+              <Button
                 type="button"
+                variant="ghost"
+                size="icon"
                 disabled={editing.trustedPublishers.length === 1}
                 onClick={() =>
                   onEdit({
@@ -644,12 +638,12 @@ function Sources({
                     ),
                   })
                 }
-                className="inline-flex size-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-red-500/10 hover:text-red-600 disabled:opacity-30"
+                className="text-muted-foreground hover:bg-red-500/10 hover:text-red-600 disabled:opacity-30"
                 aria-label={`Remove publisher key ${index + 1}`}
               >
                 <Trash2 className="size-4" />
-              </button>
-              <textarea
+              </Button>
+              <Textarea
                 required
                 rows={2}
                 aria-label={`Ed25519 public key ${index + 1}`}
@@ -660,28 +654,24 @@ function Sources({
                   onEdit({ ...editing, trustedPublishers: keys });
                 }}
                 placeholder="Base64 Ed25519 public key"
-                className="col-span-3 resize-none rounded-lg border border-border bg-background px-2 py-2 font-mono text-xs outline-none focus:border-primary"
+                className="col-span-3 resize-none font-mono text-xs"
               />
             </div>
           ))}
         </div>
 
         <div className="flex justify-end gap-3 border-t border-border pt-5">
-          <button
+          <Button
             type="button"
+            variant="outline"
             disabled={busy !== null}
             onClick={() => onEdit(null)}
-            className="h-10 rounded-xl border border-border px-4 text-sm font-medium hover:bg-muted disabled:opacity-50"
           >
             Cancel
-          </button>
-          <button
-            type="submit"
-            disabled={busy !== null}
-            className="h-10 rounded-xl bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-50"
-          >
+          </Button>
+          <Button type="submit" disabled={busy !== null}>
             {busy === "registry" ? "Saving…" : "Save source"}
-          </button>
+          </Button>
         </div>
       </form>
     );
@@ -696,20 +686,19 @@ function Sources({
             Sources can be independently enabled and trust different publishers.
           </p>
         </div>
-        <button
-          type="button"
+        <Button
+          size="sm"
           disabled={busy !== null}
           onClick={() => onEdit(registryDraft())}
-          className="inline-flex h-9 items-center gap-2 rounded-xl bg-primary px-3 text-sm font-medium text-primary-foreground disabled:opacity-50"
         >
           <Plus className="size-4" /> Add source
-        </button>
+        </Button>
       </div>
       <div className="space-y-3">
         {registries.map((registry) => (
           <article
             key={registry.id}
-            className="flex items-start justify-between gap-4 rounded-2xl border border-border p-4"
+            className="flex items-start justify-between gap-4 rounded-xl border border-border p-4"
           >
             <div className="min-w-0">
               <div className="flex items-center gap-2">
@@ -732,20 +721,22 @@ function Sources({
               </p>
             </div>
             <div className="flex shrink-0 gap-1">
-              <button
-                type="button"
+              <Button
+                variant="ghost"
+                size="icon"
                 disabled={busy !== null}
                 onClick={() => onEdit(registryDraft(registry))}
-                className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+                className="h-8 w-8 p-1"
                 aria-label={`Edit ${registry.label}`}
               >
                 <Pencil className="size-4" />
-              </button>
-              <button
-                type="button"
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
                 disabled={busy !== null}
                 onClick={() => onRemove(registry)}
-                className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-red-500/10 hover:text-red-600 disabled:opacity-50"
+                className="h-8 w-8 p-1 hover:text-red-500 dark:hover:text-red-400"
                 aria-label={`Remove ${registry.label}`}
               >
                 {busy === `registry:${registry.id}` ? (
@@ -753,12 +744,12 @@ function Sources({
                 ) : (
                   <Trash2 className="size-4" />
                 )}
-              </button>
+              </Button>
             </div>
           </article>
         ))}
         {registries.length === 0 && (
-          <div className="rounded-2xl border border-dashed border-border px-6 py-12 text-center text-sm text-muted-foreground">
+          <div className="rounded-lg border border-dashed border-border px-6 py-12 text-center text-sm text-muted-foreground">
             No registry sources configured.
           </div>
         )}

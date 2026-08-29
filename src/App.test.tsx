@@ -193,6 +193,24 @@ describe("App", () => {
     );
   });
 
+  it("announces the plugin marketplace loading state", async () => {
+    const user = userEvent.setup();
+    pluginApi.listRegistries.mockImplementation(
+      () => new Promise<never>(() => undefined),
+    );
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Open plugin marketplace" }),
+    );
+
+    expect(
+      within(
+        screen.getByRole("dialog", { name: "Plugin marketplace" }),
+      ).getByRole("status"),
+    ).toHaveTextContent("Loading plugin marketplace");
+  });
+
   it("ignores a stale current-provider response after changing applications", async () => {
     const user = userEvent.setup();
     const claudeCurrent = deferred<CurrentProvider[]>();
@@ -314,6 +332,9 @@ describe("App", () => {
     const dialog = await screen.findByRole("dialog", {
       name: "Plugin marketplace",
     });
+    expect(dialog).toHaveAccessibleDescription(
+      "Signed provider adapters from sources you trust.",
+    );
     const install = within(dialog).getByRole("button", { name: "Install" });
     expect(install).toBeDisabled();
     await user.click(
@@ -483,6 +504,9 @@ describe("App", () => {
     const deleteDialog = screen.getByRole("alertdialog", {
       name: "Delete provider?",
     });
+    expect(
+      within(deleteDialog).getByText(/will be removed from Lite storage/),
+    ).toHaveClass("break-words");
     await user.click(
       within(deleteDialog).getByRole("button", { name: "Delete provider" }),
     );
@@ -518,7 +542,7 @@ describe("App", () => {
 
     await waitFor(() => expect(api.importLive).toHaveBeenCalledWith("claude"));
     expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
-    expect(screen.getAllByText("User default")[0]).toBeVisible();
+    expect(screen.getAllByText("In Use")[0]).toBeVisible();
     expect(screen.getByRole("status")).toHaveTextContent(
       "Imported the Claude Code user configuration.",
     );
@@ -691,9 +715,13 @@ describe("App", () => {
       name: "Add Claude Code provider",
     });
     await user.click(trigger);
-    expect(
-      screen.getByRole("dialog", { name: "Add provider" }),
-    ).toHaveAttribute("aria-modal", "true");
+    const providerDialog = screen.getByRole("dialog", {
+      name: "Add provider",
+    });
+    expect(providerDialog).toHaveAttribute("aria-modal", "true");
+    expect(providerDialog).toHaveAccessibleDescription(
+      /Claude API\. Credentials remain in CC Switch Lite/,
+    );
     expect(document.querySelector("header")).toHaveAttribute("inert");
     expect(document.querySelector("main")).toHaveAttribute(
       "aria-hidden",
