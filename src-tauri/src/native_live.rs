@@ -1,37 +1,31 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     ffi::OsStr,
     path::{Path, PathBuf},
 };
 
 use cc_switch_core::{
-    builtin_app_adapter, claude, claude_desktop, codex, common_config, gemini, grokbuild, hermes,
-    openclaw, opencode, pi, AppType, ProviderEntry,
-};
-use json_five::rt::parser::{
-    from_str as parse_round_trip_json5, JSONKeyValuePair, JSONObjectContext, JSONText, JSONValue,
-    KeyValuePairContext,
+    builtin_app_adapter, claude, claude_desktop, codex, gemini, grokbuild, hermes, openclaw,
+    opencode, pi, AppType, LiveDocumentSet, NativeAction, NativePlanContext, NativePlanError,
+    NativePlanRequest, NativeProviderAccess, NativeProviderMode, ObservedDocument,
+    ProviderSnapshot,
 };
 use serde_json::{json, Map, Value};
 
 use crate::{
     live::LiveError,
-    operation::{
-        duplicate_yaml_top_level_key, read_optional, ContentExpectation, LivePaths, LogicalTarget,
-        OperationPlan, PlannedWrite, OPERATION_CONTRACT_MAJOR,
+    operation::{duplicate_yaml_top_level_key, read_optional, LivePaths, OperationPlan},
+    provider::{
+        is_lite_writable, native_adapter_reference, NativeImport, ProviderDraft, ProviderRecord,
     },
-    provider::{native_adapter_reference, NativeImport, ProviderDraft, ProviderRecord},
 };
 
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000157210";
-const CLAUDE_DESKTOP_PROFILE_NAME: &str = "CC Switch";
 const CLAUDE_DESKTOP_OFFICIAL_ID: &str = "claude-desktop-official";
 const GEMINI_OFFICIAL_PARTNER_KEY: &str = "google-official";
 const HERMES_SOURCE_FIELD: &str = "_cc_source";
 const HERMES_CUSTOM_SOURCE: &str = "custom_providers";
 const HERMES_DICT_SOURCE: &str = "providers_dict";
-const OPENCLAW_DEFAULT_SOURCE: &str =
-    "{\n  models: {\n    mode: 'merge',\n    providers: {},\n  },\n}\n";
 
 pub struct NativeLiveConfig {
     paths: LivePaths,
@@ -152,142 +146,46 @@ impl NativeLiveConfig {
             .app_id
             .parse::<AppType>()
             .map_err(|_| LiveError::InvalidProvider("application is not supported".to_owned()))?;
-        ensure_native_category_supported(&app, provider)?;
-        let stored_settings = Value::Object(provider.settings.clone());
-        let common_enabled = provider
+        let documents = self.observed_documents(&app)?;
+        let snapshot = ProviderSnapshot::new(
+            &provider.id,
+            app.clone(),
+            &provider.name,
+            Value::Object(provider.settings.clone()),
+        );
+        let mode = native_provider_mode(&app, provider);
+        let access = if is_lite_writable(provider) {
+            NativeProviderAccess::Writable
+        } else {
+            NativeProviderAccess::ReadOnly
+        };
+        let common_config = (provider
             .metadata
             .get("commonConfigEnabled")
             .and_then(Value::as_bool)
-            == Some(true);
-        let settings = common_config::apply(&app, &stored_settings, common_snippet, common_enabled)
-            .map_err(|error| invalid_provider(error.to_string()))?;
-        match app {
-            AppType::Claude => {
-                let snapshot = claude::prepare_live_snapshot(&settings)
-                    .map_err(|error| invalid_provider(error.to_string()))?;
-                self.single_write(
-                    app,
-                    LogicalTarget::ClaudeSettings,
-                    pretty_json(&snapshot.settings)?,
-                )
-            }
-            AppType::Codex => {
-                let snapshot = codex::prepare_strict_live_snapshot(&settings)
-                    .map_err(|error| invalid_provider(error.to_string()))?;
-                let config_original = read_optional(&self.paths.codex_config)?;
-                let auth_original = read_optional(&self.paths.codex_auth)?;
-                let config = codex::prepare_provider_live_config(
-                    &snapshot.auth,
-                    snapshot.config.as_deref().unwrap_or_default(),
-                )
-                .map_err(|error| invalid_provider(error.to_string()))?;
-                let catalog = codex::prepare_native_model_catalog(
-                    &settings,
-                    &config,
-                    codex::NativeCatalogOwnership::default(),
-                )
-                .map_err(|error| invalid_provider(error.to_string()))?;
-                let catalog_managed = catalog.managed;
-                let config =
-                    preserve_live_mcp_toml(config_original.as_deref(), &catalog.config, "Codex")?;
-                let mut writes = Vec::with_capacity(3);
-                let category = is_official(provider, "codex-official").then_some("official");
-                if codex::should_write_auth(category, &snapshot.auth, true) {
-                    writes.push(planned(
-                        LogicalTarget::CodexAuth,
-                        auth_original.as_deref(),
-                        Some(pretty_json(&snapshot.auth)?),
-                    ));
-                } else if category == Some("official")
-                    && parse_optional_json_object(auth_original.as_deref(), "Codex auth.json")?
-                        .as_ref()
-                        .is_some_and(codex::live_auth_is_stale_third_party_residue)
-                {
-                    writes.push(planned(
-                        LogicalTarget::CodexAuth,
-                        auth_original.as_deref(),
-                        None,
-                    ));
-                }
-                writes.push(planned(
-                    LogicalTarget::CodexConfig,
-                    config_original.as_deref(),
-                    Some(config),
-                ));
-                if catalog_managed {
-                    let catalog_original = read_optional(&self.paths.codex_model_catalog)?;
-                    writes.push(planned(
-                        LogicalTarget::CodexModelCatalog,
-                        catalog_original.as_deref(),
-                        catalog.catalog.as_ref().map(pretty_json).transpose()?,
-                    ));
-                }
-                self.plan(app, writes)
-            }
-            AppType::Gemini => {
-                let env_original = read_optional(&self.paths.gemini_env)?;
-                let settings_original = read_optional(&self.paths.gemini_settings)?;
-                let existing = parse_optional_json_object(
-                    settings_original.as_deref(),
-                    "Gemini settings.json",
-                )?;
-                let mode = gemini_mode(provider);
-                let snapshot = gemini::prepare_live_snapshot(&settings, existing.as_ref(), mode)
-                    .map_err(|error| invalid_provider(error.to_string()))?;
-                self.plan(
-                    app,
-                    vec![
-                        planned(
-                            LogicalTarget::GeminiEnv,
-                            env_original.as_deref(),
-                            Some(serialize_env(&snapshot.env)?),
-                        ),
-                        planned(
-                            LogicalTarget::GeminiSettings,
-                            settings_original.as_deref(),
-                            Some(pretty_json(&snapshot.settings)?),
-                        ),
-                    ],
-                )
-            }
-            AppType::GrokBuild => {
-                let mode = if is_official(provider, "grokbuild-official") {
-                    grokbuild::ProviderMode::Official
-                } else {
-                    grokbuild::ProviderMode::Custom
-                };
-                let snapshot = grokbuild::prepare_live_snapshot(&settings, mode)
-                    .map_err(|error| invalid_provider(error.to_string()))?;
-                let original = read_optional(&self.paths.grok_config)?;
-                let config =
-                    preserve_live_mcp_toml(original.as_deref(), &snapshot.config, "Grok Build")?;
-                self.plan(
-                    app,
-                    vec![planned(
-                        LogicalTarget::GrokConfig,
-                        original.as_deref(),
-                        Some(config),
-                    )],
-                )
-            }
-            AppType::OpenCode => {
-                let entry = opencode::prepare_provider_entry(&provider.id, &settings)
-                    .map_err(|error| invalid_provider(error.to_string()))?;
-                self.json_entry_plan(app, entry, &["provider"], JsonRoot::Empty)
-            }
-            AppType::OpenClaw => {
-                let entry = openclaw::prepare_provider_entry(&provider.id, &settings)
-                    .map_err(|error| invalid_provider(error.to_string()))?;
-                self.json_entry_plan(app, entry, &["models", "providers"], JsonRoot::OpenClaw)
-            }
-            AppType::ClaudeDesktop => self.claude_desktop_plan(provider, &settings),
-            AppType::Hermes => self.hermes_plan(provider),
-            AppType::Pi => {
-                let entry = pi::prepare_provider_entry(&provider.id, &settings)
-                    .map_err(|error| invalid_provider(error.to_string()))?;
-                self.json_entry_plan(app, entry, &["providers"], JsonRoot::Empty)
-            }
-        }
+            == Some(true))
+        .then_some(common_snippet)
+        .flatten();
+        let routes = if app == AppType::ClaudeDesktop {
+            desktop_routes(&provider.metadata)?
+        } else {
+            Vec::new()
+        };
+        let context = if app == AppType::ClaudeDesktop {
+            NativePlanContext::ClaudeDesktop { routes: &routes }
+        } else {
+            NativePlanContext::Standard { common_config }
+        };
+        builtin_app_adapter(&app)
+            .plan_native(&NativePlanRequest {
+                action: NativeAction::Apply,
+                provider: &snapshot,
+                documents: &documents,
+                mode,
+                access,
+                context,
+            })
+            .map_err(core_plan_error)
     }
 
     pub fn remove_plan(&self, provider: &ProviderRecord) -> Result<OperationPlan, LiveError> {
@@ -295,25 +193,46 @@ impl NativeLiveConfig {
             .app_id
             .parse::<AppType>()
             .map_err(|_| LiveError::InvalidProvider("application is not supported".to_owned()))?;
-        ensure_native_category_supported(&app, provider)?;
-        match app {
-            AppType::OpenCode => {
-                self.json_remove_plan(app, &provider.id, &["provider"], JsonRoot::Empty)
-            }
-            AppType::OpenClaw => self.json_remove_plan(
-                app,
-                &provider.id,
-                &["models", "providers"],
-                JsonRoot::OpenClaw,
-            ),
-            AppType::Hermes => self.hermes_remove_plan(provider),
-            AppType::Pi => {
-                self.json_remove_plan(app, &provider.id, &["providers"], JsonRoot::Empty)
-            }
-            _ => Err(LiveError::InvalidProvider(
-                "only additive native providers are removed from live configuration".to_owned(),
-            )),
-        }
+        let documents = self.observed_documents(&app)?;
+        let snapshot = ProviderSnapshot::new(
+            &provider.id,
+            app.clone(),
+            &provider.name,
+            Value::Object(provider.settings.clone()),
+        );
+        let access = if is_lite_writable(provider) {
+            NativeProviderAccess::Writable
+        } else {
+            NativeProviderAccess::ReadOnly
+        };
+        builtin_app_adapter(&app)
+            .plan_native(&NativePlanRequest {
+                action: NativeAction::Remove,
+                provider: &snapshot,
+                documents: &documents,
+                mode: native_provider_mode(&app, provider),
+                access,
+                context: NativePlanContext::Standard {
+                    common_config: None,
+                },
+            })
+            .map_err(core_plan_error)
+    }
+
+    fn observed_documents(&self, app: &AppType) -> Result<LiveDocumentSet, LiveError> {
+        let observations = builtin_app_adapter(app)
+            .targets()
+            .iter()
+            .copied()
+            .map(|target| {
+                read_optional(self.paths.path_for(target)).map(|contents| match contents {
+                    Some(contents) => ObservedDocument::present(target, contents),
+                    None => ObservedDocument::missing(target),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        LiveDocumentSet::try_new(app.clone(), observations)
+            .map_err(|error| LiveError::InvalidConfig(error.to_string()))
     }
 
     fn import_claude(&self) -> Result<Vec<NativeImport>, LiveError> {
@@ -620,273 +539,6 @@ impl NativeLiveConfig {
         }
         Ok(drafts)
     }
-
-    fn json_entry_plan(
-        &self,
-        app: AppType,
-        entry: ProviderEntry,
-        keys: &[&str],
-        default: JsonRoot,
-    ) -> Result<OperationPlan, LiveError> {
-        let target = json_target(&app)?;
-        let path = self.paths.path_for(target);
-        let original = read_optional(path)?;
-        let mut root = parse_json5_object(original.as_deref(), app.as_str(), default.value())?;
-        ensure_nested_object(&mut root, keys)?.insert(entry.key, entry.config);
-        let contents = serialize_json_root(app.clone(), &root, original.as_deref())?;
-        self.plan(
-            app,
-            vec![PlannedWrite {
-                target,
-                expected: ContentExpectation::for_contents(original.as_deref()),
-                contents: Some(contents),
-            }],
-        )
-    }
-
-    fn json_remove_plan(
-        &self,
-        app: AppType,
-        key: &str,
-        keys: &[&str],
-        default: JsonRoot,
-    ) -> Result<OperationPlan, LiveError> {
-        let target = json_target(&app)?;
-        let path = self.paths.path_for(target);
-        let original = read_optional(path)?;
-        let mut root = parse_json5_object(original.as_deref(), app.as_str(), default.value())?;
-        if let Some(entries) = nested_object_mut(&mut root, keys) {
-            entries.remove(key);
-        }
-        let contents = serialize_json_root(app.clone(), &root, original.as_deref())?;
-        self.plan(
-            app,
-            vec![PlannedWrite {
-                target,
-                expected: ContentExpectation::for_contents(original.as_deref()),
-                contents: Some(contents),
-            }],
-        )
-    }
-
-    fn hermes_plan(&self, provider: &ProviderRecord) -> Result<OperationPlan, LiveError> {
-        if provider
-            .settings
-            .get(HERMES_SOURCE_FIELD)
-            .and_then(Value::as_str)
-            == Some(HERMES_DICT_SOURCE)
-        {
-            return Err(LiveError::InvalidProvider(
-                "this Hermes provider is managed by the native providers dictionary".to_owned(),
-            ));
-        }
-        let settings = Value::Object(provider.settings.clone());
-        let entry = hermes::prepare_provider_entry(&provider.id, &settings)
-            .map_err(|error| invalid_provider(error.to_string()))?;
-        let original = read_optional(&self.paths.hermes_config)?;
-        let raw = optional_utf8(original.as_deref(), "Hermes")?;
-        let root = parse_yaml(raw, "Hermes")?;
-        if hermes_dict_only(&root, &provider.id) {
-            return Err(LiveError::InvalidProvider(
-                "this Hermes provider is managed by the native providers dictionary".to_owned(),
-            ));
-        }
-        let mut providers = root
-            .get("custom_providers")
-            .and_then(serde_yaml::Value::as_sequence)
-            .cloned()
-            .unwrap_or_default();
-        let mut next = json_to_yaml(&entry.config)?;
-        if let Some(existing) = providers.iter_mut().find(|value| {
-            value.get("name").and_then(serde_yaml::Value::as_str) == Some(provider.id.as_str())
-        }) {
-            if let (Some(existing), Some(next)) = (existing.as_mapping(), next.as_mapping_mut()) {
-                for (key, value) in existing {
-                    next.entry(key.clone()).or_insert_with(|| value.clone());
-                }
-            }
-            *existing = next;
-        } else {
-            providers.push(next);
-        }
-        let contents = replace_yaml_section(
-            raw,
-            "custom_providers",
-            &serde_yaml::Value::Sequence(providers),
-        )?;
-        let current_model = root.get("model").map(yaml_to_json).transpose()?;
-        let model = hermes::prepare_model_defaults(&provider.id, &settings, current_model.as_ref())
-            .map_err(|error| invalid_provider(error.to_string()))?;
-        let model = json_to_yaml(&model)?;
-        let contents = replace_yaml_section(&contents, "model", &model)?;
-        self.plan(
-            AppType::Hermes,
-            vec![PlannedWrite {
-                target: LogicalTarget::HermesConfig,
-                expected: ContentExpectation::for_contents(original.as_deref()),
-                contents: Some(contents),
-            }],
-        )
-    }
-
-    fn hermes_remove_plan(&self, provider: &ProviderRecord) -> Result<OperationPlan, LiveError> {
-        if provider
-            .settings
-            .get(HERMES_SOURCE_FIELD)
-            .and_then(Value::as_str)
-            == Some(HERMES_DICT_SOURCE)
-        {
-            return Err(LiveError::InvalidProvider(
-                "this Hermes provider is managed by the native providers dictionary".to_owned(),
-            ));
-        }
-        let original = read_optional(&self.paths.hermes_config)?;
-        let raw = optional_utf8(original.as_deref(), "Hermes")?;
-        let root = parse_yaml(raw, "Hermes")?;
-        if hermes_dict_only(&root, &provider.id) {
-            return Err(LiveError::InvalidProvider(
-                "this Hermes provider is managed by the native providers dictionary".to_owned(),
-            ));
-        }
-        let providers = root
-            .get("custom_providers")
-            .and_then(serde_yaml::Value::as_sequence)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|value| {
-                value.get("name").and_then(serde_yaml::Value::as_str) != Some(provider.id.as_str())
-            })
-            .collect();
-        let contents = replace_yaml_section(
-            raw,
-            "custom_providers",
-            &serde_yaml::Value::Sequence(providers),
-        )?;
-        let contents = match root.get("model").and_then(serde_yaml::Value::as_mapping) {
-            Some(model)
-                if model.get("provider").and_then(serde_yaml::Value::as_str)
-                    == Some(provider.id.as_str()) =>
-            {
-                let mut model = model.clone();
-                model.remove("provider");
-                model.remove("default");
-                replace_yaml_section(&contents, "model", &serde_yaml::Value::Mapping(model))?
-            }
-            _ => contents,
-        };
-        self.plan(
-            AppType::Hermes,
-            vec![PlannedWrite {
-                target: LogicalTarget::HermesConfig,
-                expected: ContentExpectation::for_contents(original.as_deref()),
-                contents: Some(contents),
-            }],
-        )
-    }
-
-    fn claude_desktop_plan(
-        &self,
-        provider: &ProviderRecord,
-        settings: &Value,
-    ) -> Result<OperationPlan, LiveError> {
-        ensure_claude_desktop_supported()?;
-        let official = is_official(provider, CLAUDE_DESKTOP_OFFICIAL_ID);
-        let mode = provider
-            .metadata
-            .get("claudeDesktopMode")
-            .and_then(Value::as_str);
-        if !official && mode == Some("proxy") {
-            return Err(LiveError::InvalidProvider(
-                "Claude Desktop proxy providers are not available in Lite".to_owned(),
-            ));
-        }
-        let routes = desktop_routes(&provider.metadata)?;
-        let action = claude_desktop::prepare_live_action(
-            settings,
-            if official {
-                claude_desktop::ProviderMode::Official
-            } else {
-                claude_desktop::ProviderMode::Direct
-            },
-            Some(&routes),
-        )
-        .map_err(|error| invalid_provider(error.to_string()))?;
-        let normal_original = read_optional(&self.paths.claude_desktop_normal_config)?;
-        let threep_original = read_optional(&self.paths.claude_desktop_threep_config)?;
-        let profile_original = read_optional(&self.paths.claude_desktop_profile)?;
-        let meta_original = read_optional(&self.paths.claude_desktop_meta)?;
-        let mut normal = parse_json_object_or_empty(normal_original.as_deref(), "Claude Desktop")?;
-        let mut threep = parse_json_object_or_empty(threep_original.as_deref(), "Claude Desktop")?;
-        let mut meta = parse_json_object_or_empty(meta_original.as_deref(), "Claude Desktop")?;
-        let mut writes = Vec::with_capacity(4);
-
-        match action {
-            claude_desktop::PreparedLiveAction::RestoreOfficial => {
-                normal.insert("deploymentMode".to_owned(), json!("1p"));
-                threep.insert("deploymentMode".to_owned(), json!("1p"));
-                remove_desktop_enterprise_config(&mut threep);
-                update_desktop_meta(&mut meta, false);
-                writes.push(planned(
-                    LogicalTarget::ClaudeDesktopProfile,
-                    profile_original.as_deref(),
-                    None,
-                ));
-            }
-            claude_desktop::PreparedLiveAction::ApplyDirect { profile } => {
-                normal.insert("deploymentMode".to_owned(), json!("3p"));
-                threep.insert("deploymentMode".to_owned(), json!("3p"));
-                update_desktop_meta(&mut meta, true);
-                writes.push(planned(
-                    LogicalTarget::ClaudeDesktopProfile,
-                    profile_original.as_deref(),
-                    Some(pretty_json(&profile)?),
-                ));
-            }
-        }
-        writes.push(planned(
-            LogicalTarget::ClaudeDesktopNormalConfig,
-            normal_original.as_deref(),
-            Some(pretty_json(&Value::Object(normal))?),
-        ));
-        writes.push(planned(
-            LogicalTarget::ClaudeDesktopThreepConfig,
-            threep_original.as_deref(),
-            Some(pretty_json(&Value::Object(threep))?),
-        ));
-        writes.push(planned(
-            LogicalTarget::ClaudeDesktopMeta,
-            meta_original.as_deref(),
-            Some(pretty_json(&Value::Object(meta))?),
-        ));
-        self.plan(AppType::ClaudeDesktop, writes)
-    }
-
-    fn single_write(
-        &self,
-        app: AppType,
-        target: LogicalTarget,
-        contents: String,
-    ) -> Result<OperationPlan, LiveError> {
-        self.plan(app, vec![self.write(target, Some(contents))?])
-    }
-
-    fn write(
-        &self,
-        target: LogicalTarget,
-        contents: Option<String>,
-    ) -> Result<PlannedWrite, LiveError> {
-        let original = read_optional(self.paths.path_for(target))?;
-        Ok(planned(target, original.as_deref(), contents))
-    }
-
-    fn plan(&self, app: AppType, writes: Vec<PlannedWrite>) -> Result<OperationPlan, LiveError> {
-        Ok(OperationPlan {
-            contract_major: OPERATION_CONTRACT_MAJOR,
-            app_id: app.as_str().to_owned(),
-            writes,
-        })
-    }
 }
 
 fn native_draft(
@@ -929,22 +581,6 @@ fn native_draft_with_metadata(
     })
 }
 
-fn invalid_provider(message: String) -> LiveError {
-    LiveError::InvalidProvider(message)
-}
-
-fn planned(
-    target: LogicalTarget,
-    original: Option<&[u8]>,
-    contents: Option<String>,
-) -> PlannedWrite {
-    PlannedWrite {
-        target,
-        expected: ContentExpectation::for_contents(original),
-        contents,
-    }
-}
-
 fn read_text_optional(path: &Path, label: &str) -> Result<Option<String>, LiveError> {
     read_optional(path)?
         .map(|contents| {
@@ -952,14 +588,6 @@ fn read_text_optional(path: &Path, label: &str) -> Result<Option<String>, LiveEr
                 .map_err(|_| LiveError::InvalidConfig(format!("{label} config is not UTF-8")))
         })
         .transpose()
-}
-
-fn optional_utf8<'a>(contents: Option<&'a [u8]>, label: &str) -> Result<&'a str, LiveError> {
-    match contents {
-        Some(contents) => std::str::from_utf8(contents)
-            .map_err(|_| LiveError::InvalidConfig(format!("{label} config is not UTF-8"))),
-        None => Ok(""),
-    }
 }
 
 fn read_json_object_optional(path: &Path, label: &str) -> Result<Option<Value>, LiveError> {
@@ -1008,93 +636,6 @@ fn parse_json5_object(
     })
 }
 
-fn parse_json_object_or_empty(
-    contents: Option<&[u8]>,
-    label: &str,
-) -> Result<Map<String, Value>, LiveError> {
-    let Some(contents) = contents else {
-        return Ok(Map::new());
-    };
-    let value: Value = serde_json::from_slice(contents)
-        .map_err(|_| LiveError::InvalidConfig(format!("{label} JSON could not be parsed")))?;
-    value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| LiveError::InvalidConfig(format!("{label} JSON root must be an object")))
-}
-
-fn parse_optional_json_object(
-    contents: Option<&[u8]>,
-    label: &str,
-) -> Result<Option<Value>, LiveError> {
-    contents
-        .map(|contents| parse_json_value(contents, label))
-        .transpose()
-}
-
-fn pretty_json(value: &Value) -> Result<String, LiveError> {
-    let mut contents = serde_json::to_string_pretty(value)
-        .map_err(|_| LiveError::InvalidConfig("JSON could not be serialized".to_owned()))?;
-    contents.push('\n');
-    Ok(contents)
-}
-
-fn preserve_live_mcp_toml(
-    original: Option<&[u8]>,
-    provider_config: &str,
-    label: &str,
-) -> Result<String, LiveError> {
-    let mut next = provider_config
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|_| {
-            LiveError::InvalidProvider(format!("{label} provider TOML could not be parsed"))
-        })?;
-    let current = original
-        .map(|contents| {
-            let contents = std::str::from_utf8(contents)
-                .map_err(|_| LiveError::InvalidConfig(format!("{label} live TOML is not UTF-8")))?;
-            contents.parse::<toml_edit::DocumentMut>().map_err(|_| {
-                LiveError::InvalidConfig(format!("{label} live TOML could not be parsed"))
-            })
-        })
-        .transpose()?;
-
-    next.as_table_mut().remove("mcp_servers");
-    if let Some(mcp) = next
-        .get_mut("mcp")
-        .and_then(toml_edit::Item::as_table_like_mut)
-    {
-        mcp.remove("servers");
-        if mcp.is_empty() {
-            next.as_table_mut().remove("mcp");
-        }
-    }
-
-    let Some(current) = current else {
-        return Ok(next.to_string());
-    };
-    if let Some(servers) = current.get("mcp_servers") {
-        next.as_table_mut().insert("mcp_servers", servers.clone());
-    }
-    if let Some(servers) = current
-        .get("mcp")
-        .and_then(toml_edit::Item::as_table_like)
-        .and_then(|mcp| mcp.get("servers"))
-    {
-        if next.get("mcp").is_none() {
-            next["mcp"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        let mcp = next
-            .get_mut("mcp")
-            .and_then(toml_edit::Item::as_table_like_mut)
-            .ok_or_else(|| {
-                LiveError::InvalidProvider(format!("{label} provider mcp field must be a table"))
-            })?;
-        mcp.insert("servers", servers.clone());
-    }
-    Ok(next.to_string())
-}
-
 fn parse_env(contents: &str) -> Result<Map<String, Value>, LiveError> {
     let mut env = Map::new();
     for (index, line) in contents.lines().enumerate() {
@@ -1127,19 +668,6 @@ fn parse_env(contents: &str) -> Result<Map<String, Value>, LiveError> {
     Ok(env)
 }
 
-fn serialize_env(env: &BTreeMap<String, String>) -> Result<String, LiveError> {
-    let mut lines = Vec::with_capacity(env.len());
-    for (key, value) in env {
-        if !valid_env_key(key) || value.contains(['\r', '\n', '\0']) {
-            return Err(LiveError::InvalidProvider(
-                "Gemini environment contains an unsafe key or value".to_owned(),
-            ));
-        }
-        lines.push(format!("{key}={value}"));
-    }
-    Ok(lines.join("\n"))
-}
-
 fn valid_env_key(key: &str) -> bool {
     !key.is_empty()
         && key
@@ -1158,205 +686,6 @@ fn nested_object<'a>(
     Some(current)
 }
 
-fn nested_object_mut<'a>(
-    root: &'a mut Map<String, Value>,
-    keys: &[&str],
-) -> Option<&'a mut Map<String, Value>> {
-    let mut current = root;
-    for key in keys {
-        current = current.get_mut(*key)?.as_object_mut()?;
-    }
-    Some(current)
-}
-
-fn ensure_nested_object<'a>(
-    root: &'a mut Map<String, Value>,
-    keys: &[&str],
-) -> Result<&'a mut Map<String, Value>, LiveError> {
-    let mut current = root;
-    for key in keys {
-        let value = current
-            .entry((*key).to_owned())
-            .or_insert_with(|| Value::Object(Map::new()));
-        current = value.as_object_mut().ok_or_else(|| {
-            LiveError::InvalidConfig("native provider container must be an object".to_owned())
-        })?;
-    }
-    Ok(current)
-}
-
-enum JsonRoot {
-    Empty,
-    OpenClaw,
-}
-
-impl JsonRoot {
-    fn value(&self) -> Value {
-        match self {
-            Self::Empty => json!({}),
-            Self::OpenClaw => json!({"models": {"mode": "merge", "providers": {}}}),
-        }
-    }
-}
-
-fn serialize_json_root(
-    app: AppType,
-    root: &Map<String, Value>,
-    original: Option<&[u8]>,
-) -> Result<String, LiveError> {
-    if app != AppType::OpenClaw {
-        return pretty_json(&Value::Object(root.clone()));
-    }
-    let source = optional_utf8(original, "OpenClaw")?;
-    let source = if source.trim().is_empty() {
-        OPENCLAW_DEFAULT_SOURCE
-    } else {
-        source
-    };
-    let models = root
-        .get("models")
-        .ok_or_else(|| LiveError::InvalidConfig("OpenClaw models section is missing".to_owned()))?;
-    replace_json5_root_section(source, "models", models)
-}
-
-fn replace_json5_root_section(source: &str, key: &str, value: &Value) -> Result<String, LiveError> {
-    let mut text: JSONText = parse_round_trip_json5(source).map_err(|_| {
-        LiveError::InvalidConfig("OpenClaw round-trip JSON5 could not be parsed".to_owned())
-    })?;
-    let JSONValue::JSONObject {
-        key_value_pairs,
-        context,
-    } = &mut text.value
-    else {
-        return Err(LiveError::InvalidConfig(
-            "OpenClaw configuration root must be an object".to_owned(),
-        ));
-    };
-    if key_value_pairs.is_empty()
-        && context
-            .as_ref()
-            .is_none_or(|context| context.wsc.0.is_empty())
-    {
-        *context = Some(JSONObjectContext {
-            wsc: ("\n  ".to_owned(),),
-        });
-    }
-    let leading = context
-        .as_ref()
-        .map(|context| context.wsc.0.clone())
-        .unwrap_or_default();
-    let separator = if leading.contains('\n') {
-        format!("\n{}", trailing_indent(&leading))
-    } else {
-        String::new()
-    };
-    let value = json_to_round_trip_value(value, &trailing_indent(&leading))?;
-    if let Some(existing) = key_value_pairs
-        .iter_mut()
-        .find(|pair| json5_key_name(&pair.key) == Some(key))
-    {
-        existing.value = value;
-        return Ok(text.to_string());
-    }
-    let closing = if let Some(last) = key_value_pairs.last_mut() {
-        let context = last.context.get_or_insert_with(|| KeyValuePairContext {
-            wsc: (String::new(), " ".to_owned(), String::new(), None),
-        });
-        if let Some(after_comma) = context.wsc.3.clone() {
-            context.wsc.3 = Some(separator);
-            after_comma
-        } else {
-            let closing = std::mem::take(&mut context.wsc.2);
-            context.wsc.3 = Some(separator);
-            closing
-        }
-    } else {
-        closing_whitespace(&leading)
-    };
-    key_value_pairs.push(JSONKeyValuePair {
-        key: json5_key(key),
-        value,
-        context: Some(KeyValuePairContext {
-            wsc: (String::new(), " ".to_owned(), closing, None),
-        }),
-    });
-    Ok(text.to_string())
-}
-
-fn json_to_round_trip_value(value: &Value, parent_indent: &str) -> Result<JSONValue, LiveError> {
-    let source = serde_json::to_string_pretty(value).map_err(|_| {
-        LiveError::InvalidConfig("OpenClaw models could not be serialized".to_owned())
-    })?;
-    let adjusted = if parent_indent.is_empty() || !source.contains('\n') {
-        source
-    } else {
-        let mut lines = source.lines();
-        let mut adjusted = lines.next().unwrap_or_default().to_owned();
-        for line in lines {
-            adjusted.push('\n');
-            adjusted.push_str(parent_indent);
-            adjusted.push_str(line);
-        }
-        adjusted
-    };
-    parse_round_trip_json5(&adjusted)
-        .map(|text| text.value)
-        .map_err(|_| LiveError::InvalidConfig("OpenClaw models could not be projected".to_owned()))
-}
-
-fn trailing_indent(value: &str) -> String {
-    value
-        .rsplit_once('\n')
-        .map(|(_, indent)| indent.to_owned())
-        .unwrap_or_default()
-}
-
-fn closing_whitespace(value: &str) -> String {
-    let Some((prefix, indent)) = value.rsplit_once('\n') else {
-        return String::new();
-    };
-    let indent = indent
-        .strip_suffix('\t')
-        .or_else(|| indent.strip_suffix("  "))
-        .or_else(|| indent.strip_suffix(' '))
-        .unwrap_or(indent);
-    format!("{prefix}\n{indent}")
-}
-
-fn json5_key(key: &str) -> JSONValue {
-    let mut chars = key.chars();
-    let identifier = chars
-        .next()
-        .is_some_and(|first| matches!(first, 'a'..='z' | 'A'..='Z' | '_' | '$'))
-        && chars
-            .all(|character| matches!(character, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '$'));
-    if identifier {
-        JSONValue::Identifier(key.to_owned())
-    } else {
-        JSONValue::DoubleQuotedString(key.to_owned())
-    }
-}
-
-fn json5_key_name(key: &JSONValue) -> Option<&str> {
-    match key {
-        JSONValue::Identifier(value)
-        | JSONValue::DoubleQuotedString(value)
-        | JSONValue::SingleQuotedString(value) => Some(value),
-        _ => None,
-    }
-}
-
-fn json_target(app: &AppType) -> Result<LogicalTarget, LiveError> {
-    match app {
-        AppType::OpenCode => Ok(LogicalTarget::OpenCodeConfig),
-        AppType::OpenClaw => Ok(LogicalTarget::OpenClawConfig),
-        AppType::Pi => Ok(LogicalTarget::PiModels),
-        _ => Err(LiveError::InvalidProvider(
-            "application is not a JSON additive target".to_owned(),
-        )),
-    }
-}
-
 fn gemini_mode(provider: &ProviderRecord) -> gemini::AuthMode {
     let official_meta = provider
         .metadata
@@ -1373,19 +702,32 @@ fn gemini_mode(provider: &ProviderRecord) -> gemini::AuthMode {
     }
 }
 
-fn ensure_native_category_supported(
-    app: &AppType,
-    provider: &ProviderRecord,
-) -> Result<(), LiveError> {
-    if *app == AppType::OpenCode
-        && matches!(provider.category.as_deref(), Some("omo") | Some("omo-slim"))
-    {
-        return Err(LiveError::InvalidProvider(
-            "OMO and OMO Slim use dedicated OpenCode configuration and are not managed by Lite"
-                .to_owned(),
-        ));
+fn native_provider_mode(app: &AppType, provider: &ProviderRecord) -> NativeProviderMode {
+    let official = match app {
+        AppType::Codex => is_official(provider, "codex-official"),
+        AppType::Gemini => gemini_mode(provider) == gemini::AuthMode::OAuthPersonal,
+        AppType::GrokBuild => is_official(provider, "grokbuild-official"),
+        AppType::ClaudeDesktop => is_official(provider, CLAUDE_DESKTOP_OFFICIAL_ID),
+        _ => false,
+    };
+    if official {
+        NativeProviderMode::Official
+    } else {
+        NativeProviderMode::Custom
     }
-    Ok(())
+}
+
+fn core_plan_error(error: NativePlanError) -> LiveError {
+    if matches!(
+        &error,
+        NativePlanError::InvalidDocument { .. }
+            | NativePlanError::WrongDocumentApp { .. }
+            | NativePlanError::InvalidPlan(_)
+    ) {
+        LiveError::InvalidConfig(error.to_string())
+    } else {
+        LiveError::InvalidProvider(error.to_string())
+    }
 }
 
 fn is_official(provider: &ProviderRecord, official_id: &str) -> bool {
@@ -1490,57 +832,6 @@ fn desktop_routes(metadata: &Value) -> Result<Vec<claude_desktop::DirectModelRou
         .map(Option::unwrap_or_default)
 }
 
-fn remove_desktop_enterprise_config(root: &mut Map<String, Value>) {
-    let Some(enterprise) = root
-        .get_mut("enterpriseConfig")
-        .and_then(Value::as_object_mut)
-    else {
-        return;
-    };
-    for key in [
-        "disableDeploymentModeChooser",
-        "inferenceGatewayApiKey",
-        "inferenceGatewayAuthScheme",
-        "inferenceGatewayBaseUrl",
-        "inferenceProvider",
-    ] {
-        enterprise.remove(key);
-    }
-    if enterprise.is_empty() {
-        root.remove("enterpriseConfig");
-    }
-}
-
-fn update_desktop_meta(root: &mut Map<String, Value>, apply: bool) {
-    let mut entries = root
-        .get("entries")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    entries
-        .retain(|entry| entry.get("id").and_then(Value::as_str) != Some(CLAUDE_DESKTOP_PROFILE_ID));
-    if apply {
-        entries.push(json!({
-            "id": CLAUDE_DESKTOP_PROFILE_ID,
-            "name": CLAUDE_DESKTOP_PROFILE_NAME
-        }));
-        root.insert("appliedId".to_owned(), json!(CLAUDE_DESKTOP_PROFILE_ID));
-    } else if root.get("appliedId").and_then(Value::as_str) == Some(CLAUDE_DESKTOP_PROFILE_ID) {
-        match entries
-            .iter()
-            .find_map(|entry| entry.get("id").and_then(Value::as_str))
-        {
-            Some(id) => {
-                root.insert("appliedId".to_owned(), json!(id));
-            }
-            None => {
-                root.remove("appliedId");
-            }
-        }
-    }
-    root.insert("entries".to_owned(), Value::Array(entries));
-}
-
 fn parse_yaml(contents: &str, label: &str) -> Result<serde_yaml::Value, LiveError> {
     if contents.trim().is_empty() {
         return Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
@@ -1563,12 +854,6 @@ fn parse_yaml(contents: &str, label: &str) -> Result<serde_yaml::Value, LiveErro
 fn yaml_to_json(value: &serde_yaml::Value) -> Result<Value, LiveError> {
     serde_json::to_value(value)
         .map_err(|_| LiveError::InvalidConfig("Hermes provider is not JSON-compatible".to_owned()))
-}
-
-fn json_to_yaml(value: &Value) -> Result<serde_yaml::Value, LiveError> {
-    serde_yaml::to_value(value).map_err(|_| {
-        LiveError::InvalidProvider("Hermes provider could not be serialized".to_owned())
-    })
 }
 
 fn denormalize_hermes_models(value: &mut Value) {
@@ -1595,98 +880,6 @@ fn denormalize_hermes_models(value: &mut Value) {
             })
             .collect(),
     );
-}
-
-fn hermes_dict_only(root: &serde_yaml::Value, name: &str) -> bool {
-    let list_has = root
-        .get("custom_providers")
-        .and_then(serde_yaml::Value::as_sequence)
-        .is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|entry| entry.get("name").and_then(serde_yaml::Value::as_str) == Some(name))
-        });
-    !list_has
-        && root
-            .get("providers")
-            .and_then(serde_yaml::Value::as_mapping)
-            .is_some_and(|entries| {
-                entries.iter().any(|(key, value)| {
-                    key.as_str() == Some(name)
-                        || value.get("name").and_then(serde_yaml::Value::as_str) == Some(name)
-                })
-            })
-}
-
-fn replace_yaml_section(
-    raw: &str,
-    key: &str,
-    value: &serde_yaml::Value,
-) -> Result<String, LiveError> {
-    let mut section = serde_yaml::Mapping::new();
-    section.insert(serde_yaml::Value::String(key.to_owned()), value.clone());
-    let serialized = serde_yaml::to_string(&serde_yaml::Value::Mapping(section))
-        .map_err(|_| LiveError::InvalidConfig("Hermes YAML could not be serialized".to_owned()))?;
-    let Some((start, end)) = yaml_section_range(raw, key) else {
-        let mut result = raw.to_owned();
-        if !result.is_empty() && !result.ends_with('\n') {
-            result.push('\n');
-        }
-        result.push_str(&serialized);
-        return Ok(result);
-    };
-    let mut result = String::with_capacity(raw.len() + serialized.len());
-    result.push_str(&raw[..start]);
-    result.push_str(&serialized);
-    result.push_str(&remove_yaml_sections(&raw[end..], key));
-    Ok(result)
-}
-
-fn remove_yaml_sections(raw: &str, key: &str) -> String {
-    let mut result = String::with_capacity(raw.len());
-    let mut remaining = raw;
-    while let Some((start, end)) = yaml_section_range(remaining, key) {
-        result.push_str(&remaining[..start]);
-        remaining = &remaining[end..];
-    }
-    result.push_str(remaining);
-    result
-}
-
-fn yaml_section_range(raw: &str, key: &str) -> Option<(usize, usize)> {
-    let mut start = None;
-    let mut offset = 0;
-    for line in raw.split('\n') {
-        let top_level = !line.is_empty()
-            && !line.starts_with([' ', '\t', '#', '-'])
-            && line.find(':').is_some_and(|index| {
-                let suffix = &line[index + 1..];
-                suffix.is_empty() || suffix.starts_with([' ', '\t', '\r'])
-            });
-        if start.is_none() && top_level && yaml_key_matches(line, key) {
-            start = Some(offset);
-        } else if start.is_some() && top_level {
-            return Some((start.unwrap(), offset));
-        }
-        offset += line.len() + 1;
-    }
-    start.map(|start| (start, raw.len()))
-}
-
-fn yaml_key_matches(line: &str, key: &str) -> bool {
-    let quoted = format!("\"{key}\"");
-    let single_quoted = format!("'{key}'");
-    let matches = [key, quoted.as_str(), single_quoted.as_str()]
-        .into_iter()
-        .any(|candidate| {
-            line.strip_prefix(candidate)
-                .map(str::trim_start)
-                .and_then(|suffix| suffix.strip_prefix(':'))
-                .is_some_and(|suffix| {
-                    suffix.is_empty() || suffix.chars().next().is_some_and(char::is_whitespace)
-                })
-        });
-    matches
 }
 
 fn config_root(
@@ -1793,7 +986,7 @@ fn ensure_claude_desktop_supported() -> Result<(), LiveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operation::OperationExecutor;
+    use crate::operation::{LogicalTarget, OperationExecutor};
 
     fn provider(app: AppType, id: &str, settings: Value) -> ProviderRecord {
         ProviderRecord {
@@ -1999,31 +1192,6 @@ mod tests {
             None,
         );
         assert!(matches!(result, Err(LiveError::InvalidProvider(_))));
-    }
-
-    #[test]
-    fn live_mcp_toml_is_preserved_without_accepting_provider_mcp() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "# live comment\nmodel = \"old\"\n\n[mcp_servers.echo]\ncommand = \"echo\"\n\n[mcp.servers.nested]\ncommand = \"nested\"\n",
-        )
-        .unwrap();
-
-        let original = std::fs::read(&path).unwrap();
-        let next = preserve_live_mcp_toml(
-            Some(&original),
-            "model = \"new\"\n\n[mcp_servers.stale]\ncommand = \"stale\"\n",
-            "Codex",
-        )
-        .unwrap();
-
-        assert!(next.contains("model = \"new\""));
-        assert!(next.contains("[mcp_servers.echo]"));
-        assert!(next.contains("command = \"echo\""));
-        assert!(next.contains("[mcp.servers.nested]"));
-        assert!(!next.contains("stale"));
     }
 
     #[test]
@@ -2329,8 +1497,6 @@ mod tests {
 
     #[test]
     fn desktop_non_object_json_and_omo_categories_are_rejected() {
-        assert!(parse_json_object_or_empty(Some(b"[]"), "Claude Desktop").is_err());
-
         let directory = tempfile::tempdir().unwrap();
         let native = NativeLiveConfig::for_tests(
             directory.path(),
@@ -2361,42 +1527,6 @@ mod tests {
 
         assert_eq!(metadata["claude-opus-4-6"]["labelOverride"], "Opus");
         assert_eq!(routes.len(), 2);
-    }
-
-    #[test]
-    fn hermes_section_replacement_preserves_other_sections() {
-        let raw = "# keep\nmodel:\n  default: old\ncustom_providers:\n  - name: old\nmcp_servers:\n  keep: true\n";
-        let next = replace_yaml_section(
-            raw,
-            "custom_providers",
-            &serde_yaml::from_str("- name: new\n").unwrap(),
-        )
-        .unwrap();
-
-        assert!(next.contains("# keep"));
-        assert!(next.contains("model:\n  default: old"));
-        assert!(next.contains("mcp_servers:\n  keep: true"));
-        assert!(next.contains("name: new"));
-        assert!(!next.contains("name: old"));
-    }
-
-    #[test]
-    fn hermes_section_replacement_recognizes_quoted_top_level_keys() {
-        for raw in [
-            "\"custom_providers\":\n  - name: old\nmodel: {}\n",
-            "'custom_providers':\n  - name: old\nmodel: {}\n",
-        ] {
-            let next = replace_yaml_section(
-                raw,
-                "custom_providers",
-                &serde_yaml::from_str("- name: new\n").unwrap(),
-            )
-            .unwrap();
-            let parsed = parse_yaml(&next, "Hermes").unwrap();
-
-            assert_eq!(parsed["custom_providers"][0]["name"], "new");
-            assert!(!next.contains("name: old"));
-        }
     }
 
     #[test]

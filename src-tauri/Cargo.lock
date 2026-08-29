@@ -312,11 +312,13 @@ dependencies = [
 [[package]]
 name = "cc-switch-core"
 version = "0.1.0"
-source = "git+https://github.com/SaladDay/cc-switch-core?rev=ec38ccce00dea3c140cffe03d5d1c0b8bb625a5c#ec38ccce00dea3c140cffe03d5d1c0b8bb625a5c"
+source = "git+https://github.com/SaladDay/cc-switch-core?rev=e87a826fd47789fca49a75a5722c91b9bc829068#e87a826fd47789fca49a75a5722c91b9bc829068"
 dependencies = [
  "http",
+ "json-five",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "thiserror 2.0.20",
  "toml_edit 0.22.27",
