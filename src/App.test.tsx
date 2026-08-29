@@ -293,6 +293,20 @@ describe("App", () => {
     expect(api.delete).not.toHaveBeenCalled();
   });
 
+  it("keeps a valid core catalog when adapter loading fails", async () => {
+    api.listAdapters.mockRejectedValue(new Error("Adapters unavailable"));
+    api.list.mockResolvedValue([workProvider]);
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("Adapters unavailable");
+    expect(screen.getByRole("button", { name: "Delete Work" })).toBeEnabled();
+    const switcher = within(
+      screen.getByRole("navigation", { name: "Applications" }),
+    );
+    expect(switcher.getAllByRole("button")).toHaveLength(9);
+  });
+
   it("rejects an unknown core configuration mode", async () => {
     api.supportedApps.mockResolvedValue([
       { ...coreApps(["claude"])[0], configurationMode: "stacked" },

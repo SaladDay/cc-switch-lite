@@ -141,6 +141,7 @@ export default function App() {
   const [adapters, setAdapters] = useState<AdapterDescriptor[]>([]);
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
   const [adapterError, setAdapterError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [currentError, setCurrentError] = useState<string | null>(null);
@@ -278,13 +279,14 @@ export default function App() {
 
   useEffect(() => {
     let ignore = false;
-    Promise.all([providersApi.supportedApps(), providersApi.listAdapters()])
-      .then(([value, items]) => {
+    providersApi
+      .supportedApps()
+      .then((value) => {
         if (ignore) return;
         const descriptors = parseCoreAppCatalog(value);
         setAppCatalog(descriptors);
-        setAdapters(items);
         setCatalogReady(true);
+        setCatalogError(null);
         if (!descriptors.some((app) => app.id === activeAppRef.current)) {
           setActiveApp(descriptors[0].id);
         }
@@ -292,8 +294,19 @@ export default function App() {
       .catch((error: unknown) => {
         if (!ignore) {
           setCatalogReady(false);
-          setAdapterError(errorMessage(error));
+          setCatalogError(errorMessage(error));
         }
+      });
+    providersApi
+      .listAdapters()
+      .then((items) => {
+        if (!ignore) {
+          setAdapters(items);
+          setAdapterError(null);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!ignore) setAdapterError(errorMessage(error));
       });
     return () => {
       ignore = true;
@@ -680,12 +693,20 @@ export default function App() {
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-6">
           <div className="flex-1 overflow-y-auto overflow-x-hidden px-1 pb-12">
             <div className="space-y-4">
-              {(adapterError || liveError || loadError || currentError) && (
+              {(catalogError ||
+                adapterError ||
+                liveError ||
+                loadError ||
+                currentError) && (
                 <div
                   role="alert"
                   className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-600 dark:text-red-300"
                 >
-                  {adapterError || liveError || loadError || currentError}
+                  {catalogError ||
+                    adapterError ||
+                    liveError ||
+                    loadError ||
+                    currentError}
                 </div>
               )}
 
