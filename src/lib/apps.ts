@@ -1,11 +1,10 @@
-import type { AppId, JsonValue } from "./provider-types";
+import type { AppId, CoreAppDescriptor, JsonValue } from "./provider-types";
 
 export interface AppDefinition {
   id: AppId;
   label: string;
   icon: string;
   emptyTitle: string;
-  additive: boolean;
 }
 
 export const APPS: AppDefinition[] = [
@@ -14,74 +13,104 @@ export const APPS: AppDefinition[] = [
     label: "Claude Code",
     icon: "claude",
     emptyTitle: "Add your first Claude Code provider",
-    additive: false,
   },
   {
     id: "claude-desktop",
     label: "Claude Desktop",
     icon: "claude",
     emptyTitle: "Add your first Claude Desktop provider",
-    additive: false,
   },
   {
     id: "codex",
     label: "Codex",
     icon: "openai",
     emptyTitle: "Add your first Codex provider",
-    additive: false,
   },
   {
     id: "gemini",
     label: "Gemini CLI",
     icon: "gemini",
     emptyTitle: "Add your first Gemini CLI provider",
-    additive: false,
   },
   {
     id: "grokbuild",
     label: "Grok Build",
     icon: "grok",
     emptyTitle: "Add your first Grok Build provider",
-    additive: false,
   },
   {
     id: "opencode",
     label: "OpenCode",
     icon: "opencode",
     emptyTitle: "Add your first OpenCode provider",
-    additive: true,
   },
   {
     id: "openclaw",
     label: "OpenClaw",
     icon: "openclaw",
     emptyTitle: "Add your first OpenClaw provider",
-    additive: true,
   },
   {
     id: "hermes",
     label: "Hermes",
     icon: "hermes",
     emptyTitle: "Add your first Hermes provider",
-    additive: true,
   },
   {
     id: "pi",
     label: "Pi",
     icon: "pi",
     emptyTitle: "Add your first Pi provider",
-    additive: true,
   },
 ];
 
 export const APP_IDS = APPS.map((app) => app.id);
 
-export function appDefinition(appId: AppId): AppDefinition {
-  return APPS.find((app) => app.id === appId) ?? APPS[0];
+export function parseCoreAppCatalog(value: unknown): CoreAppDescriptor[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("Core returned an invalid application catalog");
+  }
+
+  const knownIds = new Set<string>(APP_IDS);
+  const seenIds = new Set<string>();
+  return value.map((candidate) => {
+    if (
+      typeof candidate !== "object" ||
+      candidate === null ||
+      Array.isArray(candidate)
+    ) {
+      throw new Error("Core returned an invalid application catalog");
+    }
+
+    const descriptor = candidate as Record<string, unknown>;
+    const { id, displayName, brandKey, configurationMode, capabilities } =
+      descriptor;
+    if (
+      typeof id !== "string" ||
+      !knownIds.has(id) ||
+      seenIds.has(id) ||
+      typeof displayName !== "string" ||
+      typeof brandKey !== "string" ||
+      (configurationMode !== "switch" && configurationMode !== "additive") ||
+      !Array.isArray(capabilities) ||
+      !capabilities.every((capability) => typeof capability === "string")
+    ) {
+      throw new Error("Core returned an invalid application catalog");
+    }
+    seenIds.add(id);
+
+    return {
+      id: id as AppId,
+      displayName,
+      brandKey,
+      configurationMode,
+      capabilities,
+    };
+  });
 }
 
-export function isAdditiveApp(appId: AppId): boolean {
-  return appDefinition(appId).additive;
+export function appDefinition(appId: AppId): AppDefinition {
+  return APPS.find((app) => app.id === appId) ?? APPS[0];
 }
 
 const NATIVE_SETTINGS_TEMPLATES: Record<AppId, Record<string, JsonValue>> = {

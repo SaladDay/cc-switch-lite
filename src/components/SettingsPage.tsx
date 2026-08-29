@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Database, Monitor, Moon, Package, Store, Sun } from "lucide-react";
 
 import packageInfo from "../../package.json";
-import { APPS } from "../lib/apps";
+import { appDefinition } from "../lib/apps";
 import type { Theme, VisibleApps } from "../lib/preferences";
 import type { AppId } from "../lib/provider-types";
 import { cn } from "../lib/utils";
@@ -30,8 +30,7 @@ export function SettingsPage({
   onClose,
 }: SettingsPageProps) {
   const [tab, setTab] = useState<"general" | "about">("general");
-  const supported = new Set(supportedApps);
-  const availableApps = APPS.filter((app) => supported.has(app.id));
+  const availableApps = supportedApps.map(appDefinition);
   const visibleCount = availableApps.filter(
     (app) => visibleApps[app.id],
   ).length;

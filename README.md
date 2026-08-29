@@ -2,9 +2,11 @@
 
 A provider configuration editor for every application supported by CC Switch.
 
-CC Switch Lite shares low-level contracts with CC Switch through
-[`cc-switch-core`](https://github.com/SaladDay/cc-switch-core), while keeping
-its UI, state, and release cycle independent.
+CC Switch Lite uses
+[`cc-switch-core`](https://github.com/SaladDay/cc-switch-core) as its built-in
+application registry and native Import/Apply/Remove domain layer. Lite retains
+host paths and I/O, database persistence, UI presentation, plugins, and its own
+release cycle.
 
 The project is in pre-alpha development. The first release is intentionally
 limited to provider management, safe live-configuration switching, and signed

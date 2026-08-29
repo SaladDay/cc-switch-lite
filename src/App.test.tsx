@@ -11,6 +11,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import App, { sameJsonValue } from "./App";
 import type {
   AdapterDescriptor,
+  AppId,
+  CoreAppDescriptor,
   CurrentProvider,
   ProviderRecord,
 } from "./lib/provider-types";
@@ -163,23 +165,36 @@ function nativeAdapter(appId: string): AdapterDescriptor {
   };
 }
 
+function coreApps(appIds: AppId[]): CoreAppDescriptor[] {
+  const additive = new Set<AppId>(["opencode", "openclaw", "hermes", "pi"]);
+  return appIds.map((id) => ({
+    id,
+    displayName: id,
+    brandKey: id,
+    configurationMode: additive.has(id) ? "additive" : "switch",
+    capabilities: ["provider-management", "live-configuration"],
+  }));
+}
+
 describe("App", () => {
   beforeEach(() => {
     window.localStorage.clear();
     document.documentElement.className = "";
     for (const mock of Object.values(api)) mock.mockReset();
     api.listAdapters.mockResolvedValue(adapters);
-    api.supportedApps.mockResolvedValue([
-      "claude",
-      "claude-desktop",
-      "codex",
-      "gemini",
-      "grokbuild",
-      "opencode",
-      "openclaw",
-      "hermes",
-      "pi",
-    ]);
+    api.supportedApps.mockResolvedValue(
+      coreApps([
+        "claude",
+        "claude-desktop",
+        "codex",
+        "gemini",
+        "grokbuild",
+        "opencode",
+        "openclaw",
+        "hermes",
+        "pi",
+      ]),
+    );
     api.list.mockResolvedValue([]);
     api.delete.mockResolvedValue(undefined);
     api.importNative.mockResolvedValue([]);
@@ -216,7 +231,7 @@ describe("App", () => {
   });
 
   it("uses the core response as the application membership source", async () => {
-    api.supportedApps.mockResolvedValue(["pi"]);
+    api.supportedApps.mockResolvedValue(coreApps(["pi"]));
     render(<App />);
 
     expect(
@@ -233,6 +248,78 @@ describe("App", () => {
       "true",
     );
     expect(api.list).toHaveBeenLastCalledWith("pi");
+  });
+
+  it("uses the core configuration mode instead of UI presentation metadata", async () => {
+    const native = nativeAdapter("pi");
+    const catalog = coreApps(["pi"]);
+    catalog[0].configurationMode = "switch";
+    window.localStorage.setItem("cc-switch-lite:last-app", "pi");
+    api.supportedApps.mockResolvedValue(catalog);
+    api.listAdapters.mockResolvedValue([native]);
+    api.list.mockResolvedValue([
+      {
+        ...workProvider,
+        id: "pi-provider",
+        appId: "pi",
+        adapter: native.reference,
+        name: "Pi Work",
+        settings: { baseUrl: "https://pi.example.com/v1" },
+      },
+    ]);
+    render(<App />);
+
+    expect(
+      await screen.findByRole("button", { name: "Switch to Pi Work" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", {
+        name: "Add Pi Work to configuration",
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("fails closed when the core application catalog is unavailable", async () => {
+    api.supportedApps.mockRejectedValue(new Error("Catalog unavailable"));
+    api.list.mockResolvedValue([workProvider]);
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("Catalog unavailable");
+    expect(
+      screen.getByRole("button", { name: "Switch to Work" }),
+    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Edit Work" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Delete Work" })).toBeDisabled();
+    expect(api.delete).not.toHaveBeenCalled();
+  });
+
+  it("keeps a valid core catalog when adapter loading fails", async () => {
+    api.listAdapters.mockRejectedValue(new Error("Adapters unavailable"));
+    api.list.mockResolvedValue([workProvider]);
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("Adapters unavailable");
+    expect(screen.getByRole("button", { name: "Delete Work" })).toBeEnabled();
+    const switcher = within(
+      screen.getByRole("navigation", { name: "Applications" }),
+    );
+    expect(switcher.getAllByRole("button")).toHaveLength(9);
+  });
+
+  it("rejects an unknown core configuration mode", async () => {
+    api.supportedApps.mockResolvedValue([
+      { ...coreApps(["claude"])[0], configurationMode: "stacked" },
+    ]);
+    api.list.mockResolvedValue([workProvider]);
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Core returned an invalid application catalog",
+    );
+    expect(screen.getByRole("button", { name: "Delete Work" })).toBeDisabled();
   });
 
   it("switches the provider list and remembers the selected application", async () => {
@@ -816,7 +903,7 @@ describe("App", () => {
   it("creates native configuration for an application without a legacy form", async () => {
     const user = userEvent.setup();
     const native = nativeAdapter("gemini");
-    api.supportedApps.mockResolvedValue(["gemini"]);
+    api.supportedApps.mockResolvedValue(coreApps(["gemini"]));
     api.listAdapters.mockResolvedValue([native]);
     api.create.mockImplementation((draft) =>
       Promise.resolve({ ...draft, id: "gemini-new", revision: 1 }),
@@ -861,7 +948,7 @@ describe("App", () => {
       name: "Pi Work",
       settings: { baseURL: "https://pi.example.com/v1" },
     };
-    api.supportedApps.mockResolvedValue(["pi"]);
+    api.supportedApps.mockResolvedValue(coreApps(["pi"]));
     api.listAdapters.mockResolvedValue([native]);
     api.list.mockResolvedValue([provider]);
     let inConfig = false;
@@ -911,7 +998,7 @@ describe("App", () => {
         base_url: "https://hermes.example.com",
       },
     };
-    api.supportedApps.mockResolvedValue(["hermes"]);
+    api.supportedApps.mockResolvedValue(coreApps(["hermes"]));
     api.listAdapters.mockResolvedValue([native]);
     api.list.mockResolvedValue([provider]);
     api.currentProviders.mockResolvedValue([current(provider)]);
@@ -938,7 +1025,7 @@ describe("App", () => {
       settings: { npm: "special" },
       liteConfigWritable: false,
     };
-    api.supportedApps.mockResolvedValue(["opencode"]);
+    api.supportedApps.mockResolvedValue(coreApps(["opencode"]));
     api.listAdapters.mockResolvedValue([native]);
     api.list.mockResolvedValue([provider]);
     render(<App />);
@@ -976,6 +1063,24 @@ describe("App", () => {
     expect(
       window.localStorage.getItem("cc-switch-lite:visible-apps"),
     ).toContain('"pi":false');
+  });
+
+  it("keeps the core application order in settings", async () => {
+    const user = userEvent.setup();
+    api.supportedApps.mockResolvedValue(coreApps(["pi", "claude"]));
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Open settings" }),
+    );
+    const settings = screen.getByRole("dialog", { name: "Settings" });
+    const pi = within(settings).getByRole("button", { name: "Pi" });
+    const claude = within(settings).getByRole("button", {
+      name: "Claude Code",
+    });
+    expect(
+      pi.compareDocumentPosition(claude) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it("keeps the dialog fallback modal and closes it with Escape", async () => {
