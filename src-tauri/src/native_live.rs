@@ -31,6 +31,11 @@ pub struct NativeLiveConfig {
     paths: LivePaths,
 }
 
+pub(crate) struct PreparedNativePlan {
+    pub(crate) paths: LivePaths,
+    pub(crate) plan: OperationPlan,
+}
+
 impl NativeLiveConfig {
     pub fn from_home(
         home: &Path,
@@ -98,8 +103,12 @@ impl NativeLiveConfig {
     }
 
     pub fn resolved_for_app(&self, app: AppType) -> Result<Self, LiveError> {
+        self.resolved_for_targets(builtin_app_adapter(&app).targets())
+    }
+
+    fn resolved_for_targets(&self, targets: &[LogicalTarget]) -> Result<Self, LiveError> {
         let mut paths = self.paths.clone();
-        for target in builtin_app_adapter(&app).targets() {
+        for target in targets {
             paths = paths.resolved_for_write(*target)?;
         }
         Ok(Self { paths })
@@ -137,11 +146,21 @@ impl NativeLiveConfig {
         }
     }
 
+    #[cfg(test)]
     pub fn apply_plan(
         &self,
         provider: &ProviderRecord,
         common_snippet: Option<&str>,
     ) -> Result<OperationPlan, LiveError> {
+        self.prepare_apply_plan(provider, common_snippet)
+            .map(|prepared| prepared.plan)
+    }
+
+    pub(crate) fn prepare_apply_plan(
+        &self,
+        provider: &ProviderRecord,
+        common_snippet: Option<&str>,
+    ) -> Result<PreparedNativePlan, LiveError> {
         let app = provider
             .app_id
             .parse::<AppType>()
@@ -176,10 +195,11 @@ impl NativeLiveConfig {
         };
         let adapter = builtin_app_adapter(&app);
         let targets = adapter
-            .required_native_targets(NativeAction::Apply, &snapshot)
+            .required_native_targets(NativeAction::Apply, &snapshot, mode)
             .map_err(core_plan_error)?;
-        let documents = self.observed_documents(&app, &targets)?;
-        adapter
+        let native = self.resolved_for_targets(&targets)?;
+        let documents = native.observed_documents(&app, &targets)?;
+        let plan = adapter
             .plan_native(&NativePlanRequest {
                 action: NativeAction::Apply,
                 provider: &snapshot,
@@ -188,10 +208,23 @@ impl NativeLiveConfig {
                 access,
                 context,
             })
-            .map_err(core_plan_error)
+            .map_err(core_plan_error)?;
+        Ok(PreparedNativePlan {
+            paths: native.paths,
+            plan,
+        })
     }
 
+    #[cfg(test)]
     pub fn remove_plan(&self, provider: &ProviderRecord) -> Result<OperationPlan, LiveError> {
+        self.prepare_remove_plan(provider)
+            .map(|prepared| prepared.plan)
+    }
+
+    pub(crate) fn prepare_remove_plan(
+        &self,
+        provider: &ProviderRecord,
+    ) -> Result<PreparedNativePlan, LiveError> {
         let app = provider
             .app_id
             .parse::<AppType>()
@@ -204,22 +237,28 @@ impl NativeLiveConfig {
             Value::Object(provider.settings.clone()),
         );
         let adapter = builtin_app_adapter(&app);
+        let mode = native_provider_mode(&app, provider);
         let targets = adapter
-            .required_native_targets(NativeAction::Remove, &snapshot)
+            .required_native_targets(NativeAction::Remove, &snapshot, mode)
             .map_err(core_plan_error)?;
-        let documents = self.observed_documents(&app, &targets)?;
-        adapter
+        let native = self.resolved_for_targets(&targets)?;
+        let documents = native.observed_documents(&app, &targets)?;
+        let plan = adapter
             .plan_native(&NativePlanRequest {
                 action: NativeAction::Remove,
                 provider: &snapshot,
                 documents: &documents,
-                mode: native_provider_mode(&app, provider),
+                mode,
                 access,
                 context: NativePlanContext::Standard {
                     common_config: None,
                 },
             })
-            .map_err(core_plan_error)
+            .map_err(core_plan_error)?;
+        Ok(PreparedNativePlan {
+            paths: native.paths,
+            plan,
+        })
     }
 
     fn observed_documents(
@@ -1277,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn unmanaged_codex_catalog_is_not_observed_or_rewritten() {
+    fn unmanaged_codex_auth_and_catalog_are_not_observed_or_rewritten() {
         let directory = tempfile::tempdir().unwrap();
         let native = NativeLiveConfig::for_tests(
             directory.path(),
@@ -1285,6 +1324,11 @@ mod tests {
             directory.path().join(".codex"),
         );
         std::fs::create_dir_all(native.paths.codex_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &native.paths.codex_auth,
+            vec![b'x'; cc_switch_core::MAX_OPERATION_CONTENT_BYTES + 1],
+        )
+        .unwrap();
         std::fs::write(
             &native.paths.codex_model_catalog,
             vec![b'x'; cc_switch_core::MAX_OPERATION_CONTENT_BYTES + 1],
@@ -1301,10 +1345,38 @@ mod tests {
             )
             .expect("unmanaged catalog does not block Codex");
 
-        assert!(plan
-            .writes
-            .iter()
-            .all(|write| write.target != LogicalTarget::CodexModelCatalog));
+        assert!(plan.writes.iter().all(|write| !matches!(
+            write.target,
+            LogicalTarget::CodexAuth | LogicalTarget::CodexModelCatalog
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unmanaged_codex_catalog_symlink_does_not_block_path_preflight() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let native = NativeLiveConfig::for_tests(
+            directory.path(),
+            directory.path().join(".claude"),
+            directory.path().join(".codex"),
+        );
+        std::fs::create_dir_all(native.paths.codex_config.parent().unwrap()).unwrap();
+        let unrelated = directory.path().join("unrelated.json");
+        std::fs::write(&unrelated, "{}").unwrap();
+        symlink(&unrelated, &native.paths.codex_model_catalog).unwrap();
+
+        native
+            .apply_plan(
+                &provider(
+                    AppType::Codex,
+                    "custom",
+                    json!({"auth": {}, "config": "model = \"gpt-5\"\n"}),
+                ),
+                None,
+            )
+            .expect("unmanaged symlink is outside the operation target set");
     }
 
     #[test]
@@ -1443,6 +1515,35 @@ mod tests {
         assert_eq!(parsed["model"]["context_length"].as_i64(), Some(32000));
         assert_eq!(parsed["custom_providers"].as_sequence().unwrap().len(), 1);
         assert_eq!(parsed["custom_providers"][0]["name"].as_str(), Some("keep"));
+    }
+
+    #[test]
+    fn additive_removal_ignores_unused_oversized_provider_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let native = NativeLiveConfig::for_tests(
+            directory.path(),
+            directory.path().join(".claude"),
+            directory.path().join(".codex"),
+        );
+        std::fs::create_dir_all(native.paths.pi_models.parent().unwrap()).unwrap();
+        std::fs::write(
+            &native.paths.pi_models,
+            r#"{"providers":{"remove":{"models":[]}}}"#,
+        )
+        .unwrap();
+
+        let plan = native
+            .remove_plan(&provider(
+                AppType::Pi,
+                "remove",
+                json!({
+                    "unused": "x".repeat(cc_switch_core::MAX_OPERATION_CONTENT_BYTES + 1)
+                }),
+            ))
+            .expect("removal only consumes the native provider id");
+        let parsed: Value =
+            serde_json::from_str(plan.writes[0].contents.as_deref().unwrap()).expect("Pi JSON");
+        assert!(parsed["providers"].get("remove").is_none());
     }
 
     #[test]
