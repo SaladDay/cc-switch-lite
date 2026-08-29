@@ -174,11 +174,7 @@ impl LiveConfig {
         let app = app_id.parse::<cc_switch_core::AppType>().map_err(|_| {
             LiveError::InvalidProvider("application is not available in Lite".to_owned())
         })?;
-        self.with_lock(|| {
-            self.native
-                .resolved_for_app(app.clone())?
-                .import_drafts(app)
-        })
+        self.with_lock(|| self.native.import_drafts(app))
     }
 
     pub fn switch_native_recoverable(
