@@ -6,8 +6,8 @@ use std::{
 
 use cc_switch_core::{
     builtin_app_adapter, claude, claude_desktop, codex, gemini, grokbuild, hermes, openclaw,
-    opencode, pi, AppType, LiveDocumentSet, NativeAction, NativePlanContext, NativePlanError,
-    NativePlanRequest, NativeProviderAccess, NativeProviderMode, ObservedDocument,
+    opencode, pi, AppType, LiveDocumentSet, LogicalTarget, NativeAction, NativePlanContext,
+    NativePlanError, NativePlanRequest, NativeProviderAccess, NativeProviderMode, ObservedDocument,
     ProviderSnapshot,
 };
 use serde_json::{json, Map, Value};
@@ -174,8 +174,12 @@ impl NativeLiveConfig {
         } else {
             NativePlanContext::Standard { common_config }
         };
-        let documents = self.observed_documents(&app)?;
-        builtin_app_adapter(&app)
+        let adapter = builtin_app_adapter(&app);
+        let targets = adapter
+            .required_native_targets(NativeAction::Apply, &snapshot)
+            .map_err(core_plan_error)?;
+        let documents = self.observed_documents(&app, &targets)?;
+        adapter
             .plan_native(&NativePlanRequest {
                 action: NativeAction::Apply,
                 provider: &snapshot,
@@ -199,8 +203,12 @@ impl NativeLiveConfig {
             &provider.name,
             Value::Object(provider.settings.clone()),
         );
-        let documents = self.observed_documents(&app)?;
-        builtin_app_adapter(&app)
+        let adapter = builtin_app_adapter(&app);
+        let targets = adapter
+            .required_native_targets(NativeAction::Remove, &snapshot)
+            .map_err(core_plan_error)?;
+        let documents = self.observed_documents(&app, &targets)?;
+        adapter
             .plan_native(&NativePlanRequest {
                 action: NativeAction::Remove,
                 provider: &snapshot,
@@ -214,12 +222,19 @@ impl NativeLiveConfig {
             .map_err(core_plan_error)
     }
 
-    fn observed_documents(&self, app: &AppType) -> Result<LiveDocumentSet, LiveError> {
+    fn observed_documents(
+        &self,
+        app: &AppType,
+        required: &[LogicalTarget],
+    ) -> Result<LiveDocumentSet, LiveError> {
         let observations = builtin_app_adapter(app)
             .targets()
             .iter()
             .copied()
             .map(|target| {
+                if !required.contains(&target) {
+                    return Ok(ObservedDocument::unobserved(target));
+                }
                 read_optional(self.paths.path_for(target)).map(|contents| match contents {
                     Some(contents) => ObservedDocument::present(target, contents),
                     None => ObservedDocument::missing(target),
@@ -991,7 +1006,7 @@ fn ensure_claude_desktop_supported() -> Result<(), LiveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operation::{LogicalTarget, OperationExecutor};
+    use crate::operation::OperationExecutor;
 
     fn provider(app: AppType, id: &str, settings: Value) -> ProviderRecord {
         ProviderRecord {
@@ -1259,6 +1274,37 @@ mod tests {
             .unwrap()
             .contains("oauth-login"));
         assert!(native.paths.codex_model_catalog.exists());
+    }
+
+    #[test]
+    fn unmanaged_codex_catalog_is_not_observed_or_rewritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let native = NativeLiveConfig::for_tests(
+            directory.path(),
+            directory.path().join(".claude"),
+            directory.path().join(".codex"),
+        );
+        std::fs::create_dir_all(native.paths.codex_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &native.paths.codex_model_catalog,
+            vec![b'x'; cc_switch_core::MAX_OPERATION_CONTENT_BYTES + 1],
+        )
+        .unwrap();
+        let plan = native
+            .apply_plan(
+                &provider(
+                    AppType::Codex,
+                    "custom",
+                    json!({"auth": {}, "config": "model = \"gpt-5\"\n"}),
+                ),
+                None,
+            )
+            .expect("unmanaged catalog does not block Codex");
+
+        assert!(plan
+            .writes
+            .iter()
+            .all(|write| write.target != LogicalTarget::CodexModelCatalog));
     }
 
     #[test]
