@@ -201,10 +201,8 @@ impl LiveConfig {
             ));
         }
         self.with_lock(|| {
-            let native = self.native.resolved_for_app(app)?;
-            let paths = native.paths();
-            let plan = native.apply_plan(provider, common_snippet)?;
-            self.execute_recoverable_plan(&paths, &plan, None)
+            let prepared = self.native.prepare_apply_plan(provider, common_snippet)?;
+            self.execute_recoverable_plan(&prepared.paths, &prepared.plan, None)
         })
     }
 
@@ -228,10 +226,8 @@ impl LiveConfig {
             ));
         }
         self.with_lock(|| {
-            let native = self.native.resolved_for_app(app)?;
-            let paths = native.paths();
-            let plan = native.remove_plan(provider)?;
-            self.execute_recoverable_plan(&paths, &plan, None)
+            let prepared = self.native.prepare_remove_plan(provider)?;
+            self.execute_recoverable_plan(&prepared.paths, &prepared.plan, None)
         })
     }
 
