@@ -254,6 +254,7 @@ describe("App", () => {
     const native = nativeAdapter("pi");
     const catalog = coreApps(["pi"]);
     catalog[0].configurationMode = "switch";
+    window.localStorage.setItem("cc-switch-lite:last-app", "pi");
     api.supportedApps.mockResolvedValue(catalog);
     api.listAdapters.mockResolvedValue([native]);
     api.list.mockResolvedValue([
