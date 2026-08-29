@@ -2,7 +2,7 @@
   "name": "cc-switch-lite",
   "private": true,
   "version": "0.1.0-alpha.1",
-  "description": "A focused provider switcher for Claude Code and Codex",
+  "description": "A provider configuration editor for CC Switch applications",
   "type": "module",
   "engines": {
     "node": "^20.19.0 || >=22.12.0"

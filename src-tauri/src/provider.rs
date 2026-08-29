@@ -22,6 +22,16 @@ pub struct AdapterReference {
     pub extensions: Map<String, Value>,
 }
 
+impl AdapterReference {
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.plugin_id == other.plugin_id
+            && self.plugin_version == other.plugin_version
+            && self.adapter_id == other.adapter_id
+            && self.contract_major == other.contract_major
+            && self.schema_version == other.schema_version
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderRecord {
@@ -121,6 +131,34 @@ impl AdapterDescriptor {
     }
 }
 
+/// Stable ownership marker for providers stored in CC Switch's native schema.
+///
+/// Native providers do not belong to a Lite plugin. The reference is derived
+/// from the core application identifier and is therefore never persisted into
+/// the shared provider row.
+pub fn native_adapter_reference(app: &AppType) -> AdapterReference {
+    AdapterReference {
+        plugin_id: BUILTIN_PLUGIN_ID.to_owned(),
+        plugin_version: BUILTIN_PLUGIN_VERSION.to_owned(),
+        adapter_id: format!("builtin.{}.native", app.as_str()),
+        contract_major: CONTRACT_MAJOR,
+        schema_version: SCHEMA_VERSION,
+        extensions: Map::new(),
+    }
+}
+
+#[cfg(test)]
+pub fn native_adapters() -> Vec<AdapterDescriptor> {
+    AppType::all()
+        .map(|app| AdapterDescriptor {
+            app_id: app.as_str().to_owned(),
+            display_name: "Native configuration".to_owned(),
+            reference: native_adapter_reference(&app),
+            fields: Vec::new(),
+        })
+        .collect()
+}
+
 fn field(
     key: &str,
     label: &str,
@@ -212,7 +250,7 @@ pub fn adapter_for_reference(
 ) -> Option<AdapterDescriptor> {
     built_in_adapters()
         .into_iter()
-        .find(|adapter| adapter.app_id == app_id && adapter.reference == *reference)
+        .find(|adapter| adapter.app_id == app_id && adapter.reference.same_identity(reference))
 }
 
 pub fn validate_name(name: &str) -> Result<String, String> {
@@ -333,6 +371,26 @@ mod tests {
             .all(|adapter| adapter.fields.iter().any(|field| {
                 field.key == "apiKey" && field.kind == FieldKind::Secret && field.required
             })));
+    }
+
+    #[test]
+    fn native_adapters_cover_every_core_application() {
+        let adapters = native_adapters();
+
+        assert_eq!(adapters.len(), 9);
+        assert_eq!(
+            adapters
+                .iter()
+                .map(|adapter| adapter.app_id.clone())
+                .collect::<Vec<_>>(),
+            AppType::all()
+                .map(|app| app.as_str().to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert!(adapters.iter().all(|adapter| {
+            adapter.reference == native_adapter_reference(&adapter.app_id.parse().unwrap())
+                && adapter.fields.is_empty()
+        }));
     }
 
     #[test]

@@ -15,7 +15,6 @@ const MAX_INSTANCES: usize = 16;
 const MAX_MEMORIES: usize = 4;
 const MAX_TABLES: usize = 8;
 const FUEL_PER_CALL: u64 = 10_000_000;
-const FUEL_PER_CURRENT_CALL: u64 = 1_000_000;
 const MAX_CACHED_COMPONENTS: usize = 32;
 
 struct RuntimeState {
@@ -78,20 +77,6 @@ impl PluginRuntime {
         request: &PluginRequest,
     ) -> Result<PluginResponse, PluginError> {
         self.invoke_with_fuel(component_path, expected_sha256, request, FUEL_PER_CALL)
-    }
-
-    pub fn invoke_current(
-        &self,
-        component_path: &Path,
-        expected_sha256: &str,
-        request: &PluginRequest,
-    ) -> Result<PluginResponse, PluginError> {
-        self.invoke_with_fuel(
-            component_path,
-            expected_sha256,
-            request,
-            FUEL_PER_CURRENT_CALL,
-        )
     }
 
     fn invoke_with_fuel(

@@ -34,6 +34,7 @@ import type {
   ProviderChanges,
   ProviderRecord,
 } from "./lib/provider-types";
+import { isNativeAdapter, sameAdapterIdentity } from "./lib/provider-types";
 import { errorMessage, providersApi } from "./lib/providers";
 
 interface AppDefinition {
@@ -49,9 +50,44 @@ const APPS: AppDefinition[] = [
     emptyTitle: "Add your first Claude Code provider",
   },
   {
+    id: "claude-desktop",
+    label: "Claude Desktop",
+    emptyTitle: "Add your first Claude Desktop provider",
+  },
+  {
     id: "codex",
     label: "Codex",
     emptyTitle: "Add your first Codex provider",
+  },
+  {
+    id: "gemini",
+    label: "Gemini CLI",
+    emptyTitle: "Add your first Gemini CLI provider",
+  },
+  {
+    id: "grokbuild",
+    label: "Grok Build",
+    emptyTitle: "Add your first Grok Build provider",
+  },
+  {
+    id: "opencode",
+    label: "OpenCode",
+    emptyTitle: "Add your first OpenCode provider",
+  },
+  {
+    id: "openclaw",
+    label: "OpenClaw",
+    emptyTitle: "Add your first OpenClaw provider",
+  },
+  {
+    id: "hermes",
+    label: "Hermes",
+    emptyTitle: "Add your first Hermes provider",
+  },
+  {
+    id: "pi",
+    label: "Pi",
+    emptyTitle: "Add your first Pi provider",
   },
 ];
 
@@ -62,7 +98,7 @@ const HEADER_HEIGHT = 64;
 
 function initialApp(): AppId {
   const stored = window.localStorage.getItem(APP_STORAGE_KEY);
-  return stored === "codex" ? "codex" : "claude";
+  return APPS.some((app) => app.id === stored) ? (stored as AppId) : "claude";
 }
 
 function initialDarkMode(): boolean {
@@ -126,12 +162,13 @@ function adapterMatchesProvider(
 ): boolean {
   return (
     adapter.appId === provider.appId &&
-    sameJsonValue(adapter.reference, provider.adapter)
+    sameAdapterIdentity(adapter.reference, provider.adapter)
   );
 }
 
 export default function App() {
   const [activeApp, setActiveApp] = useState<AppId>(initialApp);
+  const [supportedApps, setSupportedApps] = useState<AppId[]>([]);
   const [isDark, setIsDark] = useState(initialDarkMode);
   const [adapters, setAdapters] = useState<AdapterDescriptor[]>([]);
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
@@ -163,10 +200,12 @@ export default function App() {
     ? "Import Claude Code user configuration"
     : `Import current ${definition.label} configuration`;
   const activeAdapters = adapters.filter((item) => item.appId === activeApp);
+  const liveAdapters = activeAdapters.filter(
+    (item) => !isNativeAdapter(item.reference),
+  );
   const adapter =
-    activeAdapters.find(
-      (item) => item.reference.pluginId === "org.cc-switch.builtin",
-    ) ?? activeAdapters[0];
+    activeAdapters.find((item) => isNativeAdapter(item.reference)) ??
+    activeAdapters[0];
   const editingAdapter =
     editing === "new"
       ? adapter
@@ -220,10 +259,20 @@ export default function App() {
 
   useEffect(() => {
     let ignore = false;
-    providersApi
-      .listAdapters()
-      .then((items) => {
-        if (!ignore) setAdapters(items);
+    Promise.all([providersApi.supportedApps(), providersApi.listAdapters()])
+      .then(([appIds, items]) => {
+        if (ignore) return;
+        const knownApps = appIds.filter((appId) =>
+          APPS.some((definition) => definition.id === appId),
+        );
+        if (knownApps.length === 0) {
+          throw new Error("No supported applications were reported by core");
+        }
+        setSupportedApps(knownApps);
+        setAdapters(items);
+        if (!knownApps.includes(activeAppRef.current)) {
+          setActiveApp(knownApps[0]);
+        }
       })
       .catch((error: unknown) => {
         if (!ignore) setAdapterError(errorMessage(error));
@@ -316,7 +365,7 @@ export default function App() {
         });
         setProviders((current) => [...current, created]);
       } else {
-        const updated = await providersApi.update(editing.id, {
+        const updated = await providersApi.update(activeApp, editing.id, {
           expectedRevision: editing.revision,
           name: update.name,
           settings: update.settings,
@@ -372,10 +421,12 @@ export default function App() {
     setLiveError(null);
     setNotice(null);
     try {
-      const imported = selectedAdapter
-        ? await providersApi.importLive(activeApp, selectedAdapter)
-        : await providersApi.importLive(activeApp);
-      setProviders((current) => [...current, imported]);
+      if (selectedAdapter) {
+        await providersApi.importLive(activeApp, selectedAdapter);
+      } else {
+        await providersApi.importLive(activeApp);
+      }
+      setProviders(await providersApi.list(activeApp));
       await refreshCurrent(activeApp);
       setNotice(
         isClaude
@@ -392,10 +443,11 @@ export default function App() {
 
   const beginImport = () => {
     setLiveError(null);
-    if (activeAdapters.length > 1) {
+    if (liveAdapters.length > 1) {
       setImportDialogOpen(true);
       return;
     }
+    if (liveAdapters.length === 0) return;
     void importLiveProvider();
   };
 
@@ -405,6 +457,7 @@ export default function App() {
     setNotice(null);
     try {
       await providersApi.switch(activeApp, provider.id, provider.revision);
+      setProviders(await providersApi.list(activeApp));
       await refreshCurrent(activeApp);
       setNotice(
         isClaude
@@ -425,6 +478,9 @@ export default function App() {
     return {
       provider,
       adapterAvailable: providerAdapter !== undefined,
+      canSwitch:
+        providerAdapter !== undefined &&
+        !isNativeAdapter(providerAdapter.reference),
       endpoint: providerAdapter
         ? visibleEndpoint(providerAdapter, provider)
         : "",
@@ -489,6 +545,7 @@ export default function App() {
             <div className="flex min-w-0 flex-1 items-center justify-end overflow-hidden py-4">
               <AppSwitcher
                 activeApp={activeApp}
+                apps={supportedApps}
                 disabled={mutationBusy || liveBusy !== null}
                 onSwitch={selectApp}
               />
@@ -502,7 +559,10 @@ export default function App() {
                   variant="ghost"
                   size="sm"
                   disabled={
-                    !adapter || loading || mutationBusy || liveBusy !== null
+                    liveAdapters.length === 0 ||
+                    loading ||
+                    mutationBusy ||
+                    liveBusy !== null
                   }
                   onClick={beginImport}
                   className="hover:bg-black/5 dark:hover:bg-white/5"
@@ -566,6 +626,9 @@ export default function App() {
                   isClaude ? "Import user default" : "Import current"
                 }
                 disabled={!adapter || mutationBusy || liveBusy !== null}
+                importDisabled={
+                  liveAdapters.length === 0 || mutationBusy || liveBusy !== null
+                }
                 busy={mutationBusy || liveBusy !== null}
                 importing={liveBusy === "import"}
                 switchingId={liveBusy}
@@ -609,7 +672,7 @@ export default function App() {
 
       {importDialogOpen && (
         <ImportProviderDialog
-          adapters={activeAdapters}
+          adapters={liveAdapters}
           busy={liveBusy === "import"}
           error={liveError}
           onCancel={() => setImportDialogOpen(false)}

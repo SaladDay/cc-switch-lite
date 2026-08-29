@@ -12,6 +12,7 @@ interface ProviderListProps {
   currentLabel: string;
   importLabel: string;
   disabled: boolean;
+  importDisabled: boolean;
   busy: boolean;
   importing: boolean;
   switchingId: string | null;
@@ -34,6 +35,7 @@ export function ProviderList({
   currentLabel,
   importLabel,
   disabled,
+  importDisabled,
   busy,
   importing,
   switchingId,
@@ -71,6 +73,7 @@ export function ProviderList({
         description="Add one manually, or import the API provider from your current live configuration."
         importLabel={importLabel}
         disabled={disabled}
+        importDisabled={importDisabled}
         importing={importing}
         onCreate={onCreate}
         onImport={onImport}

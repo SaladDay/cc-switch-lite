@@ -10,6 +10,7 @@ interface ProviderActionsProps {
   currentLabel: string;
   currentAriaLabel: string;
   canEdit: boolean;
+  canSwitch: boolean;
   busy: boolean;
   switching: boolean;
   deleteButtonRef?: Ref<HTMLButtonElement>;
@@ -24,6 +25,7 @@ export function ProviderActions({
   currentLabel,
   currentAriaLabel,
   canEdit,
+  canSwitch,
   busy,
   switching,
   deleteButtonRef,
@@ -32,7 +34,7 @@ export function ProviderActions({
   onDelete,
 }: ProviderActionsProps) {
   const iconButtonClass = "h-8 w-8 p-1";
-  const mainDisabled = isCurrent || !canEdit || busy;
+  const mainDisabled = isCurrent || !canSwitch || busy;
 
   return (
     <div className="flex items-center gap-1.5">

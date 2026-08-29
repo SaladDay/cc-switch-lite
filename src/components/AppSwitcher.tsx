@@ -7,20 +7,33 @@ import { ProviderIcon } from "./ProviderIcon";
 
 interface AppSwitcherProps {
   activeApp: AppId;
+  apps: AppId[];
   disabled?: boolean;
   onSwitch: (app: AppId) => void;
 }
 
-const ALL_APPS: AppId[] = ["claude", "codex"];
-
 const APP_ICON_NAME: Record<AppId, string> = {
   claude: "claude",
+  "claude-desktop": "claude",
   codex: "openai",
+  gemini: "gemini",
+  grokbuild: "grok",
+  opencode: "opencode",
+  openclaw: "openclaw",
+  hermes: "hermes",
+  pi: "pi",
 };
 
 const APP_DISPLAY_NAME: Record<AppId, string> = {
   claude: "Claude Code",
+  "claude-desktop": "Claude Desktop",
   codex: "Codex",
+  gemini: "Gemini CLI",
+  grokbuild: "Grok Build",
+  opencode: "OpenCode",
+  openclaw: "OpenClaw",
+  hermes: "Hermes",
+  pi: "Pi",
 };
 
 function AppGlyph({ app, isActive }: { app: AppId; isActive: boolean }) {
@@ -50,6 +63,7 @@ function AppGlyph({ app, isActive }: { app: AppId; isActive: boolean }) {
 
 export function AppSwitcher({
   activeApp,
+  apps,
   disabled = false,
   onSwitch,
 }: AppSwitcherProps) {
@@ -60,7 +74,7 @@ export function AppSwitcher({
       className="inline-flex gap-1 rounded-xl bg-muted p-1"
       style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
     >
-      {ALL_APPS.map((app) => {
+      {apps.map((app) => {
         const isActive = activeApp === app;
         return (
           <button

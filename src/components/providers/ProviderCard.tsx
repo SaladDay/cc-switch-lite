@@ -9,6 +9,7 @@ export interface ProviderListItem {
   provider: ProviderRecord;
   endpoint: string;
   adapterAvailable: boolean;
+  canSwitch: boolean;
   isCurrent: boolean;
 }
 
@@ -27,6 +28,7 @@ export function ProviderCard({
   provider,
   endpoint,
   adapterAvailable,
+  canSwitch,
   isCurrent,
   appId,
   currentLabel,
@@ -98,6 +100,7 @@ export function ProviderCard({
               currentLabel={currentLabel}
               currentAriaLabel={currentAriaLabel}
               canEdit={adapterAvailable}
+              canSwitch={canSwitch}
               busy={busy}
               switching={switching}
               deleteButtonRef={deleteButtonRef}

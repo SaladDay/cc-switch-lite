@@ -1,7 +1,7 @@
 [package]
 name = "cc-switch-lite"
 version = "0.1.0-alpha.1"
-description = "A focused provider switcher for Claude Code and Codex"
+description = "A provider configuration editor for CC Switch applications"
 license = "MIT"
 repository = "https://github.com/SaladDay/cc-switch-lite"
 edition = "2021"
@@ -20,8 +20,10 @@ cc-switch-core = { git = "https://github.com/SaladDay/cc-switch-core", rev = "14
 ed25519-dalek = { version = "2.2", default-features = false, features = ["fast", "std", "zeroize"] }
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 futures-util = "0.3"
+hmac = "0.12"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }

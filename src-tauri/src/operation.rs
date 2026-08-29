@@ -180,12 +180,30 @@ struct AppliedWrite {
     written: Vec<u8>,
 }
 
+pub(crate) struct OperationReceipt {
+    applied: Vec<AppliedWrite>,
+}
+
+impl OperationReceipt {
+    pub(crate) fn rollback(self) -> Result<(), OperationError> {
+        rollback_applied(&self.applied)
+    }
+}
+
 impl<'a> OperationExecutor<'a> {
     pub fn new(paths: &'a LivePaths) -> Self {
         Self { paths }
     }
 
+    #[cfg(test)]
     pub fn execute(&self, plan: &OperationPlan) -> Result<(), OperationError> {
+        self.execute_recoverable(plan).map(drop)
+    }
+
+    pub(crate) fn execute_recoverable(
+        &self,
+        plan: &OperationPlan,
+    ) -> Result<OperationReceipt, OperationError> {
         self.validate(plan)?;
 
         let mut paths = HashSet::new();
@@ -233,7 +251,7 @@ impl<'a> OperationExecutor<'a> {
                 written: prepared_write.write.contents.as_bytes().to_vec(),
             });
         }
-        Ok(())
+        Ok(OperationReceipt { applied })
     }
 
     fn validate(&self, plan: &OperationPlan) -> Result<(), OperationError> {
@@ -292,54 +310,54 @@ impl<'a> OperationExecutor<'a> {
         error: OperationError,
         applied: &[AppliedWrite],
     ) -> OperationError {
-        match self.rollback(applied) {
+        match rollback_applied(applied) {
             Ok(()) => error,
             Err(rollback_error) => OperationError::Rollback(format!(
                 "operation error: {error}; rollback error: {rollback_error}"
             )),
         }
     }
+}
 
-    fn rollback(&self, applied: &[AppliedWrite]) -> Result<(), OperationError> {
-        let mut failures = Vec::new();
-        for applied_write in applied.iter().rev() {
-            let current = match read_optional(&applied_write.path) {
-                Ok(current) => current,
-                Err(error) => {
-                    failures.push(error.to_string());
-                    continue;
-                }
-            };
-            if current.as_deref() != Some(applied_write.written.as_slice()) {
-                failures.push(format!(
-                    "{:?} changed after Lite wrote it; external contents were preserved",
-                    applied_write.target
-                ));
+fn rollback_applied(applied: &[AppliedWrite]) -> Result<(), OperationError> {
+    let mut failures = Vec::new();
+    for applied_write in applied.iter().rev() {
+        let current = match read_optional_no_follow(&applied_write.path, MAX_CONTENT_BYTES) {
+            Ok(current) => current,
+            Err(error) => {
+                failures.push(error.to_string());
                 continue;
             }
+        };
+        if current.as_deref() != Some(applied_write.written.as_slice()) {
+            failures.push(format!(
+                "{:?} changed after Lite wrote it; external contents were preserved",
+                applied_write.target
+            ));
+            continue;
+        }
 
-            let result = match &applied_write.original {
-                Some(contents) => {
-                    atomic_write(&applied_write.path, contents).map_err(OperationError::File)
-                }
-                None => match fs::remove_file(&applied_write.path) {
-                    Ok(()) => Ok(()),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(source) => Err(OperationError::Io {
-                        path: applied_write.path.clone(),
-                        source,
-                    }),
-                },
-            };
-            if let Err(error) = result {
-                failures.push(error.to_string());
+        let result = match &applied_write.original {
+            Some(contents) => {
+                atomic_write(&applied_write.path, contents).map_err(OperationError::File)
             }
+            None => match fs::remove_file(&applied_write.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(source) => Err(OperationError::Io {
+                    path: applied_write.path.clone(),
+                    source,
+                }),
+            },
+        };
+        if let Err(error) = result {
+            failures.push(error.to_string());
         }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(OperationError::Rollback(failures.join("; ")))
-        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(OperationError::Rollback(failures.join("; ")))
     }
 }
 
@@ -685,7 +703,7 @@ mod tests {
             written: b"lite".to_vec(),
         };
 
-        let result = OperationExecutor::new(&paths).rollback(&[applied]);
+        let result = rollback_applied(&[applied]);
 
         assert!(matches!(result, Err(OperationError::Rollback(_))));
         assert_eq!(fs::read(paths.claude_settings).unwrap(), b"external");

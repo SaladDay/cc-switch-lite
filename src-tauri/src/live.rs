@@ -15,13 +15,12 @@ use toml_edit::{value, DocumentMut, Item, Table};
 use crate::{
     operation::{
         read_optional, read_optional_no_follow, sha256, ContentExpectation, LivePaths,
-        LogicalTarget, OperationError, OperationExecutor, OperationPlan, PlannedWrite,
-        OPERATION_CONTRACT_MAJOR,
+        LogicalTarget, OperationError, OperationExecutor, OperationPlan, OperationReceipt,
+        PlannedWrite, OPERATION_CONTRACT_MAJOR,
     },
     plugin::{PluginCapability, PluginRoute, PluginSlot, PluginSnapshot},
     provider::{
-        adapter_for_reference, built_in_adapters, validate_settings, CurrentProvider,
-        ProviderDraft, ProviderRecord,
+        adapter_for_reference, built_in_adapters, validate_settings, ProviderDraft, ProviderRecord,
     },
 };
 
@@ -112,6 +111,15 @@ pub struct LiveConfig {
     gate: Mutex<()>,
 }
 
+pub struct LiveWriteReceipt {
+    operation: OperationReceipt,
+    ownership: Option<OwnershipWriteReceipt>,
+}
+
+struct OwnershipWriteReceipt {
+    written: Vec<u8>,
+}
+
 impl LiveConfig {
     pub fn from_home(home: &Path, lock_path: PathBuf) -> Result<Self, LiveError> {
         let claude_override = std::env::var_os("CLAUDE_CONFIG_DIR");
@@ -200,19 +208,27 @@ impl LiveConfig {
         })
     }
 
+    #[cfg(test)]
     pub fn switch(&self, provider: &ProviderRecord) -> Result<(), LiveError> {
+        self.switch_recoverable(provider).map(drop)
+    }
+
+    pub fn switch_recoverable(
+        &self,
+        provider: &ProviderRecord,
+    ) -> Result<LiveWriteReceipt, LiveError> {
         let descriptor = adapter_for_reference(&provider.app_id, &provider.adapter)
             .ok_or_else(|| LiveError::InvalidProvider("adapter is unavailable".to_owned()))?;
         validate_settings(&descriptor, &provider.settings).map_err(LiveError::InvalidProvider)?;
 
         self.with_lock(|| {
             let paths = self.paths();
-            let (paths, plan) = match provider.app_id.as_str() {
+            let (paths, plan, ownership) = match provider.app_id.as_str() {
                 "claude" => {
                     let paths = paths.resolved_for_write(LogicalTarget::ClaudeSettings)?;
                     let original = read_optional(&paths.claude_settings)?;
                     let plan = Self::claude_plan(original.as_deref(), provider)?;
-                    (paths, plan)
+                    (paths, plan, None)
                 }
                 "codex" => {
                     let paths = paths.resolved_for_write(LogicalTarget::CodexConfig)?;
@@ -221,10 +237,7 @@ impl LiveConfig {
                     let needs_save = stored_ownership.is_none();
                     let ownership = stored_ownership.unwrap_or_else(CodexRouteOwnership::new);
                     let plan = Self::codex_plan(original.as_deref(), provider, &ownership)?;
-                    if needs_save {
-                        self.write_ownership(&ownership)?;
-                    }
-                    (paths, plan)
+                    (paths, plan, needs_save.then_some(ownership))
                 }
                 _ => {
                     return Err(LiveError::InvalidProvider(
@@ -232,59 +245,26 @@ impl LiveConfig {
                     ));
                 }
             };
-            OperationExecutor::new(&paths).execute(&plan)?;
-            Ok(())
+            self.execute_recoverable_plan(&paths, &plan, ownership.as_ref())
         })
     }
 
-    pub fn current_providers(
-        &self,
-        app_id: &str,
-        providers: &[ProviderRecord],
-    ) -> Result<Vec<CurrentProvider>, LiveError> {
+    pub fn rollback(&self, receipt: LiveWriteReceipt) -> Result<(), LiveError> {
         self.with_lock(|| {
-            let paths = self.paths();
-            let live = match app_id {
-                "claude" => Self::read_claude_settings(
-                    read_optional(&paths.claude_settings)?.as_deref(),
-                    false,
-                )?,
-                "codex" => Self::read_codex_settings(
-                    read_optional(&paths.codex_config)?.as_deref(),
-                    read_optional(&paths.codex_auth)?.as_deref(),
-                    false,
-                    self.read_ownership()?.as_ref(),
-                )?,
-                _ => {
-                    return Err(LiveError::InvalidProvider(
-                        "application is not available in Lite".to_owned(),
-                    ));
-                }
-            };
-            let Some(live) = live else {
-                return Ok(Vec::new());
-            };
-
-            if app_id == "codex" {
-                if let Some(id) = live.get("hostProviderId").and_then(Value::as_str) {
-                    if let Some(provider) = providers.iter().find(|provider| {
-                        provider.id == id
-                            && managed_settings_match(app_id, &provider.settings, &live)
-                    }) {
-                        return Ok(vec![CurrentProvider::from(provider)]);
-                    }
+            let mut failures = Vec::new();
+            if let Err(error) = receipt.operation.rollback() {
+                failures.push(error.to_string());
+            }
+            if let Some(ownership) = receipt.ownership {
+                if let Err(error) = self.rollback_ownership(&ownership) {
+                    failures.push(error.to_string());
                 }
             }
-
-            Ok(providers
-                .iter()
-                .filter(|provider| {
-                    provider.app_id == app_id
-                        && adapter_for_reference(&provider.app_id, &provider.adapter).is_some()
-                })
-                .filter(|provider| managed_settings_match(app_id, &provider.settings, &live))
-                .map(CurrentProvider::from)
-                .collect())
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(OperationError::Rollback(failures.join("; ")).into())
+            }
         })
     }
 
@@ -301,12 +281,23 @@ impl LiveConfig {
         })
     }
 
+    #[cfg(test)]
     pub fn execute_plugin_route<E>(
         &self,
         provider: &ProviderRecord,
         capabilities: &[PluginCapability],
         router: impl FnOnce(Vec<PluginSnapshot>) -> Result<PluginRoute, E>,
     ) -> Result<Result<(), E>, LiveError> {
+        self.execute_plugin_route_recoverable(provider, capabilities, router)
+            .map(|result| result.map(drop))
+    }
+
+    pub fn execute_plugin_route_recoverable<E>(
+        &self,
+        provider: &ProviderRecord,
+        capabilities: &[PluginCapability],
+        router: impl FnOnce(Vec<PluginSnapshot>) -> Result<PluginRoute, E>,
+    ) -> Result<Result<LiveWriteReceipt, E>, LiveError> {
         let app_id = provider.app_id.as_str();
         self.with_lock(|| {
             let target = match app_id {
@@ -339,12 +330,12 @@ impl LiveConfig {
                 })?;
             validate_settings(&descriptor, &routed.settings).map_err(LiveError::InvalidProvider)?;
 
-            let (paths, plan) = match app_id {
+            let (paths, plan, ownership) = match app_id {
                 "claude" => {
                     let paths = paths.resolved_for_write(target)?;
                     let original = read_optional(&paths.claude_settings)?;
                     let plan = Self::claude_plan(original.as_deref(), &routed)?;
-                    (paths, plan)
+                    (paths, plan, None)
                 }
                 "codex" => {
                     let paths = paths.resolved_for_write(target)?;
@@ -353,15 +344,12 @@ impl LiveConfig {
                     let needs_save = stored_ownership.is_none();
                     let ownership = stored_ownership.unwrap_or_else(CodexRouteOwnership::new);
                     let plan = Self::codex_plan(original.as_deref(), &routed, &ownership)?;
-                    if needs_save {
-                        self.write_ownership(&ownership)?;
-                    }
-                    (paths, plan)
+                    (paths, plan, needs_save.then_some(ownership))
                 }
                 _ => unreachable!(),
             };
-            OperationExecutor::new(&paths).execute(&plan)?;
-            Ok(Ok(()))
+            let receipt = self.execute_recoverable_plan(&paths, &plan, ownership.as_ref())?;
+            Ok(Ok(receipt))
         })
     }
 
@@ -664,7 +652,9 @@ impl LiveConfig {
     }
 
     fn read_ownership(&self) -> Result<Option<CodexRouteOwnership>, LiveError> {
-        let Some(contents) = read_optional(&self.ownership_path)? else {
+        let Some(contents) =
+            read_optional_no_follow(&self.ownership_path, MAX_PLUGIN_SNAPSHOT_BYTES)?
+        else {
             return Ok(None);
         };
         let ownership: CodexRouteOwnership = serde_json::from_slice(&contents).map_err(|_| {
@@ -680,6 +670,63 @@ impl LiveConfig {
         Ok(Some(ownership))
     }
 
+    fn execute_recoverable_plan(
+        &self,
+        paths: &LivePaths,
+        plan: &OperationPlan,
+        ownership: Option<&CodexRouteOwnership>,
+    ) -> Result<LiveWriteReceipt, LiveError> {
+        let ownership = ownership
+            .map(|value| self.write_new_ownership(value))
+            .transpose()?;
+        match OperationExecutor::new(paths).execute_recoverable(plan) {
+            Ok(operation) => Ok(LiveWriteReceipt {
+                operation,
+                ownership,
+            }),
+            Err(error) => {
+                if let Some(ownership) = ownership {
+                    if let Err(rollback_error) = self.rollback_ownership(&ownership) {
+                        return Err(OperationError::Rollback(format!(
+                            "operation error: {error}; ownership rollback error: {rollback_error}"
+                        ))
+                        .into());
+                    }
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    fn write_new_ownership(
+        &self,
+        ownership: &CodexRouteOwnership,
+    ) -> Result<OwnershipWriteReceipt, LiveError> {
+        if read_optional_no_follow(&self.ownership_path, MAX_PLUGIN_SNAPSHOT_BYTES)?.is_some() {
+            return Err(OperationError::Conflict.into());
+        }
+        let written = ownership_contents(ownership)?;
+        atomic_write_private(&self.ownership_path, &written).map_err(OperationError::File)?;
+        Ok(OwnershipWriteReceipt { written })
+    }
+
+    fn rollback_ownership(&self, receipt: &OwnershipWriteReceipt) -> Result<(), OperationError> {
+        let current = read_optional_no_follow(&self.ownership_path, MAX_PLUGIN_SNAPSHOT_BYTES)?;
+        match current {
+            None => Ok(()),
+            Some(current) if current == receipt.written => {
+                fs::remove_file(&self.ownership_path).map_err(|source| OperationError::Io {
+                    path: self.ownership_path.clone(),
+                    source,
+                })
+            }
+            Some(_) => Err(OperationError::Rollback(
+                "Codex route ownership changed after Lite wrote it; external contents were preserved"
+                    .to_owned(),
+            )),
+        }
+    }
+
     #[cfg(test)]
     fn read_or_create_ownership(&self) -> Result<CodexRouteOwnership, LiveError> {
         if let Some(ownership) = self.read_ownership()? {
@@ -690,11 +737,9 @@ impl LiveConfig {
         Ok(ownership)
     }
 
+    #[cfg(test)]
     fn write_ownership(&self, ownership: &CodexRouteOwnership) -> Result<(), LiveError> {
-        let mut contents = serde_json::to_vec_pretty(ownership).map_err(|_| {
-            LiveError::InvalidConfig("Lite Codex route ownership could not be saved".to_owned())
-        })?;
-        contents.push(b'\n');
+        let contents = ownership_contents(ownership)?;
         atomic_write_private(&self.ownership_path, &contents).map_err(OperationError::File)?;
         Ok(())
     }
@@ -746,6 +791,14 @@ impl LiveConfig {
         })?;
         Ok(lock)
     }
+}
+
+fn ownership_contents(ownership: &CodexRouteOwnership) -> Result<Vec<u8>, LiveError> {
+    let mut contents = serde_json::to_vec_pretty(ownership).map_err(|_| {
+        LiveError::InvalidConfig("Lite Codex route ownership could not be saved".to_owned())
+    })?;
+    contents.push(b'\n');
+    Ok(contents)
 }
 
 fn plugin_snapshots(
@@ -1198,38 +1251,8 @@ fn insert_optional_string(target: &mut Map<String, Value>, key: &str, value: Opt
     }
 }
 
-fn managed_settings_match(
-    app_id: &str,
-    provider: &Map<String, Value>,
-    live: &Map<String, Value>,
-) -> bool {
-    provider.get("apiKey").and_then(Value::as_str).unwrap_or("")
-        == live.get("apiKey").and_then(Value::as_str).unwrap_or("")
-        && provider
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            == live
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-        && normalize_base_url_for_app(app_id, provider.get("baseUrl").and_then(Value::as_str))
-            == normalize_base_url_for_app(app_id, live.get("baseUrl").and_then(Value::as_str))
-}
-
 fn normalize_base_url(value: Option<&str>) -> &str {
     value.unwrap_or("").trim().trim_end_matches('/')
-}
-
-fn normalize_base_url_for_app<'a>(app_id: &str, value: Option<&'a str>) -> &'a str {
-    let normalized = normalize_base_url(value);
-    if app_id == "codex" && normalized.is_empty() {
-        DEFAULT_CODEX_BASE_URL
-    } else {
-        normalized
-    }
 }
 
 #[cfg(test)]
@@ -1317,6 +1340,24 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_switch_restores_the_previous_live_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let live = live(directory.path());
+        let paths = live.paths();
+        fs::create_dir_all(paths.claude_settings.parent().unwrap()).unwrap();
+        let original = br#"{"env":{"ANTHROPIC_API_KEY":"old"},"keep":true}"#;
+        fs::write(&paths.claude_settings, original).unwrap();
+
+        let receipt = live
+            .switch_recoverable(&provider("claude", json!({"apiKey": "new"})))
+            .unwrap();
+        assert_ne!(fs::read(&paths.claude_settings).unwrap(), original);
+
+        live.rollback(receipt).unwrap();
+        assert_eq!(fs::read(&paths.claude_settings).unwrap(), original);
+    }
+
+    #[test]
     fn claude_switch_rejects_unmanaged_auth_and_model_fields() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let live = live(directory.path());
@@ -1358,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_host_managed_provider_is_not_imported_switched_or_current() {
+    fn claude_host_managed_provider_is_not_imported_or_switched() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let live = live(directory.path());
         let paths = live.paths();
@@ -1376,10 +1417,6 @@ mod tests {
             live.switch(&provider),
             Err(LiveError::UnsupportedConfig(_))
         ));
-        assert!(live
-            .current_providers("claude", std::slice::from_ref(&provider))
-            .unwrap()
-            .is_empty());
         assert_eq!(fs::read_to_string(paths.claude_settings).unwrap(), original);
     }
 
@@ -1840,48 +1877,6 @@ mod tests {
             live.import_draft("claude"),
             Err(LiveError::UnsupportedConfig(_))
         ));
-    }
-
-    #[test]
-    fn codex_default_endpoint_remains_current_after_switch() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let live = live(directory.path());
-        let provider = provider("codex", json!({"apiKey": "secret"}));
-
-        live.switch(&provider).expect("switch Codex provider");
-        let current = live
-            .current_providers("codex", std::slice::from_ref(&provider))
-            .expect("read current provider");
-
-        assert_eq!(current, [CurrentProvider::from(&provider)]);
-    }
-
-    #[test]
-    fn current_returns_all_matches_for_an_external_live_config() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let live = live(directory.path());
-        let paths = live.paths();
-        fs::create_dir_all(paths.claude_settings.parent().unwrap()).unwrap();
-        fs::write(
-            &paths.claude_settings,
-            r#"{"env":{"ANTHROPIC_API_KEY":"secret"}}"#,
-        )
-        .unwrap();
-        let first = provider("claude", json!({"apiKey": "secret"}));
-        let mut second = first.clone();
-        second.id = "fc92289a-73f8-40ab-bf1a-58fb57f1c36e".to_owned();
-
-        let current = live
-            .current_providers("claude", &[first.clone(), second.clone()])
-            .unwrap();
-
-        assert_eq!(
-            current,
-            [
-                CurrentProvider::from(&first),
-                CurrentProvider::from(&second)
-            ]
-        );
     }
 
     #[test]
