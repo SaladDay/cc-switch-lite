@@ -16,7 +16,7 @@ tauri-build = { version = "2.4.0", features = [] }
 
 [dependencies]
 base64 = "0.22"
-cc-switch-core = { git = "https://github.com/SaladDay/cc-switch-core", rev = "47948575503c88a8a7d61e4abe2e18a649d35759" }
+cc-switch-core = { git = "https://github.com/SaladDay/cc-switch-core", rev = "696199516081d85a09831c93115a23738f2d6ff4" }
 ed25519-dalek = { version = "2.2", default-features = false, features = ["fast", "std", "zeroize"] }
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 futures-util = "0.3"
