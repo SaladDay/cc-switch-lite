@@ -9,6 +9,14 @@ export type AppId =
   | "hermes"
   | "pi";
 
+export interface CoreAppDescriptor {
+  id: AppId;
+  displayName: string;
+  brandKey: string;
+  configurationMode: "switch" | "additive";
+  capabilities: string[];
+}
+
 export type JsonValue =
   string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 

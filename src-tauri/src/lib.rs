@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use cc_switch_core::{builtin_app_registry, AppDescriptor};
+
 mod live;
 mod native_live;
 mod operation;
@@ -21,13 +23,9 @@ use serde::Serialize;
 use store::{ProviderStore, StoreError};
 use tauri::{Manager, State};
 
-fn lite_apps() -> impl Iterator<Item = cc_switch_core::AppType> {
-    cc_switch_core::AppType::all()
-}
-
 #[tauri::command]
-fn supported_apps() -> Vec<String> {
-    lite_apps().map(|app| app.as_str().to_owned()).collect()
+fn supported_apps() -> Vec<AppDescriptor> {
+    builtin_app_registry().descriptors().cloned().collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -499,8 +497,9 @@ mod tests {
 
     #[test]
     fn lite_boundary_follows_every_core_application() {
+        let apps = supported_apps();
         assert_eq!(
-            supported_apps(),
+            apps.iter().map(AppDescriptor::id).collect::<Vec<_>>(),
             [
                 "claude",
                 "claude-desktop",

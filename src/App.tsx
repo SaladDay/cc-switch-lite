@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -25,7 +26,7 @@ import {
   type ProviderListItem,
 } from "./components/providers/ProviderList";
 import { Button } from "./components/ui/button";
-import { APPS, appDefinition, isAdditiveApp } from "./lib/apps";
+import { APPS, appDefinition } from "./lib/apps";
 import {
   initialTheme,
   initialVisibleApps,
@@ -37,6 +38,7 @@ import type {
   AdapterDescriptor,
   AdapterReference,
   AppId,
+  CoreAppDescriptor,
   CurrentProvider,
   JsonValue,
   ProviderChanges,
@@ -132,7 +134,7 @@ function adapterMatchesProvider(
 
 export default function App() {
   const [activeApp, setActiveApp] = useState<AppId>(initialApp);
-  const [supportedApps, setSupportedApps] = useState<AppId[]>([]);
+  const [appCatalog, setAppCatalog] = useState<CoreAppDescriptor[]>([]);
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [visibleApps, setVisibleApps] = useState(initialVisibleApps);
   const [adapters, setAdapters] = useState<AdapterDescriptor[]>([]);
@@ -161,7 +163,13 @@ export default function App() {
   const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const definition = appDefinition(activeApp);
   const isClaude = activeApp === "claude";
-  const additive = isAdditiveApp(activeApp);
+  const supportedApps = useMemo(
+    () => appCatalog.map((app) => app.id),
+    [appCatalog],
+  );
+  const additive =
+    appCatalog.find((app) => app.id === activeApp)?.configurationMode ===
+    "additive";
   const currentLabel = "In Use";
   const importLabel = isClaude
     ? "Import Claude Code user configuration"
@@ -268,18 +276,23 @@ export default function App() {
   useEffect(() => {
     let ignore = false;
     Promise.all([providersApi.supportedApps(), providersApi.listAdapters()])
-      .then(([appIds, items]) => {
+      .then(([descriptors, items]) => {
         if (ignore) return;
-        const knownApps = appIds.filter((appId) =>
-          APPS.some((definition) => definition.id === appId),
+        const knownApps = descriptors.filter((descriptor) =>
+          APPS.some((definition) => definition.id === descriptor.id),
         );
+        if (knownApps.length !== descriptors.length) {
+          throw new Error(
+            "Core reported an application without Lite presentation support",
+          );
+        }
         if (knownApps.length === 0) {
           throw new Error("No supported applications were reported by core");
         }
-        setSupportedApps(knownApps);
+        setAppCatalog(knownApps);
         setAdapters(items);
-        if (!knownApps.includes(activeAppRef.current)) {
-          setActiveApp(knownApps[0]);
+        if (!knownApps.some((app) => app.id === activeAppRef.current)) {
+          setActiveApp(knownApps[0].id);
         }
       })
       .catch((error: unknown) => {

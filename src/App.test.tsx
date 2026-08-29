@@ -11,6 +11,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import App, { sameJsonValue } from "./App";
 import type {
   AdapterDescriptor,
+  AppId,
+  CoreAppDescriptor,
   CurrentProvider,
   ProviderRecord,
 } from "./lib/provider-types";
@@ -163,23 +165,36 @@ function nativeAdapter(appId: string): AdapterDescriptor {
   };
 }
 
+function coreApps(appIds: AppId[]): CoreAppDescriptor[] {
+  const additive = new Set<AppId>(["opencode", "openclaw", "hermes", "pi"]);
+  return appIds.map((id) => ({
+    id,
+    displayName: id,
+    brandKey: id,
+    configurationMode: additive.has(id) ? "additive" : "switch",
+    capabilities: ["provider-management", "live-configuration"],
+  }));
+}
+
 describe("App", () => {
   beforeEach(() => {
     window.localStorage.clear();
     document.documentElement.className = "";
     for (const mock of Object.values(api)) mock.mockReset();
     api.listAdapters.mockResolvedValue(adapters);
-    api.supportedApps.mockResolvedValue([
-      "claude",
-      "claude-desktop",
-      "codex",
-      "gemini",
-      "grokbuild",
-      "opencode",
-      "openclaw",
-      "hermes",
-      "pi",
-    ]);
+    api.supportedApps.mockResolvedValue(
+      coreApps([
+        "claude",
+        "claude-desktop",
+        "codex",
+        "gemini",
+        "grokbuild",
+        "opencode",
+        "openclaw",
+        "hermes",
+        "pi",
+      ]),
+    );
     api.list.mockResolvedValue([]);
     api.delete.mockResolvedValue(undefined);
     api.importNative.mockResolvedValue([]);
@@ -216,7 +231,7 @@ describe("App", () => {
   });
 
   it("uses the core response as the application membership source", async () => {
-    api.supportedApps.mockResolvedValue(["pi"]);
+    api.supportedApps.mockResolvedValue(coreApps(["pi"]));
     render(<App />);
 
     expect(
@@ -233,6 +248,34 @@ describe("App", () => {
       "true",
     );
     expect(api.list).toHaveBeenLastCalledWith("pi");
+  });
+
+  it("uses the core configuration mode instead of UI presentation metadata", async () => {
+    const native = nativeAdapter("pi");
+    const catalog = coreApps(["pi"]);
+    catalog[0].configurationMode = "switch";
+    api.supportedApps.mockResolvedValue(catalog);
+    api.listAdapters.mockResolvedValue([native]);
+    api.list.mockResolvedValue([
+      {
+        ...workProvider,
+        id: "pi-provider",
+        appId: "pi",
+        adapter: native.reference,
+        name: "Pi Work",
+        settings: { baseUrl: "https://pi.example.com/v1" },
+      },
+    ]);
+    render(<App />);
+
+    expect(
+      await screen.findByRole("button", { name: "Switch to Pi Work" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", {
+        name: "Add Pi Work to configuration",
+      }),
+    ).not.toBeInTheDocument();
   });
 
   it("switches the provider list and remembers the selected application", async () => {
@@ -816,7 +859,7 @@ describe("App", () => {
   it("creates native configuration for an application without a legacy form", async () => {
     const user = userEvent.setup();
     const native = nativeAdapter("gemini");
-    api.supportedApps.mockResolvedValue(["gemini"]);
+    api.supportedApps.mockResolvedValue(coreApps(["gemini"]));
     api.listAdapters.mockResolvedValue([native]);
     api.create.mockImplementation((draft) =>
       Promise.resolve({ ...draft, id: "gemini-new", revision: 1 }),
@@ -861,7 +904,7 @@ describe("App", () => {
       name: "Pi Work",
       settings: { baseURL: "https://pi.example.com/v1" },
     };
-    api.supportedApps.mockResolvedValue(["pi"]);
+    api.supportedApps.mockResolvedValue(coreApps(["pi"]));
     api.listAdapters.mockResolvedValue([native]);
     api.list.mockResolvedValue([provider]);
     let inConfig = false;
@@ -911,7 +954,7 @@ describe("App", () => {
         base_url: "https://hermes.example.com",
       },
     };
-    api.supportedApps.mockResolvedValue(["hermes"]);
+    api.supportedApps.mockResolvedValue(coreApps(["hermes"]));
     api.listAdapters.mockResolvedValue([native]);
     api.list.mockResolvedValue([provider]);
     api.currentProviders.mockResolvedValue([current(provider)]);
@@ -938,7 +981,7 @@ describe("App", () => {
       settings: { npm: "special" },
       liteConfigWritable: false,
     };
-    api.supportedApps.mockResolvedValue(["opencode"]);
+    api.supportedApps.mockResolvedValue(coreApps(["opencode"]));
     api.listAdapters.mockResolvedValue([native]);
     api.list.mockResolvedValue([provider]);
     render(<App />);
