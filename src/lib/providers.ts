@@ -2,7 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   CurrentProvider,
-  CoreAppDescriptor,
   AdapterDescriptor,
   AdapterReference,
   CommandError,
@@ -19,7 +18,7 @@ import type {
 } from "./plugin-types";
 
 export const providersApi = {
-  supportedApps: () => invoke<CoreAppDescriptor[]>("supported_apps"),
+  supportedApps: () => invoke<unknown>("supported_apps"),
   listAdapters: () => invoke<AdapterDescriptor[]>("list_provider_adapters"),
   list: (appId: string) =>
     invoke<ProviderRecord[]>("list_providers", { appId }),

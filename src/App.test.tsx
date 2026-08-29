@@ -278,6 +278,35 @@ describe("App", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("fails closed when the core application catalog is unavailable", async () => {
+    api.supportedApps.mockRejectedValue(new Error("Catalog unavailable"));
+    api.list.mockResolvedValue([workProvider]);
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("Catalog unavailable");
+    expect(
+      screen.getByRole("button", { name: "Switch to Work" }),
+    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Edit Work" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Delete Work" })).toBeDisabled();
+    expect(api.delete).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unknown core configuration mode", async () => {
+    api.supportedApps.mockResolvedValue([
+      { ...coreApps(["claude"])[0], configurationMode: "stacked" },
+    ]);
+    api.list.mockResolvedValue([workProvider]);
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Core returned an invalid application catalog",
+    );
+    expect(screen.getByRole("button", { name: "Delete Work" })).toBeDisabled();
+  });
+
   it("switches the provider list and remembers the selected application", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -1019,6 +1048,24 @@ describe("App", () => {
     expect(
       window.localStorage.getItem("cc-switch-lite:visible-apps"),
     ).toContain('"pi":false');
+  });
+
+  it("keeps the core application order in settings", async () => {
+    const user = userEvent.setup();
+    api.supportedApps.mockResolvedValue(coreApps(["pi", "claude"]));
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Open settings" }),
+    );
+    const settings = screen.getByRole("dialog", { name: "Settings" });
+    const pi = within(settings).getByRole("button", { name: "Pi" });
+    const claude = within(settings).getByRole("button", {
+      name: "Claude Code",
+    });
+    expect(
+      pi.compareDocumentPosition(claude) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it("keeps the dialog fallback modal and closes it with Escape", async () => {

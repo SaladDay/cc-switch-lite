@@ -1,4 +1,4 @@
-import type { AppId, JsonValue } from "./provider-types";
+import type { AppId, CoreAppDescriptor, JsonValue } from "./provider-types";
 
 export interface AppDefinition {
   id: AppId;
@@ -65,6 +65,49 @@ export const APPS: AppDefinition[] = [
 ];
 
 export const APP_IDS = APPS.map((app) => app.id);
+
+export function parseCoreAppCatalog(value: unknown): CoreAppDescriptor[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("Core returned an invalid application catalog");
+  }
+
+  const knownIds = new Set<string>(APP_IDS);
+  const seenIds = new Set<string>();
+  return value.map((candidate) => {
+    if (
+      typeof candidate !== "object" ||
+      candidate === null ||
+      Array.isArray(candidate)
+    ) {
+      throw new Error("Core returned an invalid application catalog");
+    }
+
+    const descriptor = candidate as Record<string, unknown>;
+    const { id, displayName, brandKey, configurationMode, capabilities } =
+      descriptor;
+    if (
+      typeof id !== "string" ||
+      !knownIds.has(id) ||
+      seenIds.has(id) ||
+      typeof displayName !== "string" ||
+      typeof brandKey !== "string" ||
+      (configurationMode !== "switch" && configurationMode !== "additive") ||
+      !Array.isArray(capabilities) ||
+      !capabilities.every((capability) => typeof capability === "string")
+    ) {
+      throw new Error("Core returned an invalid application catalog");
+    }
+    seenIds.add(id);
+
+    return {
+      id: id as AppId,
+      displayName,
+      brandKey,
+      configurationMode,
+      capabilities,
+    };
+  });
+}
 
 export function appDefinition(appId: AppId): AppDefinition {
   return APPS.find((app) => app.id === appId) ?? APPS[0];

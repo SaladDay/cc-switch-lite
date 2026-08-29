@@ -26,7 +26,7 @@ import {
   type ProviderListItem,
 } from "./components/providers/ProviderList";
 import { Button } from "./components/ui/button";
-import { APPS, appDefinition } from "./lib/apps";
+import { APPS, appDefinition, parseCoreAppCatalog } from "./lib/apps";
 import {
   initialTheme,
   initialVisibleApps,
@@ -135,6 +135,7 @@ function adapterMatchesProvider(
 export default function App() {
   const [activeApp, setActiveApp] = useState<AppId>(initialApp);
   const [appCatalog, setAppCatalog] = useState<CoreAppDescriptor[]>([]);
+  const [catalogReady, setCatalogReady] = useState(false);
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [visibleApps, setVisibleApps] = useState(initialVisibleApps);
   const [adapters, setAdapters] = useState<AdapterDescriptor[]>([]);
@@ -170,6 +171,8 @@ export default function App() {
   const additive =
     appCatalog.find((app) => app.id === activeApp)?.configurationMode ===
     "additive";
+  const providerActionsReady =
+    catalogReady && appCatalog.some((app) => app.id === activeApp);
   const currentLabel = "In Use";
   const importLabel = isClaude
     ? "Import Claude Code user configuration"
@@ -276,27 +279,21 @@ export default function App() {
   useEffect(() => {
     let ignore = false;
     Promise.all([providersApi.supportedApps(), providersApi.listAdapters()])
-      .then(([descriptors, items]) => {
+      .then(([value, items]) => {
         if (ignore) return;
-        const knownApps = descriptors.filter((descriptor) =>
-          APPS.some((definition) => definition.id === descriptor.id),
-        );
-        if (knownApps.length !== descriptors.length) {
-          throw new Error(
-            "Core reported an application without Lite presentation support",
-          );
-        }
-        if (knownApps.length === 0) {
-          throw new Error("No supported applications were reported by core");
-        }
-        setAppCatalog(knownApps);
+        const descriptors = parseCoreAppCatalog(value);
+        setAppCatalog(descriptors);
         setAdapters(items);
-        if (!knownApps.some((app) => app.id === activeAppRef.current)) {
-          setActiveApp(knownApps[0].id);
+        setCatalogReady(true);
+        if (!descriptors.some((app) => app.id === activeAppRef.current)) {
+          setActiveApp(descriptors[0].id);
         }
       })
       .catch((error: unknown) => {
-        if (!ignore) setAdapterError(errorMessage(error));
+        if (!ignore) {
+          setCatalogReady(false);
+          setAdapterError(errorMessage(error));
+        }
       });
     return () => {
       ignore = true;
@@ -376,13 +373,14 @@ export default function App() {
   };
 
   const openEditor = (provider: ProviderRecord | "new") => {
+    if (!providerActionsReady) return;
     setMutationError(null);
     setNotice(null);
     setEditing(provider);
   };
 
   const saveProvider = async (update: ProviderChanges) => {
-    if (!editing) return;
+    if (!editing || !providerActionsReady) return;
     setMutationBusy(true);
     setMutationError(null);
     try {
@@ -419,7 +417,7 @@ export default function App() {
   };
 
   const deleteProvider = async () => {
-    if (!deleting) return;
+    if (!deleting || !providerActionsReady) return;
     setMutationBusy(true);
     setMutationError(null);
     try {
@@ -449,6 +447,7 @@ export default function App() {
   };
 
   const importLiveProvider = async (selectedAdapter?: AdapterReference) => {
+    if (!providerActionsReady) return;
     setLiveBusy("import");
     setLiveError(null);
     setNotice(null);
@@ -476,6 +475,7 @@ export default function App() {
   };
 
   const beginImport = () => {
+    if (!providerActionsReady) return;
     setLiveError(null);
     if (liveAdapters.length > 1) {
       setImportDialogOpen(true);
@@ -489,6 +489,7 @@ export default function App() {
   };
 
   const switchProvider = async (provider: ProviderRecord) => {
+    if (!providerActionsReady) return;
     setLiveBusy(provider.id);
     setLiveError(null);
     setNotice(null);
@@ -509,6 +510,7 @@ export default function App() {
   };
 
   const removeProviderFromLive = async (provider: ProviderRecord) => {
+    if (!providerActionsReady) return;
     setLiveBusy(provider.id);
     setLiveError(null);
     setNotice(null);
@@ -543,16 +545,25 @@ export default function App() {
     return {
       provider,
       adapterAvailable: providerAdapter !== undefined,
-      canEdit: providerAdapter !== undefined && !readOnly,
+      canEdit:
+        providerActionsReady && providerAdapter !== undefined && !readOnly,
       canSwitch:
-        providerAdapter !== undefined && !readOnly && currentError === null,
+        providerActionsReady &&
+        providerAdapter !== undefined &&
+        !readOnly &&
+        currentError === null,
       canRemove:
+        providerActionsReady &&
         providerAdapter !== undefined &&
         isNativeAdapter(providerAdapter.reference) &&
         additive &&
         !readOnly &&
         currentError === null,
-      canDelete: !readOnly && currentError === null && (additive || !isCurrent),
+      canDelete:
+        providerActionsReady &&
+        !readOnly &&
+        currentError === null &&
+        (additive || !isCurrent),
       isAdditive: additive,
       isReadOnly: readOnly,
       readOnlyLabel: hermesManaged ? "Hermes managed" : "Not supported in Lite",
@@ -626,6 +637,7 @@ export default function App() {
                   variant="ghost"
                   size="sm"
                   disabled={
+                    !providerActionsReady ||
                     liveAdapters.length === 0 ||
                     loading ||
                     mutationBusy ||
@@ -646,7 +658,11 @@ export default function App() {
                   ref={addProviderButtonRef}
                   size="icon"
                   disabled={
-                    !adapter || loading || mutationBusy || liveBusy !== null
+                    !providerActionsReady ||
+                    !adapter ||
+                    loading ||
+                    mutationBusy ||
+                    liveBusy !== null
                   }
                   onClick={() => openEditor("new")}
                   className={`ml-2 ${addActionButtonClass}`}
@@ -692,9 +708,17 @@ export default function App() {
                 importLabel={
                   isClaude ? "Import user default" : "Import current"
                 }
-                disabled={!adapter || mutationBusy || liveBusy !== null}
+                disabled={
+                  !providerActionsReady ||
+                  !adapter ||
+                  mutationBusy ||
+                  liveBusy !== null
+                }
                 importDisabled={
-                  liveAdapters.length === 0 || mutationBusy || liveBusy !== null
+                  !providerActionsReady ||
+                  liveAdapters.length === 0 ||
+                  mutationBusy ||
+                  liveBusy !== null
                 }
                 busy={mutationBusy || liveBusy !== null}
                 importing={liveBusy === "import"}
