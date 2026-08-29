@@ -5,8 +5,8 @@ use std::{
 };
 
 use cc_switch_core::{
-    claude, claude_desktop, codex, common_config, gemini, grokbuild, hermes, openclaw, opencode,
-    pi, AppType, ProviderEntry,
+    builtin_app_adapter, claude, claude_desktop, codex, common_config, gemini, grokbuild, hermes,
+    openclaw, opencode, pi, AppType, ProviderEntry,
 };
 use json_five::rt::parser::{
     from_str as parse_round_trip_json5, JSONKeyValuePair, JSONObjectContext, JSONText, JSONValue,
@@ -104,28 +104,8 @@ impl NativeLiveConfig {
     }
 
     pub fn resolved_for_app(&self, app: AppType) -> Result<Self, LiveError> {
-        let targets: &[LogicalTarget] = match app {
-            AppType::Claude => &[LogicalTarget::ClaudeSettings],
-            AppType::Codex => &[
-                LogicalTarget::CodexAuth,
-                LogicalTarget::CodexConfig,
-                LogicalTarget::CodexModelCatalog,
-            ],
-            AppType::Gemini => &[LogicalTarget::GeminiEnv, LogicalTarget::GeminiSettings],
-            AppType::GrokBuild => &[LogicalTarget::GrokConfig],
-            AppType::OpenCode => &[LogicalTarget::OpenCodeConfig],
-            AppType::OpenClaw => &[LogicalTarget::OpenClawConfig],
-            AppType::ClaudeDesktop => &[
-                LogicalTarget::ClaudeDesktopNormalConfig,
-                LogicalTarget::ClaudeDesktopThreepConfig,
-                LogicalTarget::ClaudeDesktopProfile,
-                LogicalTarget::ClaudeDesktopMeta,
-            ],
-            AppType::Hermes => &[LogicalTarget::HermesConfig],
-            AppType::Pi => &[LogicalTarget::PiModels],
-        };
         let mut paths = self.paths.clone();
-        for target in targets {
+        for target in builtin_app_adapter(&app).targets() {
             paths = paths.resolved_for_write(*target)?;
         }
         Ok(Self { paths })
