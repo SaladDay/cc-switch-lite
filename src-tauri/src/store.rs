@@ -20,9 +20,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::provider::{
-    native_adapter_reference, validate_name, validate_settings, AdapterDescriptor,
-    AdapterReference, CurrentProvider, NativeImport, ProviderDraft, ProviderRecord, ProviderUpdate,
-    BUILTIN_PLUGIN_ID,
+    is_lite_writable, native_adapter_reference, validate_name, validate_settings,
+    AdapterDescriptor, AdapterReference, CurrentProvider, NativeImport, ProviderDraft,
+    ProviderRecord, ProviderUpdate, BUILTIN_PLUGIN_ID,
 };
 
 const SAFE_JS_INTEGER_MASK: u64 = (1_u64 << 53) - 1;
@@ -214,6 +214,76 @@ impl ProviderStore {
                 if changed != 1 {
                     return Err(StoreError::Conflict(id.to_owned()));
                 }
+            }
+            transaction.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = finalize {
+            if let Err(rollback_error) = rollback(receipt) {
+                return Err(StoreError::Recovery(format!(
+                    "database error: {error}; live recovery error: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(Ok(()))
+    }
+
+    pub fn remove_from_live_with_provider<T, E>(
+        &self,
+        app_id: &str,
+        id: &str,
+        expected_revision: u64,
+        action: impl FnOnce(&ProviderRecord) -> Result<T, E>,
+        rollback: impl FnOnce(T) -> Result<(), String>,
+    ) -> Result<Result<(), E>, StoreError> {
+        let app = parse_app(app_id)?;
+        if !app.is_additive_mode() {
+            return Err(StoreError::InvalidProvider(format!(
+                "application '{}' does not use additive provider configuration",
+                app.as_str()
+            )));
+        }
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let provider = self
+            .stored_provider(&transaction, &app, id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
+        ensure_revision(&provider.record, expected_revision)?;
+
+        let mut metadata = provider
+            .record
+            .metadata
+            .as_object()
+            .cloned()
+            .ok_or_else(|| {
+                StoreError::InvalidStore(format!("provider '{id}' metadata is not an object"))
+            })?;
+        if metadata.get("liveConfigManaged").and_then(Value::as_bool) == Some(false) {
+            transaction.commit()?;
+            return Ok(Ok(()));
+        }
+
+        let receipt = match action(&provider.record) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                transaction.rollback()?;
+                return Ok(Err(error));
+            }
+        };
+        metadata.insert("liveConfigManaged".to_owned(), Value::Bool(false));
+        let finalize = (|| -> Result<(), StoreError> {
+            let changed = transaction.execute(
+                "UPDATE providers SET meta = ?1 WHERE id = ?2 AND app_type = ?3",
+                params![
+                    serde_json::to_string(&Value::Object(metadata))
+                        .map_err(|error| StoreError::InvalidProvider(error.to_string()))?,
+                    id,
+                    app.as_str(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::Conflict(id.to_owned()));
             }
             transaction.commit()?;
             Ok(())
@@ -503,6 +573,24 @@ impl ProviderStore {
                         "provider '{id}' is owned by a different adapter"
                     )));
                 }
+                if !is_lite_writable(&current.record) {
+                    let unchanged_hermes_dictionary = app == AppType::Hermes
+                        && current
+                            .record
+                            .settings
+                            .get("_cc_source")
+                            .and_then(Value::as_str)
+                            == Some("providers_dict")
+                        && draft.settings.get("_cc_source").and_then(Value::as_str)
+                            == Some("providers_dict");
+                    if unchanged_hermes_dictionary {
+                        imported.push(current.record);
+                        continue;
+                    }
+                    return Err(StoreError::InvalidProvider(format!(
+                        "provider '{id}' is read-only in Lite"
+                    )));
+                }
                 let mut merged_metadata = current
                     .record
                     .metadata
@@ -659,16 +747,9 @@ impl ProviderStore {
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
         ensure_revision(&current.record, update.expected_revision)?;
-        if app == AppType::Hermes
-            && current
-                .record
-                .settings
-                .get("_cc_source")
-                .and_then(Value::as_str)
-                == Some("providers_dict")
-        {
+        if !is_lite_writable(&current.record) {
             return Err(StoreError::InvalidProvider(
-                "Hermes dictionary providers are read-only in Lite".to_owned(),
+                "this provider is read-only in Lite".to_owned(),
             ));
         }
         let (settings, compatibility_settings) = if current
@@ -761,6 +842,11 @@ impl ProviderStore {
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
         ensure_revision(&current.record, expected_revision)?;
+        if !is_lite_writable(&current.record) {
+            return Err(StoreError::InvalidProvider(
+                "this provider is read-only in Lite".to_owned(),
+            ));
+        }
         if current.is_current && !app.is_additive_mode() {
             return Err(StoreError::CurrentProvider(id.to_owned()));
         }
@@ -802,6 +888,11 @@ impl ProviderStore {
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
         ensure_revision(&current.record, expected_revision)?;
+        if !is_lite_writable(&current.record) {
+            return Err(StoreError::InvalidProvider(
+                "this provider is read-only in Lite".to_owned(),
+            ));
+        }
         let receipt = match action(&current.record) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -838,19 +929,65 @@ impl ProviderStore {
     }
 
     pub fn current(&self, app_id: &str) -> Result<Vec<CurrentProvider>, StoreError> {
+        self.current_from(app_id, None)
+    }
+
+    pub fn current_with_native_live_ids(
+        &self,
+        app_id: &str,
+        live_ids: &HashSet<String>,
+    ) -> Result<Vec<CurrentProvider>, StoreError> {
+        self.current_from(app_id, Some(live_ids))
+    }
+
+    fn current_from(
+        &self,
+        app_id: &str,
+        native_live_ids: Option<&HashSet<String>>,
+    ) -> Result<Vec<CurrentProvider>, StoreError> {
         let app = parse_app(app_id)?;
-        if app.is_additive_mode() {
-            return Ok(Vec::new());
-        }
         let mut connection = self.connect()?;
         let transaction = connection.transaction()?;
         let current = self
             .stored_providers(&transaction, Some(&app))?
             .into_iter()
-            .filter(|provider| provider.is_current)
+            .filter(|provider| {
+                if app.is_additive_mode() {
+                    if provider
+                        .record
+                        .adapter
+                        .same_identity(&native_adapter_reference(&app))
+                    {
+                        native_live_ids.is_some_and(|ids| {
+                            ids.contains(&provider.record.id)
+                                && provider
+                                    .record
+                                    .metadata
+                                    .get("liveConfigManaged")
+                                    .and_then(Value::as_bool)
+                                    != Some(false)
+                        }) || (native_live_ids.is_none()
+                            && provider
+                                .record
+                                .metadata
+                                .get("liveConfigManaged")
+                                .and_then(Value::as_bool)
+                                == Some(true))
+                    } else {
+                        provider
+                            .record
+                            .metadata
+                            .get("liveConfigManaged")
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                    }
+                } else {
+                    provider.is_current
+                }
+            })
             .map(|provider| CurrentProvider::from(&provider.record))
             .collect::<Vec<_>>();
-        if current.len() > 1 {
+        if !app.is_additive_mode() && current.len() > 1 {
             return Err(StoreError::InvalidStore(format!(
                 "application '{}' has more than one current provider",
                 app.as_str()
@@ -2197,6 +2334,86 @@ mod tests {
     }
 
     #[test]
+    fn native_import_does_not_overwrite_a_full_version_only_record() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cc-switch.db");
+        let store = ProviderStore::open(path.clone()).unwrap();
+        let app = AppType::OpenCode;
+        store
+            .import_native_batch_from(app.as_str(), || {
+                Ok::<_, StoreError>(vec![native_import(&app, "shared", "OMO", "original")])
+            })
+            .unwrap()
+            .unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE providers SET category = 'omo' WHERE id = 'shared' AND app_type = 'opencode'",
+                [],
+            )
+            .unwrap();
+
+        let result = store.import_native_batch_from(app.as_str(), || {
+            Ok::<_, StoreError>(vec![native_import(
+                &app,
+                "shared",
+                "Live provider",
+                "replacement",
+            )])
+        });
+
+        assert!(matches!(result, Err(StoreError::InvalidProvider(_))));
+        let unchanged = store.list(app.as_str()).unwrap().pop().unwrap();
+        assert_eq!(unchanged.settings["env"]["API_KEY"], "original");
+        assert_eq!(unchanged.category.as_deref(), Some("omo"));
+    }
+
+    #[test]
+    fn repeated_hermes_import_skips_dictionary_rows_and_updates_custom_rows() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let app = AppType::Hermes;
+        let import = |dictionary_secret: &str, custom_secret: &str| {
+            let mut dictionary = native_import(&app, "managed", "Managed", dictionary_secret);
+            dictionary.draft.settings.insert(
+                "_cc_source".to_owned(),
+                Value::String("providers_dict".to_owned()),
+            );
+            let mut custom = native_import(&app, "custom", "Custom", custom_secret);
+            custom.draft.settings.insert(
+                "_cc_source".to_owned(),
+                Value::String("custom_providers".to_owned()),
+            );
+            vec![dictionary, custom]
+        };
+
+        store
+            .import_native_batch_from(app.as_str(), || {
+                Ok::<_, StoreError>(import("managed-original", "custom-original"))
+            })
+            .unwrap()
+            .unwrap();
+        store
+            .import_native_batch_from(app.as_str(), || {
+                Ok::<_, StoreError>(import("managed-live-change", "custom-live-change"))
+            })
+            .unwrap()
+            .unwrap();
+
+        let providers = store.list(app.as_str()).unwrap();
+        let managed = providers
+            .iter()
+            .find(|provider| provider.id == "managed")
+            .unwrap();
+        let custom = providers
+            .iter()
+            .find(|provider| provider.id == "custom")
+            .unwrap();
+        assert_eq!(managed.settings["env"]["API_KEY"], "managed-original");
+        assert_eq!(custom.settings["env"]["API_KEY"], "custom-live-change");
+    }
+
+    #[test]
     fn switch_reads_common_config_from_the_same_database_transaction() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
@@ -2256,6 +2473,89 @@ mod tests {
         let updated = store.list("opencode").unwrap().pop().unwrap();
         assert_eq!(updated.metadata["keep"], true);
         assert_eq!(updated.metadata["liveConfigManaged"], true);
+        assert_eq!(store.current("opencode").unwrap()[0].id, provider.id);
+    }
+
+    #[test]
+    fn additive_current_state_can_follow_the_actual_native_live_ids() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cc-switch.db");
+        let store = ProviderStore::open(path.clone()).unwrap();
+        let provider = create_native(&store, &AppType::Pi, "Pi");
+        let live_ids = HashSet::from([provider.id.clone()]);
+        assert!(store
+            .current_with_native_live_ids("pi", &live_ids)
+            .unwrap()
+            .is_empty());
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE providers SET meta = '{}' WHERE id = ?1 AND app_type = 'pi'",
+                [&provider.id],
+            )
+            .unwrap();
+
+        assert!(store.current("pi").unwrap().is_empty());
+        assert_eq!(
+            store.current_with_native_live_ids("pi", &live_ids).unwrap()[0].id,
+            provider.id
+        );
+        assert!(store
+            .current_with_native_live_ids("pi", &HashSet::new())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn additive_live_removal_keeps_the_provider_and_updates_current_state() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let app = AppType::Pi;
+        let provider = store
+            .import_native_batch_from(app.as_str(), || {
+                Ok::<_, StoreError>(vec![native_import(&app, "custom", "Custom", "secret")])
+            })
+            .unwrap()
+            .unwrap()
+            .pop()
+            .unwrap();
+        let action_called = std::cell::Cell::new(false);
+
+        store
+            .remove_from_live_with_provider(
+                app.as_str(),
+                &provider.id,
+                provider.revision,
+                |_| {
+                    action_called.set(true);
+                    Ok::<_, &str>("receipt")
+                },
+                |_| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(action_called.get());
+        assert!(store.current(app.as_str()).unwrap().is_empty());
+        let preserved = store.list(app.as_str()).unwrap().pop().unwrap();
+        assert_eq!(preserved.id, provider.id);
+        assert_eq!(preserved.metadata["liveConfigManaged"], false);
+
+        action_called.set(false);
+        store
+            .remove_from_live_with_provider(
+                app.as_str(),
+                &preserved.id,
+                preserved.revision,
+                |_| {
+                    action_called.set(true);
+                    Ok::<_, &str>("receipt")
+                },
+                |_| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!action_called.get());
     }
 
     #[test]

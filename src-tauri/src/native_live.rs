@@ -783,6 +783,18 @@ impl NativeLiveConfig {
             "custom_providers",
             &serde_yaml::Value::Sequence(providers),
         )?;
+        let contents = match root.get("model").and_then(serde_yaml::Value::as_mapping) {
+            Some(model)
+                if model.get("provider").and_then(serde_yaml::Value::as_str)
+                    == Some(provider.id.as_str()) =>
+            {
+                let mut model = model.clone();
+                model.remove("provider");
+                model.remove("default");
+                replace_yaml_section(&contents, "model", &serde_yaml::Value::Mapping(model))?
+            }
+            _ => contents,
+        };
         self.plan(
             AppType::Hermes,
             vec![PlannedWrite {
@@ -2200,6 +2212,38 @@ mod tests {
         assert_eq!(parsed["model"]["provider"].as_str(), Some("new"));
         assert_eq!(parsed["model"]["default"].as_str(), Some("new-model"));
         assert_eq!(parsed["model"]["context_length"].as_i64(), Some(32000));
+    }
+
+    #[test]
+    fn hermes_removal_clears_a_model_reference_to_the_removed_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let native = NativeLiveConfig::for_tests(
+            directory.path(),
+            directory.path().join(".claude"),
+            directory.path().join(".codex"),
+        );
+        std::fs::create_dir_all(native.paths.hermes_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &native.paths.hermes_config,
+            "model:\n  provider: old\n  default: old-model\n  context_length: 32000\ncustom_providers:\n  - name: old\n    base_url: https://old.example.com\n    models:\n      old-model: {}\n  - name: keep\n    base_url: https://keep.example.com\n",
+        )
+        .unwrap();
+
+        let plan = native
+            .remove_plan(&provider(
+                AppType::Hermes,
+                "old",
+                json!({"base_url": "https://old.example.com"}),
+            ))
+            .expect("Hermes removal plan");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(plan.writes[0].contents.as_deref().unwrap()).unwrap();
+
+        assert!(parsed["model"].get("provider").is_none());
+        assert!(parsed["model"].get("default").is_none());
+        assert_eq!(parsed["model"]["context_length"].as_i64(), Some(32000));
+        assert_eq!(parsed["custom_providers"].as_sequence().unwrap().len(), 1);
+        assert_eq!(parsed["custom_providers"][0]["name"].as_str(), Some("keep"));
     }
 
     #[test]

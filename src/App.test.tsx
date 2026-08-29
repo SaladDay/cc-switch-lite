@@ -1,4 +1,10 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -18,7 +24,9 @@ const api = vi.hoisted(() => ({
   update: vi.fn(),
   delete: vi.fn(),
   importLive: vi.fn(),
+  importNative: vi.fn(),
   switch: vi.fn(),
+  removeFromLive: vi.fn(),
   currentProviders: vi.fn(),
 }));
 
@@ -140,6 +148,21 @@ function current(provider: ProviderRecord) {
   return { id: provider.id, revision: provider.revision };
 }
 
+function nativeAdapter(appId: string): AdapterDescriptor {
+  return {
+    appId,
+    displayName: "Native configuration",
+    reference: {
+      pluginId: "org.cc-switch.builtin",
+      pluginVersion: "0.1.0",
+      adapterId: `builtin.${appId}.native`,
+      contractMajor: 1,
+      schemaVersion: 1,
+    },
+    fields: [],
+  };
+}
+
 describe("App", () => {
   beforeEach(() => {
     window.localStorage.clear();
@@ -159,7 +182,9 @@ describe("App", () => {
     ]);
     api.list.mockResolvedValue([]);
     api.delete.mockResolvedValue(undefined);
+    api.importNative.mockResolvedValue([]);
     api.switch.mockResolvedValue(undefined);
+    api.removeFromLive.mockResolvedValue(undefined);
     api.currentProviders.mockResolvedValue([]);
     for (const mock of Object.values(pluginApi)) mock.mockReset();
     pluginApi.listRegistries.mockResolvedValue([]);
@@ -303,6 +328,23 @@ describe("App", () => {
       }),
     );
     expect(screen.getByRole("heading", { name: "Work" })).toBeVisible();
+  });
+
+  it("offers full native configuration alongside the Claude simple form", async () => {
+    const user = userEvent.setup();
+    const native = nativeAdapter("claude");
+    api.listAdapters.mockResolvedValue([native, ...adapters]);
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Add Claude Code provider" }),
+    );
+    const adapterSelect = screen.getByLabelText("Adapter");
+    expect(adapterSelect).toHaveValue("0");
+    expect(screen.getByLabelText("API key")).toBeVisible();
+
+    await user.selectOptions(adapterSelect, "1");
+    expect(screen.getByLabelText("Configuration JSON")).toBeVisible();
   });
 
   it("creates a provider with an installed plugin adapter", async () => {
@@ -746,6 +788,196 @@ describe("App", () => {
     expect(document.body).not.toHaveTextContent("token");
   });
 
+  it("imports the complete native provider batch", async () => {
+    const user = userEvent.setup();
+    const native = nativeAdapter("claude");
+    const imported = {
+      ...workProvider,
+      adapter: native.reference,
+    };
+    api.listAdapters.mockResolvedValue([native, ...adapters]);
+    api.importNative.mockResolvedValue([imported]);
+    api.list.mockResolvedValueOnce([]).mockResolvedValue([imported]);
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Import Claude Code user configuration",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(api.importNative).toHaveBeenCalledWith("claude"),
+    );
+    expect(api.importLive).not.toHaveBeenCalled();
+    expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
+  });
+
+  it("creates native configuration for an application without a legacy form", async () => {
+    const user = userEvent.setup();
+    const native = nativeAdapter("gemini");
+    api.supportedApps.mockResolvedValue(["gemini"]);
+    api.listAdapters.mockResolvedValue([native]);
+    api.create.mockImplementation((draft) =>
+      Promise.resolve({ ...draft, id: "gemini-new", revision: 1 }),
+    );
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Add Gemini CLI provider" }),
+    );
+    await user.type(screen.getByLabelText("Provider name"), "Gemini Work");
+    fireEvent.change(screen.getByLabelText("Configuration JSON"), {
+      target: {
+        value: JSON.stringify({
+          env: { GEMINI_API_KEY: "secret" },
+          config: { model: { name: "gemini-test" } },
+        }),
+      },
+    });
+    await user.click(screen.getByRole("button", { name: "Save provider" }));
+
+    await waitFor(() =>
+      expect(api.create).toHaveBeenCalledWith({
+        appId: "gemini",
+        adapter: native.reference,
+        name: "Gemini Work",
+        settings: {
+          env: { GEMINI_API_KEY: "secret" },
+          config: { model: { name: "gemini-test" } },
+        },
+      }),
+    );
+  });
+
+  it("adds and removes an additive native provider without deleting it", async () => {
+    const user = userEvent.setup();
+    const native = nativeAdapter("pi");
+    const provider: ProviderRecord = {
+      ...workProvider,
+      id: "pi-provider",
+      appId: "pi",
+      adapter: native.reference,
+      name: "Pi Work",
+      settings: { baseURL: "https://pi.example.com/v1" },
+    };
+    api.supportedApps.mockResolvedValue(["pi"]);
+    api.listAdapters.mockResolvedValue([native]);
+    api.list.mockResolvedValue([provider]);
+    let inConfig = false;
+    api.currentProviders.mockImplementation((appId: string) =>
+      Promise.resolve(appId === "pi" && inConfig ? [current(provider)] : []),
+    );
+    api.switch.mockImplementation(() => {
+      inConfig = true;
+      return Promise.resolve();
+    });
+    api.removeFromLive.mockImplementation(() => {
+      inConfig = false;
+      return Promise.resolve();
+    });
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Add Pi Work to configuration",
+      }),
+    );
+    await waitFor(() =>
+      expect(api.switch).toHaveBeenCalledWith("pi", "pi-provider", 1),
+    );
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Remove Pi Work from configuration",
+      }),
+    );
+    await waitFor(() =>
+      expect(api.removeFromLive).toHaveBeenCalledWith("pi", "pi-provider", 1),
+    );
+    expect(api.delete).not.toHaveBeenCalled();
+  });
+
+  it("keeps Hermes dictionary providers visibly read-only", async () => {
+    const native = nativeAdapter("hermes");
+    const provider: ProviderRecord = {
+      ...workProvider,
+      id: "managed",
+      appId: "hermes",
+      adapter: native.reference,
+      name: "Managed",
+      settings: {
+        _cc_source: "providers_dict",
+        base_url: "https://hermes.example.com",
+      },
+    };
+    api.supportedApps.mockResolvedValue(["hermes"]);
+    api.listAdapters.mockResolvedValue([native]);
+    api.list.mockResolvedValue([provider]);
+    api.currentProviders.mockResolvedValue([current(provider)]);
+    render(<App />);
+
+    expect(await screen.findByText("Hermes managed")).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Managed: Hermes managed" }),
+    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Edit Managed" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Delete Managed" }),
+    ).toBeDisabled();
+  });
+
+  it("keeps full-version-only native providers visible and read-only", async () => {
+    const native = nativeAdapter("opencode");
+    const provider: ProviderRecord = {
+      ...workProvider,
+      id: "omo",
+      appId: "opencode",
+      adapter: native.reference,
+      name: "Oh My OpenCode",
+      settings: { npm: "special" },
+      liteConfigWritable: false,
+    };
+    api.supportedApps.mockResolvedValue(["opencode"]);
+    api.listAdapters.mockResolvedValue([native]);
+    api.list.mockResolvedValue([provider]);
+    render(<App />);
+
+    expect(await screen.findByText("Not supported in Lite")).toBeVisible();
+    expect(
+      screen.getByRole("button", {
+        name: "Oh My OpenCode: Not supported in Lite",
+      }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Edit Oh My OpenCode" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Delete Oh My OpenCode" }),
+    ).toBeDisabled();
+  });
+
+  it("shows settings for all core applications and persists visibility", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Open settings" }),
+    );
+    const settings = screen.getByRole("dialog", { name: "Settings" });
+    const pi = within(settings).getByRole("button", { name: "Pi" });
+    expect(
+      within(settings).getByRole("button", { name: "Claude Desktop" }),
+    ).toBeVisible();
+    expect(pi).toHaveAttribute("aria-pressed", "true");
+
+    await user.click(pi);
+    expect(pi).toHaveAttribute("aria-pressed", "false");
+    expect(
+      window.localStorage.getItem("cc-switch-lite:visible-apps"),
+    ).toContain('"pi":false');
+  });
+
   it("keeps the dialog fallback modal and closes it with Escape", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -782,7 +1014,10 @@ describe("App", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "Use dark theme" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Open settings" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Dark" }));
 
     expect(document.documentElement).toHaveClass("dark");
     expect(window.localStorage.getItem("cc-switch-lite:theme")).toBe("dark");

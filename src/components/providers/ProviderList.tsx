@@ -19,6 +19,7 @@ interface ProviderListProps {
   onCreate: () => void;
   onImport: () => void;
   onSwitch: (provider: ProviderRecord) => void;
+  onRemove: (provider: ProviderRecord) => void;
   onEdit: (provider: ProviderRecord) => void;
   onDelete: (provider: ProviderRecord) => void;
   setDeleteButtonRef: (
@@ -42,6 +43,7 @@ export function ProviderList({
   onCreate,
   onImport,
   onSwitch,
+  onRemove,
   onEdit,
   onDelete,
   setDeleteButtonRef,
@@ -96,6 +98,7 @@ export function ProviderList({
               setDeleteButtonRef(item.provider.id, element)
             }
             onSwitch={onSwitch}
+            onRemove={onRemove}
             onEdit={onEdit}
             onDelete={onDelete}
           />

@@ -38,6 +38,78 @@ function OpenAiIcon() {
   );
 }
 
+function GeminiIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="1em" height="1em" aria-hidden="true">
+      <path
+        fill="#3186FF"
+        d="M20.616 10.835a14.147 14.147 0 0 1-4.45-3.001 14.111 14.111 0 0 1-3.678-6.452.503.503 0 0 0-.975 0 14.134 14.134 0 0 1-3.679 6.452 14.155 14.155 0 0 1-4.45 3.001c-.65.28-1.318.505-2.002.678a.502.502 0 0 0 0 .975c.684.172 1.35.397 2.002.677a14.147 14.147 0 0 1 4.45 3.001 14.112 14.112 0 0 1 3.679 6.453.502.502 0 0 0 .975 0c.172-.685.397-1.351.677-2.003a14.145 14.145 0 0 1 3.001-4.45 14.113 14.113 0 0 1 6.453-3.678.503.503 0 0 0 0-.975 13.245 13.245 0 0 1-2.003-.678Z"
+      />
+    </svg>
+  );
+}
+
+function GrokIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width="1em"
+      height="1em"
+      fill="currentColor"
+      aria-hidden="true"
+    >
+      <path d="m9.27 15.29 7.978-5.897c.391-.29.95-.177 1.137.272.98 2.369.542 5.215-1.41 7.169-1.951 1.954-4.667 2.382-7.149 1.406l-2.711 1.257c3.889 2.661 8.611 2.003 11.562-.953 2.341-2.344 3.066-5.539 2.388-8.42l.006.007c-.983-4.232.242-5.924 2.75-9.383L24 .5l-3.301 3.305v-.01L9.267 15.292M7.623 16.723c-2.792-2.67-2.31-6.801.071-9.184 1.761-1.763 4.647-2.483 7.166-1.425l2.705-1.25a7.808 7.808 0 0 0-1.829-1A8.975 8.975 0 0 0 5.984 5.83c-2.533 2.536-3.33 6.436-1.962 9.764 1.022 2.487-.653 4.246-2.34 6.022-.599.63-1.199 1.259-1.682 1.925l7.62-6.815" />
+    </svg>
+  );
+}
+
+function OpenCodeIcon() {
+  return (
+    <svg viewBox="0 0 240 300" width="1em" height="1em" aria-hidden="true">
+      <path d="M180 240H60V120h120v120Z" fill="#CFCECD" />
+      <path
+        d="M180 60H60v180h120V60Zm60 240H0V0h240v300Z"
+        fill="currentColor"
+      />
+    </svg>
+  );
+}
+
+function OpenClawIcon() {
+  return (
+    <svg viewBox="0 0 120 120" width="1em" height="1em" aria-hidden="true">
+      <defs>
+        <linearGradient
+          id="openclaw-gradient"
+          x1="0%"
+          y1="0%"
+          x2="100%"
+          y2="100%"
+        >
+          <stop offset="0%" stopColor="#ff4d4d" />
+          <stop offset="100%" stopColor="#991b1b" />
+        </linearGradient>
+      </defs>
+      <path
+        d="M60 10C30 10 15 35 15 55s15 40 30 45v10h10v-10s5 2 10 0v10h10v-10c15-5 30-25 30-45s-15-45-45-45Z"
+        fill="url(#openclaw-gradient)"
+      />
+      <path
+        d="M20 45C5 40 0 50 5 60s15 5 20-5c3-7 0-10-5-10Z"
+        fill="url(#openclaw-gradient)"
+      />
+      <path
+        d="M100 45c15-5 20 5 15 15s-15 5-20-5c-3-7 0-10 5-10Z"
+        fill="url(#openclaw-gradient)"
+      />
+      <circle cx="45" cy="35" r="6" fill="#050810" />
+      <circle cx="75" cy="35" r="6" fill="#050810" />
+      <circle cx="46" cy="34" r="2.5" fill="#00e5cc" />
+      <circle cx="76" cy="34" r="2.5" fill="#00e5cc" />
+    </svg>
+  );
+}
+
 export function ProviderIcon({
   icon,
   name,
@@ -56,9 +128,25 @@ export function ProviderIcon({
     };
   }, [size]);
 
-  if (icon === "claude" || icon === "openai") {
+  const appIcon =
+    icon === "claude" ? (
+      <ClaudeIcon />
+    ) : icon === "openai" ? (
+      <OpenAiIcon />
+    ) : icon === "gemini" ? (
+      <GeminiIcon />
+    ) : icon === "grok" ? (
+      <GrokIcon />
+    ) : icon === "opencode" ? (
+      <OpenCodeIcon />
+    ) : icon === "openclaw" ? (
+      <OpenClawIcon />
+    ) : null;
+
+  if (appIcon) {
     return (
       <span
+        aria-hidden="true"
         className={cn(
           "inline-flex flex-shrink-0 items-center justify-center",
           className,
@@ -66,7 +154,7 @@ export function ProviderIcon({
         title={name}
         style={{ ...sizeStyle, color }}
       >
-        {icon === "claude" ? <ClaudeIcon /> : <OpenAiIcon />}
+        {appIcon}
       </span>
     );
   }
@@ -81,6 +169,7 @@ export function ProviderIcon({
 
   return (
     <span
+      aria-hidden="true"
       className={cn(
         "inline-flex flex-shrink-0 items-center justify-center rounded-lg",
         "bg-muted font-semibold text-muted-foreground",

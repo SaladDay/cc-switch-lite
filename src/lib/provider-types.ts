@@ -28,6 +28,7 @@ export interface ProviderRecord {
   adapter: AdapterReference;
   name: string;
   settings: Record<string, JsonValue>;
+  liteConfigWritable?: boolean;
 }
 
 export interface CurrentProvider {
