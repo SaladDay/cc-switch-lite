@@ -12,21 +12,44 @@ use thiserror::Error;
 use toml_edit::DocumentMut;
 
 pub const OPERATION_CONTRACT_MAJOR: u32 = 1;
-const MAX_OPERATIONS: usize = 3;
+const MAX_OPERATIONS: usize = 4;
 const MAX_CONTENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LogicalTarget {
     ClaudeSettings,
+    ClaudeDesktopNormalConfig,
+    ClaudeDesktopThreepConfig,
+    ClaudeDesktopProfile,
+    ClaudeDesktopMeta,
+    CodexAuth,
     CodexConfig,
+    CodexModelCatalog,
+    GeminiEnv,
+    GeminiSettings,
+    GrokConfig,
+    OpenCodeConfig,
+    OpenClawConfig,
+    HermesConfig,
+    PiModels,
 }
 
 impl LogicalTarget {
     pub(crate) fn app_id(self) -> &'static str {
         match self {
             Self::ClaudeSettings => "claude",
-            Self::CodexConfig => "codex",
+            Self::ClaudeDesktopNormalConfig
+            | Self::ClaudeDesktopThreepConfig
+            | Self::ClaudeDesktopProfile
+            | Self::ClaudeDesktopMeta => "claude-desktop",
+            Self::CodexAuth | Self::CodexConfig | Self::CodexModelCatalog => "codex",
+            Self::GeminiEnv | Self::GeminiSettings => "gemini",
+            Self::GrokConfig => "grokbuild",
+            Self::OpenCodeConfig => "opencode",
+            Self::OpenClawConfig => "openclaw",
+            Self::HermesConfig => "hermes",
+            Self::PiModels => "pi",
         }
     }
 }
@@ -91,7 +114,7 @@ impl ContentExpectation {
 pub struct PlannedWrite {
     pub target: LogicalTarget,
     pub expected: ContentExpectation,
-    pub contents: String,
+    pub contents: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,15 +128,40 @@ pub struct OperationPlan {
 #[derive(Debug, Clone)]
 pub struct LivePaths {
     pub claude_settings: PathBuf,
+    pub claude_desktop_normal_config: PathBuf,
+    pub claude_desktop_threep_config: PathBuf,
+    pub claude_desktop_profile: PathBuf,
+    pub claude_desktop_meta: PathBuf,
     pub codex_auth: PathBuf,
     pub codex_config: PathBuf,
+    pub codex_model_catalog: PathBuf,
+    pub gemini_env: PathBuf,
+    pub gemini_settings: PathBuf,
+    pub grok_config: PathBuf,
+    pub opencode_config: PathBuf,
+    pub openclaw_config: PathBuf,
+    pub hermes_config: PathBuf,
+    pub pi_models: PathBuf,
 }
 
 impl LivePaths {
-    fn path_for(&self, target: LogicalTarget) -> &Path {
+    pub(crate) fn path_for(&self, target: LogicalTarget) -> &Path {
         match target {
             LogicalTarget::ClaudeSettings => &self.claude_settings,
+            LogicalTarget::ClaudeDesktopNormalConfig => &self.claude_desktop_normal_config,
+            LogicalTarget::ClaudeDesktopThreepConfig => &self.claude_desktop_threep_config,
+            LogicalTarget::ClaudeDesktopProfile => &self.claude_desktop_profile,
+            LogicalTarget::ClaudeDesktopMeta => &self.claude_desktop_meta,
+            LogicalTarget::CodexAuth => &self.codex_auth,
             LogicalTarget::CodexConfig => &self.codex_config,
+            LogicalTarget::CodexModelCatalog => &self.codex_model_catalog,
+            LogicalTarget::GeminiEnv => &self.gemini_env,
+            LogicalTarget::GeminiSettings => &self.gemini_settings,
+            LogicalTarget::GrokConfig => &self.grok_config,
+            LogicalTarget::OpenCodeConfig => &self.opencode_config,
+            LogicalTarget::OpenClawConfig => &self.openclaw_config,
+            LogicalTarget::HermesConfig => &self.hermes_config,
+            LogicalTarget::PiModels => &self.pi_models,
         }
     }
 
@@ -122,7 +170,24 @@ impl LivePaths {
         let path = resolve_write_path(self.path_for(target))?;
         match target {
             LogicalTarget::ClaudeSettings => resolved.claude_settings = path,
+            LogicalTarget::ClaudeDesktopNormalConfig => {
+                resolved.claude_desktop_normal_config = path
+            }
+            LogicalTarget::ClaudeDesktopThreepConfig => {
+                resolved.claude_desktop_threep_config = path
+            }
+            LogicalTarget::ClaudeDesktopProfile => resolved.claude_desktop_profile = path,
+            LogicalTarget::ClaudeDesktopMeta => resolved.claude_desktop_meta = path,
+            LogicalTarget::CodexAuth => resolved.codex_auth = path,
             LogicalTarget::CodexConfig => resolved.codex_config = path,
+            LogicalTarget::CodexModelCatalog => resolved.codex_model_catalog = path,
+            LogicalTarget::GeminiEnv => resolved.gemini_env = path,
+            LogicalTarget::GeminiSettings => resolved.gemini_settings = path,
+            LogicalTarget::GrokConfig => resolved.grok_config = path,
+            LogicalTarget::OpenCodeConfig => resolved.opencode_config = path,
+            LogicalTarget::OpenClawConfig => resolved.openclaw_config = path,
+            LogicalTarget::HermesConfig => resolved.hermes_config = path,
+            LogicalTarget::PiModels => resolved.pi_models = path,
         }
         Ok(resolved)
     }
@@ -177,7 +242,7 @@ struct AppliedWrite {
     target: LogicalTarget,
     path: PathBuf,
     original: Option<Vec<u8>>,
-    written: Vec<u8>,
+    written: Option<Vec<u8>>,
 }
 
 pub(crate) struct OperationReceipt {
@@ -238,17 +303,34 @@ impl<'a> OperationExecutor<'a> {
                 return Err(self.failure_after_rollback(OperationError::Conflict, &applied));
             }
 
-            if let Err(error) = atomic_write(
-                &prepared_write.path,
-                prepared_write.write.contents.as_bytes(),
-            ) {
-                return Err(self.failure_after_rollback(OperationError::File(error), &applied));
-            }
+            let written = match &prepared_write.write.contents {
+                Some(contents) => {
+                    if let Err(error) = atomic_write(&prepared_write.path, contents.as_bytes()) {
+                        return Err(
+                            self.failure_after_rollback(OperationError::File(error), &applied)
+                        );
+                    }
+                    Some(contents.as_bytes().to_vec())
+                }
+                None => match fs::remove_file(&prepared_write.path) {
+                    Ok(()) => None,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(source) => {
+                        return Err(self.failure_after_rollback(
+                            OperationError::Io {
+                                path: prepared_write.path.clone(),
+                                source,
+                            },
+                            &applied,
+                        ));
+                    }
+                },
+            };
             applied.push(AppliedWrite {
                 target: prepared_write.write.target,
                 path: prepared_write.path,
                 original: prepared_write.original,
-                written: prepared_write.write.contents.as_bytes().to_vec(),
+                written,
             });
         }
         Ok(OperationReceipt { applied })
@@ -261,7 +343,7 @@ impl<'a> OperationExecutor<'a> {
                 plan.contract_major
             )));
         }
-        if !matches!(plan.app_id.as_str(), "claude" | "codex") {
+        if !cc_switch_core::AppType::all().any(|app| app.as_str() == plan.app_id) {
             return Err(OperationError::InvalidPlan(
                 "application is not available in Lite".to_owned(),
             ));
@@ -284,7 +366,11 @@ impl<'a> OperationExecutor<'a> {
                     "a logical target appears more than once".to_owned(),
                 ));
             }
-            if write.contents.len() > MAX_CONTENT_BYTES {
+            if write
+                .contents
+                .as_ref()
+                .is_some_and(|contents| contents.len() > MAX_CONTENT_BYTES)
+            {
                 return Err(OperationError::InvalidPlan(format!(
                     "a write exceeds the {MAX_CONTENT_BYTES} byte limit"
                 )));
@@ -300,7 +386,7 @@ impl<'a> OperationExecutor<'a> {
                     ));
                 }
             }
-            validate_contents(write.target, &write.contents)?;
+            validate_contents(write.target, write.contents.as_deref())?;
         }
         Ok(())
     }
@@ -329,7 +415,7 @@ fn rollback_applied(applied: &[AppliedWrite]) -> Result<(), OperationError> {
                 continue;
             }
         };
-        if current.as_deref() != Some(applied_write.written.as_slice()) {
+        if current.as_deref() != applied_write.written.as_deref() {
             failures.push(format!(
                 "{:?} changed after Lite wrote it; external contents were preserved",
                 applied_write.target
@@ -362,17 +448,7 @@ fn rollback_applied(applied: &[AppliedWrite]) -> Result<(), OperationError> {
 }
 
 pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, OperationError> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(OperationError::Io {
-                path: path.to_owned(),
-                source,
-            });
-        }
-    };
-    read_opened(path, file, MAX_CONTENT_BYTES)
+    read_optional_no_follow(path, MAX_CONTENT_BYTES)
 }
 
 pub fn read_optional_no_follow(
@@ -523,9 +599,33 @@ fn canonicalize_missing_path(path: &Path) -> Result<PathBuf, OperationError> {
     }
 }
 
-fn validate_contents(target: LogicalTarget, contents: &str) -> Result<(), OperationError> {
+fn validate_contents(target: LogicalTarget, contents: Option<&str>) -> Result<(), OperationError> {
+    let Some(contents) = contents else {
+        return if matches!(
+            target,
+            LogicalTarget::ClaudeDesktopProfile
+                | LogicalTarget::CodexAuth
+                | LogicalTarget::CodexModelCatalog
+        ) {
+            Ok(())
+        } else {
+            Err(OperationError::InvalidPlan(
+                "only Lite-managed authentication, profile, or catalog files may be removed"
+                    .to_owned(),
+            ))
+        };
+    };
     match target {
-        LogicalTarget::ClaudeSettings => {
+        LogicalTarget::ClaudeSettings
+        | LogicalTarget::ClaudeDesktopNormalConfig
+        | LogicalTarget::ClaudeDesktopThreepConfig
+        | LogicalTarget::ClaudeDesktopProfile
+        | LogicalTarget::ClaudeDesktopMeta
+        | LogicalTarget::CodexAuth
+        | LogicalTarget::CodexModelCatalog
+        | LogicalTarget::GeminiSettings
+        | LogicalTarget::OpenCodeConfig
+        | LogicalTarget::PiModels => {
             let value: serde_json::Value = serde_json::from_str(contents).map_err(|error| {
                 OperationError::InvalidPlan(format!("JSON write is invalid: {error}"))
             })?;
@@ -535,10 +635,78 @@ fn validate_contents(target: LogicalTarget, contents: &str) -> Result<(), Operat
                 ));
             }
         }
-        LogicalTarget::CodexConfig => {
+        LogicalTarget::CodexConfig | LogicalTarget::GrokConfig => {
             contents
                 .parse::<DocumentMut>()
                 .map_err(|_| OperationError::InvalidPlan("TOML write is invalid".to_owned()))?;
+        }
+        LogicalTarget::OpenClawConfig => {
+            let value: serde_json::Value = json5::from_str(contents)
+                .map_err(|_| OperationError::InvalidPlan("JSON5 write is invalid".to_owned()))?;
+            if !value.is_object() {
+                return Err(OperationError::InvalidPlan(
+                    "JSON5 write must contain an object".to_owned(),
+                ));
+            }
+        }
+        LogicalTarget::GeminiEnv => validate_env_contents(contents)?,
+        LogicalTarget::HermesConfig => {
+            if duplicate_yaml_top_level_key(contents).is_some() {
+                return Err(OperationError::InvalidPlan(
+                    "YAML write contains a duplicate top-level key".to_owned(),
+                ));
+            }
+            serde_yaml::from_str::<serde_yaml::Value>(contents)
+                .map_err(|_| OperationError::InvalidPlan("YAML write is invalid".to_owned()))?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn duplicate_yaml_top_level_key(raw: &str) -> Option<String> {
+    let mut seen = HashSet::new();
+    for line in raw.split('\n') {
+        if yaml_top_level_key_line(line) {
+            if let Some(colon) = line.find(':') {
+                let key = line[..colon].trim();
+                if !seen.insert(key) {
+                    return Some(key.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn yaml_top_level_key_line(line: &str) -> bool {
+    if line.is_empty() || line.starts_with([' ', '\t', '#', '-']) {
+        return false;
+    }
+    line.find(':').is_some_and(|colon| {
+        let suffix = &line[colon + 1..];
+        suffix.is_empty() || suffix.starts_with([' ', '\t', '\r'])
+    })
+}
+
+fn validate_env_contents(contents: &str) -> Result<(), OperationError> {
+    for line in contents.lines() {
+        if line.is_empty() {
+            return Err(OperationError::InvalidPlan(
+                "environment write contains an empty line".to_owned(),
+            ));
+        }
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            OperationError::InvalidPlan("environment write is malformed".to_owned())
+        })?;
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            || value.contains(['\r', '\n', '\0'])
+        {
+            return Err(OperationError::InvalidPlan(
+                "environment write contains an unsafe key or value".to_owned(),
+            ));
         }
     }
     Ok(())
@@ -556,8 +724,20 @@ mod tests {
     fn paths(directory: &Path) -> LivePaths {
         LivePaths {
             claude_settings: directory.join(".claude/settings.json"),
+            claude_desktop_normal_config: directory.join("Claude/claude_desktop_config.json"),
+            claude_desktop_threep_config: directory.join("Claude-3p/claude_desktop_config.json"),
+            claude_desktop_profile: directory.join("Claude-3p/configLibrary/profile.json"),
+            claude_desktop_meta: directory.join("Claude-3p/configLibrary/_meta.json"),
             codex_auth: directory.join(".codex/auth.json"),
             codex_config: directory.join(".codex/config.toml"),
+            codex_model_catalog: directory.join(".codex/cc-switch-model-catalog.json"),
+            gemini_env: directory.join(".gemini/.env"),
+            gemini_settings: directory.join(".gemini/settings.json"),
+            grok_config: directory.join(".grok/config.toml"),
+            opencode_config: directory.join(".config/opencode/opencode.json"),
+            openclaw_config: directory.join(".openclaw/openclaw.json"),
+            hermes_config: directory.join(".hermes/config.yaml"),
+            pi_models: directory.join(".pi/agent/models.json"),
         }
     }
 
@@ -571,7 +751,7 @@ mod tests {
             writes: vec![PlannedWrite {
                 target: LogicalTarget::CodexConfig,
                 expected: ContentExpectation::Missing,
-                contents: "model = \"gpt-5\"\n".to_owned(),
+                contents: Some("model = \"gpt-5\"\n".to_owned()),
             }],
         };
 
@@ -593,7 +773,7 @@ mod tests {
             writes: vec![PlannedWrite {
                 target: LogicalTarget::ClaudeSettings,
                 expected: ContentExpectation::Missing,
-                contents: "{\"env\":{}}\n".to_owned(),
+                contents: Some("{\"env\":{}}\n".to_owned()),
             }],
         };
 
@@ -614,7 +794,7 @@ mod tests {
             writes: vec![PlannedWrite {
                 target: LogicalTarget::ClaudeSettings,
                 expected: ContentExpectation::Missing,
-                contents: contents.to_owned(),
+                contents: Some(contents.to_owned()),
             }],
         };
 
@@ -656,7 +836,7 @@ mod tests {
             writes: vec![PlannedWrite {
                 target: LogicalTarget::ClaudeSettings,
                 expected: ContentExpectation::for_contents(Some(b"{}\n")),
-                contents: "{\"env\":{}}\n".to_owned(),
+                contents: Some("{\"env\":{}}\n".to_owned()),
             }],
         };
 
@@ -700,13 +880,108 @@ mod tests {
             target: LogicalTarget::ClaudeSettings,
             path: paths.claude_settings.clone(),
             original: Some(b"original".to_vec()),
-            written: b"lite".to_vec(),
+            written: Some(b"lite".to_vec()),
         };
 
         let result = rollback_applied(&[applied]);
 
         assert!(matches!(result, Err(OperationError::Rollback(_))));
         assert_eq!(fs::read(paths.claude_settings).unwrap(), b"external");
+    }
+
+    #[test]
+    fn managed_profile_deletion_is_recoverable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = paths(directory.path());
+        fs::create_dir_all(paths.claude_desktop_profile.parent().unwrap()).unwrap();
+        fs::write(&paths.claude_desktop_profile, b"{}\n").unwrap();
+        let plan = OperationPlan {
+            contract_major: OPERATION_CONTRACT_MAJOR,
+            app_id: "claude-desktop".to_owned(),
+            writes: vec![PlannedWrite {
+                target: LogicalTarget::ClaudeDesktopProfile,
+                expected: ContentExpectation::for_contents(Some(b"{}\n")),
+                contents: None,
+            }],
+        };
+
+        let receipt = OperationExecutor::new(&paths)
+            .execute_recoverable(&plan)
+            .expect("delete profile");
+        assert!(!paths.claude_desktop_profile.exists());
+
+        receipt.rollback().expect("restore profile");
+        assert_eq!(fs::read(&paths.claude_desktop_profile).unwrap(), b"{}\n");
+    }
+
+    #[test]
+    fn managed_codex_catalog_deletion_is_recoverable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = paths(directory.path());
+        fs::create_dir_all(paths.codex_model_catalog.parent().unwrap()).unwrap();
+        fs::write(&paths.codex_model_catalog, b"{\"models\":[]}\n").unwrap();
+        let plan = OperationPlan {
+            contract_major: OPERATION_CONTRACT_MAJOR,
+            app_id: "codex".to_owned(),
+            writes: vec![PlannedWrite {
+                target: LogicalTarget::CodexModelCatalog,
+                expected: ContentExpectation::for_contents(Some(b"{\"models\":[]}\n")),
+                contents: None,
+            }],
+        };
+
+        let receipt = OperationExecutor::new(&paths)
+            .execute_recoverable(&plan)
+            .expect("delete model catalog");
+        assert!(!paths.codex_model_catalog.exists());
+
+        receipt.rollback().expect("restore model catalog");
+        assert_eq!(
+            fs::read(&paths.codex_model_catalog).unwrap(),
+            b"{\"models\":[]}\n"
+        );
+    }
+
+    #[test]
+    fn hermes_write_rejects_duplicate_top_level_sections() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = paths(directory.path());
+        let plan = OperationPlan {
+            contract_major: OPERATION_CONTRACT_MAJOR,
+            app_id: "hermes".to_owned(),
+            writes: vec![PlannedWrite {
+                target: LogicalTarget::HermesConfig,
+                expected: ContentExpectation::Missing,
+                contents: Some(
+                    "custom_providers: []\ncustom_providers:\n  - name: duplicate\n".to_owned(),
+                ),
+            }],
+        };
+
+        assert!(matches!(
+            OperationExecutor::new(&paths).execute(&plan),
+            Err(OperationError::InvalidPlan(_))
+        ));
+    }
+
+    #[test]
+    fn arbitrary_targets_cannot_be_deleted() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = paths(directory.path());
+        let plan = OperationPlan {
+            contract_major: OPERATION_CONTRACT_MAJOR,
+            app_id: "pi".to_owned(),
+            writes: vec![PlannedWrite {
+                target: LogicalTarget::PiModels,
+                expected: ContentExpectation::Missing,
+                contents: None,
+            }],
+        };
+
+        assert!(matches!(
+            OperationExecutor::new(&paths).execute(&plan),
+            Err(OperationError::InvalidPlan(_))
+        ));
     }
 
     #[cfg(unix)]
@@ -727,7 +1002,7 @@ mod tests {
             writes: vec![PlannedWrite {
                 target: LogicalTarget::ClaudeSettings,
                 expected: ContentExpectation::for_contents(Some(b"{}\n")),
-                contents: "{\"env\":{}}\n".to_owned(),
+                contents: Some("{\"env\":{}}\n".to_owned()),
             }],
         };
 
