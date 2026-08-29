@@ -146,7 +146,10 @@ impl NativeLiveConfig {
             .app_id
             .parse::<AppType>()
             .map_err(|_| LiveError::InvalidProvider("application is not supported".to_owned()))?;
-        let documents = self.observed_documents(&app)?;
+        let access = writable_native_access(provider)?;
+        if app == AppType::ClaudeDesktop {
+            ensure_claude_desktop_supported()?;
+        }
         let snapshot = ProviderSnapshot::new(
             &provider.id,
             app.clone(),
@@ -154,11 +157,6 @@ impl NativeLiveConfig {
             Value::Object(provider.settings.clone()),
         );
         let mode = native_provider_mode(&app, provider);
-        let access = if is_lite_writable(provider) {
-            NativeProviderAccess::Writable
-        } else {
-            NativeProviderAccess::ReadOnly
-        };
         let common_config = (provider
             .metadata
             .get("commonConfigEnabled")
@@ -176,6 +174,7 @@ impl NativeLiveConfig {
         } else {
             NativePlanContext::Standard { common_config }
         };
+        let documents = self.observed_documents(&app)?;
         builtin_app_adapter(&app)
             .plan_native(&NativePlanRequest {
                 action: NativeAction::Apply,
@@ -193,18 +192,14 @@ impl NativeLiveConfig {
             .app_id
             .parse::<AppType>()
             .map_err(|_| LiveError::InvalidProvider("application is not supported".to_owned()))?;
-        let documents = self.observed_documents(&app)?;
+        let access = writable_native_access(provider)?;
         let snapshot = ProviderSnapshot::new(
             &provider.id,
             app.clone(),
             &provider.name,
             Value::Object(provider.settings.clone()),
         );
-        let access = if is_lite_writable(provider) {
-            NativeProviderAccess::Writable
-        } else {
-            NativeProviderAccess::ReadOnly
-        };
+        let documents = self.observed_documents(&app)?;
         builtin_app_adapter(&app)
             .plan_native(&NativePlanRequest {
                 action: NativeAction::Remove,
@@ -714,6 +709,16 @@ fn native_provider_mode(app: &AppType, provider: &ProviderRecord) -> NativeProvi
         NativeProviderMode::Official
     } else {
         NativeProviderMode::Custom
+    }
+}
+
+fn writable_native_access(provider: &ProviderRecord) -> Result<NativeProviderAccess, LiveError> {
+    if is_lite_writable(provider) {
+        Ok(NativeProviderAccess::Writable)
+    } else {
+        Err(core_plan_error(NativePlanError::ReadOnlyProvider {
+            provider_id: provider.id.clone(),
+        }))
     }
 }
 
@@ -1513,6 +1518,58 @@ mod tests {
             native.remove_plan(&omo),
             Err(LiveError::InvalidProvider(_))
         ));
+
+        let mut desktop_proxy = provider(
+            AppType::ClaudeDesktop,
+            "proxy",
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://example.com",
+                    "ANTHROPIC_AUTH_TOKEN": "secret"
+                }
+            }),
+        );
+        desktop_proxy.metadata = json!({
+            "claudeDesktopMode": "proxy",
+            "claudeDesktopModelRoutes": {"broken": {}}
+        });
+        assert!(matches!(
+            native.apply_plan(&desktop_proxy, None),
+            Err(LiveError::InvalidProvider(message)) if message.contains("read-only")
+        ));
+    }
+
+    #[test]
+    fn claude_desktop_apply_respects_platform_support() {
+        let directory = tempfile::tempdir().unwrap();
+        let native = NativeLiveConfig::for_tests(
+            directory.path(),
+            directory.path().join(".claude"),
+            directory.path().join(".codex"),
+        );
+        let result = native.apply_plan(
+            &provider(
+                AppType::ClaudeDesktop,
+                "desktop-direct",
+                json!({
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://example.com",
+                        "ANTHROPIC_AUTH_TOKEN": "secret"
+                    }
+                }),
+            ),
+            None,
+        );
+
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(
+                result,
+                Err(LiveError::InvalidProvider(message))
+                    if message.contains("supported on macOS and Windows")
+            ));
+        }
     }
 
     #[test]
