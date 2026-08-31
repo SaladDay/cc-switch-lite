@@ -140,7 +140,7 @@ pub enum McpLiveChange {
         previous: Option<Value>,
         server: Value,
         native_snapshot: Option<McpNativeSnapshot>,
-        applied: bool,
+        link_state: McpNativeLinkState,
     },
     Disable {
         app: AppType,
@@ -148,12 +148,20 @@ pub enum McpLiveChange {
         previous: Value,
         server: Value,
         native_snapshot: Option<McpNativeSnapshot>,
+        link_state: McpNativeLinkState,
     },
     Remove {
         app: AppType,
         id: String,
         server: Value,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpNativeLinkState {
+    Unowned,
+    Owned,
+    Observed,
 }
 
 impl McpLiveChange {
@@ -672,6 +680,12 @@ fn live_changes(
             .id
             .as_str();
         let native_link = get_native_link(transaction, id, &app)?;
+        let link_state = if native_link.is_some() {
+            McpNativeLinkState::Owned
+        } else {
+            McpNativeLinkState::Unowned
+        };
+        let native_snapshot = native_link.flatten();
         let was_enabled = before.is_some_and(|server| server.apps.enabled(&app));
         let is_enabled = after.is_some_and(|server| server.apps.enabled(&app));
         match (before, after, was_enabled, is_enabled) {
@@ -684,20 +698,27 @@ fn live_changes(
                     id: server.id.clone(),
                     previous: previous.map(|server| server.server.clone()),
                     server: server.server.clone(),
-                    native_snapshot: native_link.clone().flatten(),
-                    applied: false,
+                    native_snapshot,
+                    link_state,
                 });
             }
-            (Some(previous), Some(server), true, false) => {
+            (Some(previous), Some(server), _, false)
+                if was_enabled
+                    || (link_state == McpNativeLinkState::Owned
+                        && previous.server != server.server) =>
+            {
                 changes.push(McpLiveChange::Disable {
                     app,
                     id: server.id.clone(),
                     previous: previous.server.clone(),
                     server: server.server.clone(),
-                    native_snapshot: native_link.clone().flatten(),
+                    native_snapshot,
+                    link_state,
                 });
             }
-            (Some(previous), None, _, _) if was_enabled || native_link.is_some() => {
+            (Some(previous), None, _, _)
+                if was_enabled || link_state == McpNativeLinkState::Owned =>
+            {
                 changes.push(McpLiveChange::Remove {
                     app,
                     id: previous.id.clone(),
@@ -738,14 +759,22 @@ fn persist_native_links(
     for change in changes {
         match change {
             McpLiveChange::Upsert {
-                app, id, applied, ..
-            } => upsert_native_link(connection, id, app, None, *applied)?,
+                app,
+                id,
+                link_state: McpNativeLinkState::Observed,
+                ..
+            } => upsert_native_link(connection, id, app, None, true)?,
+            McpLiveChange::Upsert { .. } => {}
             McpLiveChange::Disable {
                 app,
                 id,
                 native_snapshot,
+                link_state,
                 ..
-            } => upsert_native_link(connection, id, app, native_snapshot.as_ref(), true)?,
+            } if *link_state != McpNativeLinkState::Unowned => {
+                upsert_native_link(connection, id, app, native_snapshot.as_ref(), true)?;
+            }
+            McpLiveChange::Disable { .. } => {}
             McpLiveChange::Remove { app, id, .. } => {
                 connection.execute(
                     "DELETE FROM mcp_native_links WHERE server_id = ?1 AND app_id = ?2",
@@ -1122,7 +1151,34 @@ mod tests {
     }
 
     #[test]
-    fn native_snapshot_is_transactional_link_state() {
+    fn owned_disabled_native_entries_track_catalog_edits() {
+        let directory = tempdir().unwrap();
+        let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let mut connection = store.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let mut previous = server();
+        previous.apps = McpApps::default();
+        let mut updated = previous.clone();
+        updated.server = json!({"type":"stdio","command":"uvx"});
+        upsert_native_link(&transaction, &previous.id, &AppType::OpenCode, None, false).unwrap();
+
+        let updates = live_changes(&transaction, Some(&previous), Some(&updated)).unwrap();
+
+        assert_eq!(updates.len(), 1);
+        assert!(matches!(
+            &updates[0],
+            McpLiveChange::Disable {
+                app: AppType::OpenCode,
+                previous: value,
+                server,
+                link_state: McpNativeLinkState::Owned,
+                ..
+            } if value["command"] == "npx" && server["command"] == "uvx"
+        ));
+    }
+
+    #[test]
+    fn unobserved_live_changes_do_not_create_native_ownership() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("cc-switch.db");
         let store = McpStore::open(path.clone()).unwrap();
@@ -1133,6 +1189,58 @@ mod tests {
         };
         store
             .upsert_with_live(record, |_| Ok::<_, ()>(()), |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let link_count = || {
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM mcp_native_links WHERE server_id='context7' AND app_id='gemini'",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(link_count(), 0);
+
+        let current = store.list().unwrap().remove(0);
+        store
+            .toggle_with_live(
+                &current.id,
+                current.revision,
+                AppType::Gemini,
+                false,
+                |_| Ok::<_, ()>(()),
+                |_| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(link_count(), 0);
+    }
+
+    #[test]
+    fn native_snapshot_is_transactional_link_state() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cc-switch.db");
+        let store = McpStore::open(path.clone()).unwrap();
+        let mut record = server();
+        record.apps = McpApps {
+            gemini: true,
+            ..Default::default()
+        };
+        store
+            .upsert_with_live(
+                record,
+                |changes| {
+                    let McpLiveChange::Upsert { link_state, .. } = &mut changes[0] else {
+                        panic!("expected upsert");
+                    };
+                    *link_state = McpNativeLinkState::Observed;
+                    Ok::<_, ()>(())
+                },
+                |_| Ok(()),
+            )
             .unwrap()
             .unwrap();
         let snapshot = cc_switch_core::import_mcp_servers(
@@ -1185,14 +1293,14 @@ mod tests {
                 |changes| {
                     let McpLiveChange::Upsert {
                         native_snapshot,
-                        applied,
+                        link_state,
                         ..
                     } = &mut changes[0]
                     else {
                         panic!("expected upsert");
                     };
                     assert!(native_snapshot.is_some());
-                    *applied = true;
+                    *link_state = McpNativeLinkState::Observed;
                     Ok::<_, ()>(())
                 },
                 |_| Ok(()),

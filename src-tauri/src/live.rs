@@ -660,7 +660,7 @@ mod tests {
             previous: None,
             server: json!({"command":"npx"}),
             native_snapshot: None,
-            applied: false,
+            link_state: crate::mcp::McpNativeLinkState::Unowned,
         }];
         let receipt = live.apply_mcp_recoverable(&mut changes).unwrap();
         let contender = OpenOptions::new()

@@ -7,7 +7,7 @@ use cc_switch_core::{
 
 use crate::{
     live::LiveError,
-    mcp::{McpImportsByApp, McpLiveChange},
+    mcp::{McpImportsByApp, McpLiveChange, McpNativeLinkState},
     operation::{read_optional, resolve_write_path, OperationError},
 };
 
@@ -200,6 +200,7 @@ impl McpLiveConfig {
                 previous,
                 server,
                 native_snapshot,
+                link_state,
                 ..
             } => {
                 let Some(current) = current else {
@@ -213,6 +214,7 @@ impl McpLiveConfig {
                 if let Some(snapshot) = &current.native_snapshot {
                     *native_snapshot = Some(snapshot.clone());
                 }
+                *link_state = McpNativeLinkState::Observed;
                 (id.as_str(), McpServerProjection::Disable(server))
             }
             McpLiveChange::Remove { id, server, .. } => {
@@ -232,8 +234,8 @@ impl McpLiveConfig {
             return Ok(());
         };
         let after = projected.into_bytes();
-        if let McpLiveChange::Upsert { applied, .. } = change {
-            *applied = true;
+        if let McpLiveChange::Upsert { link_state, .. } = change {
+            *link_state = McpNativeLinkState::Observed;
         }
         if before.as_deref() == Some(after.as_slice()) {
             return Ok(());
@@ -338,7 +340,7 @@ mod tests {
                 previous: None,
                 server: json!({"type":"stdio","command":"npx"}),
                 native_snapshot: None,
-                applied: false,
+                link_state: McpNativeLinkState::Unowned,
             },
             McpLiveChange::Upsert {
                 app: AppType::Codex,
@@ -346,7 +348,7 @@ mod tests {
                 previous: None,
                 server: json!({"type":"stdio","command":"npx"}),
                 native_snapshot: None,
-                applied: false,
+                link_state: McpNativeLinkState::Unowned,
             },
         ];
         let receipt = live.apply(&mut changes).unwrap();
@@ -381,7 +383,7 @@ mod tests {
             previous: None,
             server: json!({"type":"stdio","command":"npx"}),
             native_snapshot: None,
-            applied: false,
+            link_state: McpNativeLinkState::Unowned,
         }];
         let receipt = live.apply(&mut changes).unwrap();
         assert!(receipt.writes.is_empty());
@@ -409,6 +411,7 @@ mod tests {
             previous,
             server: updated.clone(),
             native_snapshot: None,
+            link_state: McpNativeLinkState::Unowned,
         }];
         live.apply(&mut disable).unwrap();
         let disabled: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -422,7 +425,7 @@ mod tests {
             previous: Some(updated.clone()),
             server: updated,
             native_snapshot: None,
-            applied: false,
+            link_state: McpNativeLinkState::Unowned,
         }];
         live.apply(&mut enable).unwrap();
         let enabled: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -449,6 +452,7 @@ mod tests {
             previous: shared.clone(),
             server: shared.clone(),
             native_snapshot: None,
+            link_state: McpNativeLinkState::Unowned,
         }];
 
         live.apply(&mut disable).unwrap();
@@ -468,7 +472,7 @@ mod tests {
             previous: Some(shared),
             server: json!({"type":"stdio","command":"new"}),
             native_snapshot: Some(snapshot),
-            applied: false,
+            link_state: McpNativeLinkState::Owned,
         }];
         live.apply(&mut enable).unwrap();
         let enabled: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
