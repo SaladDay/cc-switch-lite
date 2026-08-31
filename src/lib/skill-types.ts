@@ -7,7 +7,7 @@ export interface SkillRecord {
   directory: string;
   repoOwner?: string;
   repoName?: string;
-  apps: Record<AppId, boolean>;
+  apps: Partial<Record<AppId, boolean>>;
   issue?: string;
   appIssues?: Partial<Record<AppId, string>>;
 }

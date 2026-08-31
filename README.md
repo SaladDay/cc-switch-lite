@@ -38,6 +38,8 @@ applications. Installation, discovery, updates, backups, and a marketplace are
 outside Lite. A switch may remove only a link to the selected shared Skill or an
 exact verified copy; an unrelated same-name directory is left intact
 and reported as a conflict.
+When the shared source is `~/.agents/skills`, Pi discovers it directly; Lite
+reports that Pi state as active and keeps the per-application switch read-only.
 
 Import reads only the API-provider fields that Lite can reproduce. Switching
 uses the shared Core executor with logical configuration targets. Lite updates its

@@ -5,9 +5,7 @@ use std::{
     time::Duration,
 };
 
-use cc_switch_core::{
-    builtin_app_registry, validate_skill_directory, AppType, SkillActivationSource,
-};
+use cc_switch_core::{builtin_app_registry, skill_directory_key, AppType, SkillActivationSource};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior};
 use serde::Serialize;
 use thiserror::Error;
@@ -99,17 +97,19 @@ impl SkillStore {
 
         let mut directory_counts = HashMap::new();
         for skill in &skills {
-            *directory_counts
-                .entry(skill.directory.to_ascii_lowercase())
-                .or_insert(0) += 1;
+            if let Ok(key) = skill_directory_key(&skill.directory) {
+                *directory_counts.entry(key).or_insert(0) += 1;
+            }
         }
         for skill in &mut skills {
             skill.issue = validate_catalog_entry(skill).err().or_else(|| {
-                (directory_counts[&skill.directory.to_ascii_lowercase()] > 1).then(|| {
-                    format!(
-                        "Multiple catalog entries use the '{}' directory",
-                        skill.directory
-                    )
+                skill_directory_key(&skill.directory).ok().and_then(|key| {
+                    (directory_counts.get(&key).copied().unwrap_or_default() > 1).then(|| {
+                        format!(
+                            "Multiple catalog entries use the '{}' directory",
+                            skill.directory
+                        )
+                    })
                 })
             });
         }
@@ -136,25 +136,16 @@ impl SkillStore {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let column = contract.catalog_column();
-        let (directory, current) = get_toggle_state(&transaction, id, column)?
+        let directory = get_skill_directory(&transaction, id)?
             .ok_or_else(|| SkillError::NotFound(id.to_owned()))?;
-        validate_skill_directory(&directory)
+        let directory_key = skill_directory_key(&directory)
             .map_err(|error| SkillError::InvalidSkill(error.to_string()))?;
-        let count = transaction.query_row(
-            "SELECT COUNT(*) FROM skills WHERE directory = ?1 COLLATE NOCASE",
-            [&directory],
-            |row| row.get::<_, usize>(0),
-        )?;
+        let count = count_directory_key(&transaction, &directory_key)?;
         if count != 1 {
             return Err(SkillError::InvalidSkill(format!(
                 "directory '{directory}' is not unique in the shared catalog"
             )));
         }
-        if current == Some(false) && !enabled {
-            transaction.commit()?;
-            return Ok(Ok(()));
-        }
-
         let receipt = match apply(&directory, &app, enabled) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -187,9 +178,15 @@ impl SkillStore {
             return recover_live_failure(error, database_rollback, receipt);
         }
 
-        if let Err(error) = transaction.commit() {
-            return recover_database_failure(SkillError::Database(error), Ok(()), receipt);
+        if let Err(error) = transaction.execute_batch("COMMIT") {
+            let database_rollback = transaction.rollback();
+            return recover_database_failure(
+                SkillError::Database(error),
+                database_rollback,
+                receipt,
+            );
         }
+        drop(transaction);
         match receipt.commit() {
             Ok(()) => Ok(Ok(())),
             Err(error) => Ok(Err(error)),
@@ -295,30 +292,30 @@ fn validate_catalog_entry(skill: &SkillRecord) -> Result<(), String> {
     if skill.id.trim().is_empty() {
         return Err("Skill catalog entry has an empty id".to_owned());
     }
-    validate_skill_directory(&skill.directory).map_err(|error| error.to_string())
+    skill_directory_key(&skill.directory)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
-fn get_toggle_state(
-    connection: &Connection,
-    id: &str,
-    column: Option<&str>,
-) -> Result<Option<(String, Option<bool>)>, SkillError> {
-    match column {
-        Some(column) => connection
-            .query_row(
-                &format!("SELECT directory, {column} FROM skills WHERE id = ?1"),
-                [id],
-                |row| Ok((row.get(0)?, Some(row.get(1)?))),
-            )
-            .optional()
-            .map_err(Into::into),
-        None => connection
-            .query_row("SELECT directory FROM skills WHERE id = ?1", [id], |row| {
-                Ok((row.get(0)?, None))
-            })
-            .optional()
-            .map_err(Into::into),
+fn count_directory_key(connection: &Connection, expected: &str) -> Result<usize, SkillError> {
+    let mut statement = connection.prepare("SELECT directory FROM skills")?;
+    let directories = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut count = 0;
+    for directory in directories {
+        if skill_directory_key(&directory?).is_ok_and(|key| key == expected) {
+            count += 1;
+        }
     }
+    Ok(count)
+}
+
+fn get_skill_directory(connection: &Connection, id: &str) -> Result<Option<String>, SkillError> {
+    connection
+        .query_row("SELECT directory FROM skills WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(Into::into)
 }
 
 fn recover_live_failure<C: RecoverableSkillChange>(
@@ -559,6 +556,39 @@ mod tests {
     }
 
     #[test]
+    fn portable_directory_aliases_are_read_only() {
+        let (_directory, path, store) = seed_store();
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO skills (id, name, directory) VALUES ('accent-a', 'A', 'É')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO skills (id, name, directory) VALUES ('accent-b', 'B', 'é')",
+                [],
+            )
+            .unwrap();
+
+        let skills = store.list().unwrap();
+        assert!(skills
+            .iter()
+            .filter(|skill| skill.id.starts_with("accent-"))
+            .all(|skill| skill.issue.is_some()));
+        assert!(matches!(
+            store.toggle_with_live::<FakeReceipt>(
+                "accent-a",
+                AppType::Claude,
+                true,
+                |_, _, _| panic!("aliased catalog rows must not reach live changes")
+            ),
+            Err(SkillError::InvalidSkill(_))
+        ));
+    }
+
+    #[test]
     fn shared_catalog_and_native_skill_change_commit_together() {
         let directory = tempdir().unwrap();
         let shared = directory.path().join(".cc-switch");
@@ -586,6 +616,17 @@ mod tests {
             )
             .unwrap();
         let live = LiveConfig::from_home(directory.path()).unwrap();
+
+        let residual = claude.join("skills/docs");
+        fs::create_dir_all(&residual).unwrap();
+        fs::write(residual.join("SKILL.md"), "# Docs").unwrap();
+        store
+            .toggle_with_live("docs", AppType::Claude, false, |directory, app, enabled| {
+                live.apply_skill_recoverable(directory, app, enabled)
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!residual.exists());
 
         for enabled in [true, false] {
             store

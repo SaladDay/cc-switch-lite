@@ -109,19 +109,25 @@ impl LiveConfig {
         let settings = load_shared_path_settings(home);
         let dirs = resolve_config_dirs(home, &settings)?;
         let claude_mcp = claude_mcp_path(home, &dirs.claude)?;
+        let unified_store = settings.skill_storage_location.as_deref() == Some("unified");
+        let skill_roots = vec![
+            (AppType::Claude, dirs.claude.clone()),
+            (AppType::Codex, dirs.codex.clone()),
+            (AppType::Gemini, dirs.gemini.clone()),
+            (AppType::GrokBuild, dirs.grok.clone()),
+            (AppType::OpenCode, dirs.opencode.clone()),
+            (AppType::Hermes, dirs.hermes.clone()),
+            (AppType::Pi, dirs.pi.clone()),
+        ]
+        .into_iter()
+        .map(|(app, root)| absolute_skill_root(&root).map(|root| (app, root)))
+        .collect::<Result<Vec<_>, _>>()?;
         let skill = SkillLiveConfig::new(
             skill_source_root(home, settings.skill_storage_location.as_deref()),
             skill_sync_method(settings.skill_sync_method.as_deref()),
-            vec![
-                (AppType::Claude, dirs.claude.clone()),
-                (AppType::Codex, dirs.codex.clone()),
-                (AppType::Gemini, dirs.gemini.clone()),
-                (AppType::GrokBuild, dirs.grok.clone()),
-                (AppType::OpenCode, dirs.opencode.clone()),
-                (AppType::Hermes, dirs.hermes.clone()),
-                (AppType::Pi, dirs.pi.clone()),
-            ],
-        );
+            unified_store,
+            skill_roots,
+        )?;
         Ok(Self {
             native: NativeLiveConfig::from_home(home, &dirs)?,
             mcp: McpLiveConfig::new(
@@ -434,7 +440,7 @@ fn resolve_config_dirs(
 fn skill_source_root(home: &Path, location: Option<&str>) -> PathBuf {
     match location {
         Some("unified") => home.join(".agents/skills"),
-        _ => shared_config_dir(home).join("skills"),
+        _ => shared_database_dir(home).join("skills"),
     }
 }
 
@@ -447,7 +453,7 @@ fn skill_sync_method(method: Option<&str>) -> SkillSyncMethod {
 }
 
 fn load_shared_path_settings(home: &Path) -> SharedPathSettings {
-    let path = shared_config_dir(home).join("settings.json");
+    let path = device_settings_path(home);
     let Ok(contents) = fs::read(path) else {
         return SharedPathSettings::default();
     };
@@ -457,11 +463,27 @@ fn load_shared_path_settings(home: &Path) -> SharedPathSettings {
     serde_json::from_slice(&contents).unwrap_or_default()
 }
 
-fn shared_config_dir(home: &Path) -> PathBuf {
+fn device_settings_path(home: &Path) -> PathBuf {
+    home.join(".cc-switch/settings.json")
+}
+
+fn shared_database_dir(home: &Path) -> PathBuf {
     crate::store::database_path(home)
         .parent()
         .map(Path::to_owned)
         .unwrap_or_else(|| home.join(".cc-switch"))
+}
+
+fn absolute_skill_root(path: &Path) -> Result<PathBuf, LiveError> {
+    if path.is_absolute() {
+        return Ok(path.to_owned());
+    }
+    std::env::current_dir()
+        .map(|current| current.join(path))
+        .map_err(|source| LiveError::Io {
+            path: PathBuf::from("."),
+            source,
+        })
 }
 
 fn configured_root(
@@ -754,6 +776,19 @@ mod tests {
                 &home.join(".hermes"),
             ),
             home.join("custom-hermes")
+        );
+        assert_eq!(
+            absolute_skill_root(Path::new("relative/hermes")).unwrap(),
+            std::env::current_dir().unwrap().join("relative/hermes")
+        );
+    }
+
+    #[test]
+    fn device_settings_stay_under_the_system_home() {
+        let home = Path::new("/system/home");
+        assert_eq!(
+            device_settings_path(home),
+            home.join(".cc-switch/settings.json")
         );
     }
 
