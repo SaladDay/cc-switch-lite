@@ -90,7 +90,21 @@ impl McpLiveConfig {
     pub fn apply(&self, changes: &mut [McpLiveChange]) -> Result<McpLiveReceipt, LiveError> {
         let mut receipt = McpLiveReceipt { writes: Vec::new() };
         for change in changes {
-            if let Err(error) = self.apply_one(change, &mut receipt) {
+            let applied = self.apply_one(change, &mut receipt).and_then(|()| {
+                if let McpLiveChange::Upsert {
+                    app, link_state, ..
+                } = change
+                {
+                    if *link_state != McpNativeLinkState::Observed {
+                        return Err(LiveError::Missing(format!(
+                            "{} MCP configuration",
+                            app.as_str()
+                        )));
+                    }
+                }
+                Ok(())
+            });
+            if let Err(error) = applied {
                 if let Err(rollback) = rollback_writes(receipt.writes) {
                     return Err(LiveError::Recovery(format!(
                         "MCP write error: {error}; live recovery error: {rollback}"
@@ -303,6 +317,7 @@ fn restore_write(write: McpFileReceipt) -> Result<(), LiveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::{McpApps, McpServer, McpStore};
     use serde_json::{json, Value};
     use std::path::Path;
     use tempfile::tempdir;
@@ -374,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_writes_for_apps_that_are_not_installed() {
+    fn rejects_enabling_apps_that_are_not_installed() {
         let directory = tempdir().unwrap();
         let live = config(directory.path());
         let mut changes = [McpLiveChange::Upsert {
@@ -385,9 +400,49 @@ mod tests {
             native_snapshot: None,
             link_state: McpNativeLinkState::Unowned,
         }];
-        let receipt = live.apply(&mut changes).unwrap();
-        assert!(receipt.writes.is_empty());
+        let error = live.apply(&mut changes).err().unwrap();
+        assert!(matches!(error, LiveError::Missing(_)));
         assert!(!directory.path().join(".gemini/settings.json").exists());
+    }
+
+    #[test]
+    fn missing_application_keeps_the_database_disabled() {
+        let directory = tempdir().unwrap();
+        let live = config(directory.path());
+        let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
+        store
+            .upsert_with_live(
+                McpServer {
+                    id: "server".to_owned(),
+                    name: "Server".to_owned(),
+                    server: json!({"type":"stdio","command":"npx"}),
+                    apps: McpApps::default(),
+                    description: None,
+                    homepage: None,
+                    docs: None,
+                    tags: Vec::new(),
+                    revision: 0,
+                },
+                |_| Ok::<_, ()>(()),
+                |_| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+        let current = store.list().unwrap().remove(0);
+
+        let result = store
+            .toggle_with_live(
+                &current.id,
+                current.revision,
+                AppType::Gemini,
+                true,
+                |changes| live.apply(changes),
+                |receipt| live.rollback(receipt).map_err(|error| error.to_string()),
+            )
+            .unwrap();
+
+        assert!(matches!(result, Err(LiveError::Missing(_))));
+        assert!(!store.list().unwrap().remove(0).apps.gemini);
     }
 
     #[test]
