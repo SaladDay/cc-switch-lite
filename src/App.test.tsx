@@ -12,6 +12,7 @@ import type {
   ProviderRecord,
   SimpleProviderFormDescriptor,
 } from "./lib/provider-types";
+import type { SkillRecord } from "./lib/skill-types";
 
 const api = vi.hoisted(() => ({
   supportedApps: vi.fn(),
@@ -35,12 +36,18 @@ const mcp = vi.hoisted(() => ({
   importExisting: vi.fn(),
 }));
 
+const skillApi = vi.hoisted(() => ({
+  list: vi.fn(),
+  toggle: vi.fn(),
+}));
+
 vi.mock("./lib/providers", async (importOriginal) => {
   const original = await importOriginal<typeof import("./lib/providers")>();
   return { ...original, providersApi: api };
 });
 
 vi.mock("./lib/mcp", () => ({ mcpApi: mcp }));
+vi.mock("./lib/skills", () => ({ skillsApi: skillApi }));
 
 const adapters: AdapterDescriptor[] = [
   {
@@ -129,6 +136,24 @@ const contextServer: McpServer = {
   },
   tags: ["docs"],
   revision: 1,
+};
+
+const docsSkill: SkillRecord = {
+  id: "owner/repo:docs",
+  name: "Docs",
+  description: "Search project documentation",
+  directory: "docs",
+  repoOwner: "owner",
+  repoName: "repo",
+  apps: {
+    claude: true,
+    codex: false,
+    gemini: false,
+    grokbuild: false,
+    opencode: false,
+    hermes: false,
+    pi: false,
+  },
 };
 
 function deferred<T>() {
@@ -237,6 +262,7 @@ describe("App", () => {
     document.documentElement.className = "";
     for (const mock of Object.values(api)) mock.mockReset();
     for (const mock of Object.values(mcp)) mock.mockReset();
+    for (const mock of Object.values(skillApi)) mock.mockReset();
     const appIds = [
       "claude",
       "claude-desktop",
@@ -270,6 +296,8 @@ describe("App", () => {
       disabledApps: 0,
       failedApps: [],
     });
+    skillApi.list.mockResolvedValue([]);
+    skillApi.toggle.mockResolvedValue(undefined);
   });
 
   it("shows every application from the shared core boundary", async () => {
@@ -301,7 +329,9 @@ describe("App", () => {
     });
     await user.click(screen.getByRole("button", { name: "Manage Skills" }));
     expect(screen.getByRole("heading", { name: "Skills" })).toBeVisible();
-    expect(screen.getByLabelText("Skills placeholder")).toBeVisible();
+    expect(
+      await screen.findByRole("heading", { name: "No installed Skills" }),
+    ).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: "Back to providers" }));
     await user.click(
@@ -311,6 +341,56 @@ describe("App", () => {
     expect(
       await screen.findByRole("heading", { name: "No MCP servers" }),
     ).toBeVisible();
+  });
+
+  it("switches installed Skills through the shared application catalog", async () => {
+    const user = userEvent.setup();
+    skillApi.list
+      .mockResolvedValueOnce([docsSkill])
+      .mockResolvedValueOnce([
+        { ...docsSkill, apps: { ...docsSkill.apps, codex: true } },
+      ]);
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Add your first Claude Code provider",
+    });
+    await user.click(screen.getByRole("button", { name: "Manage Skills" }));
+    expect(await screen.findByText("Docs")).toBeVisible();
+
+    await user.click(
+      screen.getByRole("button", { name: "Enable Docs for Codex" }),
+    );
+    await waitFor(() =>
+      expect(skillApi.toggle).toHaveBeenCalledWith(
+        "owner/repo:docs",
+        "codex",
+        true,
+      ),
+    );
+    expect(
+      await screen.findByRole("button", { name: "Disable Docs for Codex" }),
+    ).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("keeps an invalid shared Skill visible but read-only", async () => {
+    const user = userEvent.setup();
+    skillApi.list.mockResolvedValue([
+      { ...docsSkill, issue: "Skill source is missing SKILL.md" },
+    ]);
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Add your first Claude Code provider",
+    });
+    await user.click(screen.getByRole("button", { name: "Manage Skills" }));
+
+    expect(await screen.findByText("Docs")).toBeVisible();
+    expect(screen.getByText("Skill source is missing SKILL.md")).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Enable Docs for Codex" }),
+    ).toBeDisabled();
+    expect(skillApi.toggle).not.toHaveBeenCalled();
   });
 
   it("blocks MCP actions until the initial catalog has loaded", async () => {

@@ -27,10 +27,17 @@ pnpm tauri dev
 ```
 
 Provider records live in the same `~/.cc-switch/cc-switch.db` database used by
-CC Switch. Lite does not keep a second provider catalog. Updates use SQLite
-transactions and reject stale edits made against an older record revision.
+CC Switch. MCP servers and installed Skills use their existing shared tables as
+well; Lite does not keep parallel catalogs. Updates use SQLite transactions and
+reject stale provider or MCP edits made against an older record revision.
 Until the full application adopts Core's shared live-file lock protocol, do not
 write configuration from CC Switch and Lite at the same time.
+
+The Skills page only switches already-installed Skills between supported
+applications. Installation, discovery, updates, backups, and a marketplace are
+outside Lite. A switch may remove only a link to the selected shared Skill or an
+exact verified copy; an unrelated same-name directory is left intact
+and reported as a conflict.
 
 Import reads only the API-provider fields that Lite can reproduce. Switching
 uses the shared Core executor with logical configuration targets. Lite updates its

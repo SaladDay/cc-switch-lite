@@ -11,6 +11,8 @@ mod mcp_live;
 mod native_live;
 mod operation;
 mod provider;
+mod skill;
+mod skill_live;
 mod store;
 
 use live::{LiveConfig, LiveError};
@@ -21,6 +23,7 @@ use provider::{
     ProviderDraft, ProviderRecord, SimpleProviderDraft, SimpleProviderUpdate,
 };
 use serde::Serialize;
+use skill::{SkillError, SkillRecord, SkillStore};
 use store::{ProviderStore, StoreError};
 use tauri::{Manager, State};
 
@@ -61,6 +64,15 @@ impl From<LiveError> for CommandError {
 
 impl From<McpError> for CommandError {
     fn from(error: McpError) -> Self {
+        Self {
+            code: error.code(),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<SkillError> for CommandError {
+    fn from(error: SkillError) -> Self {
         Self {
             code: error.code(),
             message: error.to_string(),
@@ -534,6 +546,71 @@ fn import_mcp_from_apps(
     }
 }
 
+#[tauri::command]
+fn list_installed_skills(
+    store: State<'_, SkillStore>,
+    live: State<'_, LiveConfig>,
+) -> CommandResult<Vec<SkillRecord>> {
+    let mut skills = store.list()?;
+    let requests = skills
+        .iter()
+        .map(|skill| (skill.id.clone(), skill.directory.clone()))
+        .collect::<Vec<_>>();
+    let observations = live.observe_skills(&requests)?;
+    let indexes = skills
+        .iter()
+        .enumerate()
+        .map(|(index, skill)| (skill.id.clone(), index))
+        .collect::<std::collections::HashMap<_, _>>();
+    for observation in observations {
+        let Some(skill) = indexes
+            .get(&observation.id)
+            .and_then(|index| skills.get_mut(*index))
+        else {
+            continue;
+        };
+        if skill.issue.is_none() {
+            skill.issue = observation.source_issue;
+        }
+        for (app_id, state) in observation.native_apps {
+            match state {
+                Ok(enabled) => {
+                    skill.apps.insert(app_id.clone(), enabled);
+                    skill.app_issues.remove(&app_id);
+                }
+                Err(error) => {
+                    skill.app_issues.insert(app_id, error);
+                }
+            }
+        }
+    }
+    Ok(skills)
+}
+
+#[tauri::command]
+fn toggle_skill_app(
+    store: State<'_, SkillStore>,
+    live: State<'_, LiveConfig>,
+    skill_id: String,
+    app_id: String,
+    enabled: bool,
+) -> CommandResult<()> {
+    let app = app_id.parse::<cc_switch_core::AppType>().map_err(|_| {
+        CommandError::from(SkillError::InvalidSkill(format!(
+            "application '{app_id}' is not supported"
+        )))
+    })?;
+    match store
+        .toggle_with_live(&skill_id, app, enabled, |directory, app, enabled| {
+            live.apply_skill_recoverable(directory, app, enabled)
+        })
+        .map_err(CommandError::from)?
+    {
+        Ok(()) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -541,9 +618,11 @@ pub fn run() {
             let home_dir = app.path().home_dir()?;
             let store = ProviderStore::from_home(&home_dir)?;
             let mcp_store = McpStore::open(store::database_path(&home_dir))?;
+            let skill_store = SkillStore::open(store::database_path(&home_dir))?;
             // The shared database is authoritative; startup never imports old Lite files.
             app.manage(store);
             app.manage(mcp_store);
+            app.manage(skill_store);
             app.manage(LiveConfig::from_home(&home_dir)?);
             Ok(())
         })
@@ -564,6 +643,8 @@ pub fn run() {
             toggle_mcp_app,
             delete_mcp_server,
             import_mcp_from_apps,
+            list_installed_skills,
+            toggle_skill_app,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run CC Switch Lite");

@@ -19,6 +19,7 @@ import { McpIcon } from "./components/McpIcon";
 import { McpPanel, type McpPanelHandle } from "./components/mcp/McpPanel";
 import { ProviderDialog } from "./components/ProviderDialog";
 import { AppSwitcher } from "./components/AppSwitcher";
+import { SkillsPanel } from "./components/skills/SkillsPanel";
 import {
   ProviderList,
   type ProviderListItem,
@@ -158,6 +159,7 @@ export default function App() {
   const [liveError, setLiveError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [mcpManagementBusy, setMcpManagementBusy] = useState(false);
+  const [skillsManagementBusy, setSkillsManagementBusy] = useState(false);
   const [currentProviders, setCurrentProviders] = useState<CurrentProvider[]>(
     [],
   );
@@ -196,6 +198,9 @@ export default function App() {
   const supportsSkills = supportsFeature(appCatalog, activeApp, "skills");
   const mcpApps = appCatalog.filter((app) =>
     supportsFeature(appCatalog, app.id, "mcp"),
+  );
+  const skillsApps = appCatalog.filter((app) =>
+    supportsFeature(appCatalog, app.id, "skills"),
   );
   const editingAdapter =
     editing === "new"
@@ -628,7 +633,10 @@ export default function App() {
                 <Button
                   variant="outline"
                   size="icon"
-                  disabled={currentView === "mcp" && mcpManagementBusy}
+                  disabled={
+                    (currentView === "mcp" && mcpManagementBusy) ||
+                    (currentView === "skills" && skillsManagementBusy)
+                  }
                   onClick={() => setCurrentView("providers")}
                   className="mr-2 rounded-lg"
                   aria-label="Back to providers"
@@ -840,19 +848,10 @@ export default function App() {
             onInteractionBlockedChange={setMcpManagementBusy}
           />
         ) : (
-          <div className="flex min-h-0 flex-1 items-center justify-center px-6 pb-12">
-            <div
-              className="glass-card flex max-w-md flex-col items-center rounded-2xl px-8 py-10 text-center"
-              aria-label={`${viewTitle} placeholder`}
-            >
-              <Wrench className="h-7 w-7 text-muted-foreground" />
-              <p className="mt-4 text-base font-semibold">{viewTitle}</p>
-              <p className="mt-2 text-sm text-muted-foreground">
-                This management view will be connected in its implementation
-                step.
-              </p>
-            </div>
-          </div>
+          <SkillsPanel
+            apps={skillsApps}
+            onInteractionBlockedChange={setSkillsManagementBusy}
+          />
         )}
       </main>
 
