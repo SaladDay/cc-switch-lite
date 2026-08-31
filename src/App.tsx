@@ -16,6 +16,7 @@ import {
 
 import { DeleteProviderDialog } from "./components/DeleteProviderDialog";
 import { McpIcon } from "./components/McpIcon";
+import { McpPanel, type McpPanelHandle } from "./components/mcp/McpPanel";
 import { ProviderDialog } from "./components/ProviderDialog";
 import { AppSwitcher } from "./components/AppSwitcher";
 import {
@@ -156,6 +157,7 @@ export default function App() {
   const [liveBusy, setLiveBusy] = useState<string | null>(null);
   const [liveError, setLiveError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [mcpManagementBusy, setMcpManagementBusy] = useState(false);
   const [currentProviders, setCurrentProviders] = useState<CurrentProvider[]>(
     [],
   );
@@ -163,6 +165,7 @@ export default function App() {
   const activeAppRef = useRef(activeApp);
   activeAppRef.current = activeApp;
   const addProviderButtonRef = useRef<HTMLButtonElement>(null);
+  const mcpPanelRef = useRef<McpPanelHandle>(null);
   const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const definition = appDefinition(activeApp, appCatalog);
   const isClaude = activeApp === "claude";
@@ -191,6 +194,9 @@ export default function App() {
   const simpleForm = simpleForms.find((form) => form.appId === activeApp);
   const supportsMcp = supportsFeature(appCatalog, activeApp, "mcp");
   const supportsSkills = supportsFeature(appCatalog, activeApp, "skills");
+  const mcpApps = appCatalog.filter((app) =>
+    supportsFeature(appCatalog, app.id, "mcp"),
+  );
   const editingAdapter =
     editing === "new"
       ? adapter
@@ -622,6 +628,7 @@ export default function App() {
                 <Button
                   variant="outline"
                   size="icon"
+                  disabled={currentView === "mcp" && mcpManagementBusy}
                   onClick={() => setCurrentView("providers")}
                   className="mr-2 rounded-lg"
                   aria-label="Back to providers"
@@ -719,6 +726,30 @@ export default function App() {
                     </Button>
                   </>
                 )}
+                {currentView === "mcp" && (
+                  <>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={mcpManagementBusy}
+                      onClick={() => mcpPanelRef.current?.importExisting()}
+                      className="hover:bg-black/5 dark:hover:bg-white/5"
+                    >
+                      <Download className="mr-2 h-4 w-4" />
+                      Import existing
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={mcpManagementBusy}
+                      onClick={() => mcpPanelRef.current?.openAdd()}
+                      className="hover:bg-black/5 dark:hover:bg-white/5"
+                    >
+                      <Plus className="mr-2 h-4 w-4" />
+                      Add MCP
+                    </Button>
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -802,17 +833,19 @@ export default function App() {
               </div>
             </div>
           </div>
+        ) : currentView === "mcp" ? (
+          <McpPanel
+            ref={mcpPanelRef}
+            apps={mcpApps}
+            onInteractionBlockedChange={setMcpManagementBusy}
+          />
         ) : (
           <div className="flex min-h-0 flex-1 items-center justify-center px-6 pb-12">
             <div
               className="glass-card flex max-w-md flex-col items-center rounded-2xl px-8 py-10 text-center"
               aria-label={`${viewTitle} placeholder`}
             >
-              {currentView === "mcp" ? (
-                <McpIcon size={28} className="text-muted-foreground" />
-              ) : (
-                <Wrench className="h-7 w-7 text-muted-foreground" />
-              )}
+              <Wrench className="h-7 w-7 text-muted-foreground" />
               <p className="mt-4 text-base font-semibold">{viewTitle}</p>
               <p className="mt-2 text-sm text-muted-foreground">
                 This management view will be connected in its implementation

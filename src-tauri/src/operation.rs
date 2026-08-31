@@ -353,7 +353,7 @@ fn read_opened(
     Ok(Some(contents))
 }
 
-fn resolve_write_path(path: &Path) -> Result<PathBuf, OperationError> {
+pub(crate) fn resolve_write_path(path: &Path) -> Result<PathBuf, OperationError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(OperationError::InvalidTarget(
             format!("{} must not be a symbolic link", path.display()),

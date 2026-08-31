@@ -29,6 +29,8 @@ pnpm tauri dev
 Provider records live in the same `~/.cc-switch/cc-switch.db` database used by
 CC Switch. Lite does not keep a second provider catalog. Updates use SQLite
 transactions and reject stale edits made against an older record revision.
+Until the full application adopts Core's shared live-file lock protocol, do not
+write configuration from CC Switch and Lite at the same time.
 
 Import reads only the API-provider fields that Lite can reproduce. Switching
 uses the shared Core executor with logical configuration targets. Lite updates its

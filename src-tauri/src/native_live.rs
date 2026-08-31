@@ -1,7 +1,7 @@
-use std::{
-    ffi::OsStr,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "windows")]
+use std::ffi::OsStr;
 
 use cc_switch_core::{
     builtin_app_adapter, claude_desktop, codex, gemini, AppType, HermesProviderSource,
@@ -12,7 +12,7 @@ use cc_switch_core::{
 use serde_json::{json, Map, Value};
 
 use crate::{
-    live::LiveError,
+    live::{LiveError, ResolvedConfigDirs},
     operation::{read_optional, LivePaths, OperationPlan},
     provider::{
         is_lite_writable, native_adapter_reference, NativeImport, ProviderDraft, ProviderRecord,
@@ -36,39 +36,25 @@ pub(crate) struct PreparedNativePlan {
 }
 
 impl NativeLiveConfig {
-    pub fn from_home(
-        home: &Path,
-        claude_dir: PathBuf,
-        codex_dir: PathBuf,
-    ) -> Result<Self, LiveError> {
-        let hermes_dir = config_root(
-            std::env::var_os("HERMES_HOME").as_deref(),
-            &default_hermes_dir(home),
-            "HERMES_HOME",
-        )?;
-        let pi_dir = config_root(
-            std::env::var_os("PI_CODING_AGENT_DIR").as_deref(),
-            &home.join(".pi").join("agent"),
-            "PI_CODING_AGENT_DIR",
-        )?;
+    pub fn from_home(home: &Path, dirs: &ResolvedConfigDirs) -> Result<Self, LiveError> {
         let (normal, threep, profile, meta) = claude_desktop_paths(home);
         Ok(Self {
             paths: LivePaths {
-                claude_settings: claude_dir.join("settings.json"),
+                claude_settings: dirs.claude.join("settings.json"),
                 claude_desktop_normal_config: normal,
                 claude_desktop_threep_config: threep,
                 claude_desktop_profile: profile,
                 claude_desktop_meta: meta,
-                codex_auth: codex_dir.join("auth.json"),
-                codex_config: codex_dir.join("config.toml"),
-                codex_model_catalog: codex_dir.join(codex::MODEL_CATALOG_FILENAME),
-                gemini_env: home.join(".gemini").join(".env"),
-                gemini_settings: home.join(".gemini").join("settings.json"),
-                grok_config: home.join(".grok").join("config.toml"),
-                opencode_config: home.join(".config").join("opencode").join("opencode.json"),
+                codex_auth: dirs.codex.join("auth.json"),
+                codex_config: dirs.codex.join("config.toml"),
+                codex_model_catalog: dirs.codex.join(codex::MODEL_CATALOG_FILENAME),
+                gemini_env: dirs.gemini.join(".env"),
+                gemini_settings: dirs.gemini.join("settings.json"),
+                grok_config: dirs.grok.join("config.toml"),
+                opencode_config: dirs.opencode.join("opencode.json"),
                 openclaw_config: home.join(".openclaw").join("openclaw.json"),
-                hermes_config: hermes_dir.join("config.yaml"),
-                pi_models: pi_dir.join("models.json"),
+                hermes_config: dirs.hermes.join("config.yaml"),
+                pi_models: dirs.pi.join("models.json"),
             },
         })
     }
@@ -452,25 +438,8 @@ fn desktop_routes(metadata: &Value) -> Result<Vec<claude_desktop::DirectModelRou
         .map(Option::unwrap_or_default)
 }
 
-fn config_root(
-    override_value: Option<&OsStr>,
-    default: &Path,
-    variable: &str,
-) -> Result<PathBuf, LiveError> {
-    let path = override_value
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default.to_owned());
-    if !path.is_absolute() {
-        return Err(LiveError::InvalidConfig(format!(
-            "{variable} must be an absolute path"
-        )));
-    }
-    Ok(path)
-}
-
 #[cfg(target_os = "windows")]
-fn default_hermes_dir(home: &Path) -> PathBuf {
+pub(crate) fn default_hermes_dir(home: &Path) -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -479,7 +448,7 @@ fn default_hermes_dir(home: &Path) -> PathBuf {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn default_hermes_dir(home: &Path) -> PathBuf {
+pub(crate) fn default_hermes_dir(home: &Path) -> PathBuf {
     home.join(".hermes")
 }
 

@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import App, { sameJsonValue } from "./App";
+import type { McpServer } from "./lib/mcp-types";
 import type {
   AdapterDescriptor,
   AppId,
@@ -26,10 +27,20 @@ const api = vi.hoisted(() => ({
   currentProviders: vi.fn(),
 }));
 
+const mcp = vi.hoisted(() => ({
+  list: vi.fn(),
+  upsert: vi.fn(),
+  toggle: vi.fn(),
+  delete: vi.fn(),
+  importExisting: vi.fn(),
+}));
+
 vi.mock("./lib/providers", async (importOriginal) => {
   const original = await importOriginal<typeof import("./lib/providers")>();
   return { ...original, providersApi: api };
 });
+
+vi.mock("./lib/mcp", () => ({ mcpApi: mcp }));
 
 const adapters: AdapterDescriptor[] = [
   {
@@ -98,6 +109,26 @@ const workProvider: ProviderRecord = {
   },
   liteConfigWritable: true,
   liteSimpleEditable: true,
+};
+
+const contextServer: McpServer = {
+  id: "context7",
+  name: "Context7",
+  server: {
+    type: "stdio",
+    command: "npx",
+    args: ["-y", "@upstash/context7-mcp"],
+  },
+  apps: {
+    claude: true,
+    codex: false,
+    gemini: false,
+    grokbuild: false,
+    opencode: false,
+    hermes: false,
+  },
+  tags: ["docs"],
+  revision: 1,
 };
 
 function deferred<T>() {
@@ -205,6 +236,7 @@ describe("App", () => {
     window.localStorage.clear();
     document.documentElement.className = "";
     for (const mock of Object.values(api)) mock.mockReset();
+    for (const mock of Object.values(mcp)) mock.mockReset();
     const appIds = [
       "claude",
       "claude-desktop",
@@ -228,6 +260,16 @@ describe("App", () => {
     api.switch.mockResolvedValue(undefined);
     api.removeFromLive.mockResolvedValue(undefined);
     api.currentProviders.mockResolvedValue([]);
+    mcp.list.mockResolvedValue([]);
+    mcp.upsert.mockResolvedValue(undefined);
+    mcp.toggle.mockResolvedValue(undefined);
+    mcp.delete.mockResolvedValue(undefined);
+    mcp.importExisting.mockResolvedValue({
+      newServers: 0,
+      enabledApps: 0,
+      disabledApps: 0,
+      failedApps: [],
+    });
   });
 
   it("shows every application from the shared core boundary", async () => {
@@ -266,7 +308,101 @@ describe("App", () => {
       screen.getByRole("button", { name: "Manage MCP servers" }),
     );
     expect(screen.getByRole("heading", { name: "MCP Servers" })).toBeVisible();
-    expect(screen.getByLabelText("MCP Servers placeholder")).toBeVisible();
+    expect(
+      await screen.findByRole("heading", { name: "No MCP servers" }),
+    ).toBeVisible();
+  });
+
+  it("blocks MCP actions until the initial catalog has loaded", async () => {
+    const user = userEvent.setup();
+    const initial = deferred<McpServer[]>();
+    mcp.list.mockReturnValueOnce(initial.promise);
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Add your first Claude Code provider",
+    });
+    await user.click(
+      screen.getByRole("button", { name: "Manage MCP servers" }),
+    );
+    const add = screen.getByRole("button", { name: "Add MCP" });
+    await waitFor(() => expect(add).toBeDisabled());
+    await user.click(add);
+    expect(
+      screen.queryByRole("heading", { name: "Add MCP server" }),
+    ).not.toBeInTheDocument();
+
+    initial.resolve([]);
+    await waitFor(() => expect(add).toBeEnabled());
+  });
+
+  it("manages shared MCP application switches from the family-style panel", async () => {
+    const user = userEvent.setup();
+    const enabledServer = {
+      ...contextServer,
+      apps: { ...contextServer.apps, codex: true },
+      revision: 2,
+    };
+    mcp.list
+      .mockResolvedValueOnce([contextServer])
+      .mockResolvedValue([enabledServer]);
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Add your first Claude Code provider",
+    });
+    await user.click(
+      screen.getByRole("button", { name: "Manage MCP servers" }),
+    );
+    expect(await screen.findByText("Context7")).toBeVisible();
+
+    await user.click(
+      screen.getByRole("button", { name: "Enable Context7 for Codex" }),
+    );
+    await waitFor(() =>
+      expect(mcp.toggle).toHaveBeenCalledWith("context7", "codex", true, 1),
+    );
+    await waitFor(() => expect(mcp.list).toHaveBeenCalledTimes(2));
+    expect(
+      screen.getByRole("button", { name: "Disable Context7 for Codex" }),
+    ).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("adds an MCP preset without exposing a raw configuration editor", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Add your first Claude Code provider",
+    });
+    await user.click(
+      screen.getByRole("button", { name: "Manage MCP servers" }),
+    );
+    await screen.findByRole("heading", { name: "No MCP servers" });
+    await user.click(screen.getByRole("button", { name: "Add MCP" }));
+    expect(
+      screen.getByRole("heading", { name: "Add MCP server" }),
+    ).toBeVisible();
+    expect(screen.queryByText("JSON configuration")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "context7" }));
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await waitFor(() => expect(mcp.upsert).toHaveBeenCalledTimes(1));
+    expect(mcp.upsert.mock.calls[0][0]).toMatchObject({
+      id: "context7",
+      server: {
+        type: "stdio",
+        command: expect.any(String),
+      },
+      apps: {
+        claude: true,
+        codex: true,
+        gemini: true,
+        grokbuild: true,
+        opencode: false,
+        hermes: false,
+      },
+    });
   });
 
   it("hides feature entries not declared by core", async () => {
