@@ -578,7 +578,17 @@ fn list_installed_skills(
         if skill.issue.is_none() {
             skill.issue = observation.source_issue;
         }
-        for (app_id, state) in observation.app_overrides {
+        for (app_id, mut state) in observation.app_overrides {
+            if let Some(pending) = skill
+                .apps
+                .get(&app_id)
+                .and_then(|existing| existing.issue.as_deref())
+            {
+                state.issue = Some(match state.issue {
+                    Some(issue) => format!("{pending}; {issue}"),
+                    None => pending.to_owned(),
+                });
+            }
             skill.apps.insert(app_id, state);
         }
     }
@@ -623,15 +633,16 @@ pub fn run() {
             let mcp_store = McpStore::open(store::database_path(&home_dir))?;
             let skill_store = SkillStore::open(store::database_path(&home_dir))?;
             let live = LiveConfig::from_home(&home_dir)?;
-            if let Err(error) = skill_store.recover_pending_with_live(|pending| {
+            let recovery_issues = skill_store.recover_pending_with_live(|pending| {
                 live.apply_skill_recoverable(
                     &pending.name,
                     &pending.directory,
                     &pending.app,
                     pending.enabled,
                 )
-            })? {
-                return Err(error.into());
+            })?;
+            for issue in recovery_issues {
+                eprintln!("CC Switch Lite Skill recovery: {issue}");
             }
             // The shared database is authoritative; startup never imports old Lite files.
             app.manage(store);

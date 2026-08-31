@@ -389,8 +389,13 @@ describe("App", () => {
     expect(await screen.findByText("Docs")).toBeVisible();
     expect(screen.getByText("Skill source is missing SKILL.md")).toBeVisible();
     expect(
-      screen.getByRole("button", { name: "Enable Docs for Codex" }),
-    ).toBeDisabled();
+      screen.getByRole("status", {
+        name: /Codex: disabled, read-only\. Skill source is missing SKILL\.md/,
+      }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Enable Docs for Codex" }),
+    ).not.toBeInTheDocument();
     expect(skillApi.toggle).not.toHaveBeenCalled();
   });
 
@@ -417,7 +422,7 @@ describe("App", () => {
 
     expect(
       await screen.findByRole("status", {
-        name: /Codex: read-only\. Codex Skill state is managed outside Lite/,
+        name: /Codex: state unknown, read-only\. Codex Skill state is managed outside Lite/,
       }),
     ).toBeVisible();
     expect(

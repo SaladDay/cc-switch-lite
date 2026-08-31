@@ -6,10 +6,10 @@ use std::{
 
 use cc_switch_core::{
     apply_skill_deployment, builtin_app_registry, inspect_skill_config_state,
-    inspect_skill_deployment, inspect_skill_discovery, inspect_skill_presence,
+    inspect_skill_deployment, inspect_skill_discovery, inspect_skill_presence, skill_name_key,
     validate_skill_directory, validate_skill_source, AppType, SkillConfigError, SkillConfigState,
-    SkillConfigTarget, SkillDeploymentReceipt, SkillDeploymentState, SkillDiscoveryState,
-    SkillSyncMethod, UnifiedSkillControl,
+    SkillConfigTarget, SkillDeploymentReceipt, SkillDeploymentState, SkillDiscoveryMode,
+    SkillDiscoveryState, SkillSyncMethod,
 };
 use thiserror::Error;
 
@@ -97,6 +97,12 @@ impl SkillLiveConfig {
         skills: &[(String, String, String)],
         configs: &SkillConfigDocuments,
     ) -> Vec<SkillObservation> {
+        let mut name_counts = HashMap::new();
+        for (_, name, _) in skills {
+            if let Ok(key) = skill_name_key(name) {
+                *name_counts.entry(key).or_insert(0_usize) += 1;
+            }
+        }
         skills
             .iter()
             .map(|(id, name, directory)| {
@@ -111,7 +117,16 @@ impl SkillLiveConfig {
                 let app_overrides = if directory_issue.is_some() {
                     BTreeMap::new()
                 } else {
-                    self.observe_app_overrides(name, directory, source_issue.is_none(), configs)
+                    let ambiguous_name = skill_name_key(name)
+                        .ok()
+                        .is_some_and(|key| name_counts.get(&key).copied().unwrap_or_default() > 1);
+                    self.observe_app_overrides(
+                        name,
+                        directory,
+                        source_issue.is_none(),
+                        ambiguous_name,
+                        configs,
+                    )
                 };
                 SkillObservation {
                     id: id.clone(),
@@ -131,25 +146,24 @@ impl SkillLiveConfig {
         let Some(contract) = descriptor.skill_contract() else {
             return Err(SkillLiveError::Unsupported(app.as_str().to_owned()));
         };
-        let discovery = match contract.unified_control() {
-            Some(_) => {
+        let discovery = match contract.discovery() {
+            SkillDiscoveryMode::Unified => {
                 inspect_skill_discovery(&self.source_root, &self.unified_discovery_root, directory)?
             }
-            None => SkillDiscoveryState::Missing,
+            SkillDiscoveryMode::Managed => SkillDiscoveryState::Missing,
         };
         if discovery == SkillDiscoveryState::External {
             return Err(SkillLiveError::UnifiedConflict(
                 descriptor.display_name().to_owned(),
             ));
         }
-        let config_target = match (contract.unified_control(), discovery) {
-            (Some(UnifiedSkillControl::ReadOnly), SkillDiscoveryState::Selected) => {
+        let config_target = match (contract.discovery(), contract.config_target(), discovery) {
+            (SkillDiscoveryMode::Unified, None, SkillDiscoveryState::Selected) => {
                 return Err(SkillLiveError::UnifiedDiscovery(
                     descriptor.display_name().to_owned(),
                 ))
             }
-            (Some(UnifiedSkillControl::DisabledNameList(target)), _) => Some(target),
-            (Some(UnifiedSkillControl::ReadOnly) | None, _) => None,
+            (_, target, _) => target,
         };
         if config_target.is_some() {
             let target = self
@@ -159,7 +173,8 @@ impl SkillLiveConfig {
         }
         Ok(SkillApplyRoute {
             config_target,
-            deploy_native: discovery == SkillDiscoveryState::Missing,
+            deploy_native: contract.discovery() == SkillDiscoveryMode::Managed
+                || discovery == SkillDiscoveryState::Missing,
         })
     }
 
@@ -194,6 +209,7 @@ impl SkillLiveConfig {
         name: &str,
         directory: &str,
         source_valid: bool,
+        ambiguous_name: bool,
         configs: &SkillConfigDocuments,
     ) -> BTreeMap<String, SkillAppState> {
         let unified_discovery =
@@ -230,15 +246,25 @@ impl SkillLiveConfig {
                             ),
                         })
                 };
-                let observation = match (contract.unified_control(), &unified_discovery) {
-                    (Some(_), Ok(SkillDiscoveryState::External)) => SkillAppState {
-                        enabled: None,
-                        issue: Some(
-                            SkillLiveError::UnifiedConflict(descriptor.display_name().to_owned())
+                let discovery = if contract.discovery() == SkillDiscoveryMode::Unified {
+                    unified_discovery.clone()
+                } else {
+                    Ok(SkillDiscoveryState::Missing)
+                };
+                let observation = match (contract.discovery(), contract.config_target(), discovery)
+                {
+                    (SkillDiscoveryMode::Unified, _, Ok(SkillDiscoveryState::External)) => {
+                        SkillAppState {
+                            enabled: None,
+                            issue: Some(
+                                SkillLiveError::UnifiedConflict(
+                                    descriptor.display_name().to_owned(),
+                                )
                                 .to_string(),
-                        ),
-                    },
-                    (Some(UnifiedSkillControl::ReadOnly), Ok(SkillDiscoveryState::Selected)) => {
+                            ),
+                        }
+                    }
+                    (SkillDiscoveryMode::Unified, None, Ok(SkillDiscoveryState::Selected)) => {
                         SkillAppState {
                             enabled: None,
                             issue: Some(
@@ -249,20 +275,27 @@ impl SkillLiveConfig {
                             ),
                         }
                     }
-                    (Some(UnifiedSkillControl::DisabledNameList(target)), Ok(discovery)) => {
-                        observe_configured_state(
-                            native_observation(),
-                            target,
-                            name,
-                            *discovery == SkillDiscoveryState::Selected,
-                            configs,
-                        )
-                    }
-                    (Some(_), Err(issue)) => SkillAppState {
+                    (_, Some(target), Ok(discovery)) => observe_configured_state(
+                        native_observation(),
+                        target,
+                        name,
+                        discovery == SkillDiscoveryState::Selected,
+                        configs,
+                    ),
+                    (SkillDiscoveryMode::Unified, _, Err(issue)) => SkillAppState {
                         enabled: None,
                         issue: Some(issue.clone()),
                     },
                     _ => native_observation(),
+                };
+                let observation = if ambiguous_name && contract.config_target().is_some() {
+                    append_issue(
+                        observation,
+                        "Multiple installed Skills use this native name; switching is read-only"
+                            .to_owned(),
+                    )
+                } else {
+                    observation
                 };
                 (descriptor.id().to_owned(), observation)
             })
@@ -353,6 +386,13 @@ fn observe_configured_state(
             },
             "Skills are disabled globally in the application's native settings".to_owned(),
         ),
+        Ok(SkillConfigState::ExternallyDisabled) => append_issue(
+            SkillAppState {
+                enabled: Some(false),
+                issue: native.issue,
+            },
+            "This Skill is disabled by a platform-specific native setting".to_owned(),
+        ),
         Ok(configured @ (SkillConfigState::Enabled | SkillConfigState::Disabled)) => {
             let configured = configured == SkillConfigState::Enabled;
             SkillAppState {
@@ -412,6 +452,7 @@ mod tests {
         HashMap::from([
             (SkillConfigTarget::GeminiSettings, Ok(None)),
             (SkillConfigTarget::GrokConfig, Ok(None)),
+            (SkillConfigTarget::HermesConfig, Ok(None)),
         ])
     }
 
@@ -489,8 +530,10 @@ mod tests {
         let unified = directory.path().join(".agents/skills");
         fs::create_dir_all(source.join("docs")).unwrap();
         fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
-        fs::create_dir_all(unified.join("docs")).unwrap();
-        fs::write(unified.join("docs/SKILL.md"), "# Docs").unwrap();
+        apply_skill_deployment(&source, &unified, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
         let roots = app_roots(directory.path());
         for (_, root) in &roots {
             fs::create_dir_all(root).unwrap();
@@ -503,11 +546,13 @@ mod tests {
                 Ok(Some(br#"{"skills":{"disabled":["Docs"]}}"#.to_vec())),
             ),
             (SkillConfigTarget::GrokConfig, Ok(None)),
+            (SkillConfigTarget::HermesConfig, Ok(None)),
         ]);
         let observations = live.observe(&skill_request(), &configs);
         for descriptor in builtin_app_registry().descriptors().filter(|descriptor| {
             descriptor.skill_contract().is_some_and(|contract| {
-                contract.unified_control() == Some(UnifiedSkillControl::ReadOnly)
+                contract.discovery() == SkillDiscoveryMode::Unified
+                    && contract.config_target().is_none()
             })
         }) {
             let state = &observations[0].app_overrides[descriptor.id()];
@@ -545,8 +590,10 @@ mod tests {
         let unified = directory.path().join(".agents/skills");
         fs::create_dir_all(source.join("docs")).unwrap();
         fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
-        fs::create_dir_all(unified.join("docs")).unwrap();
-        fs::write(unified.join("docs/SKILL.md"), "# Docs").unwrap();
+        apply_skill_deployment(&source, &unified, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
         let roots = app_roots(directory.path());
         for (_, root) in &roots {
             fs::create_dir_all(root).unwrap();
@@ -558,6 +605,7 @@ mod tests {
                 Ok(Some(br#"{"skills":{"enabled":false}}"#.to_vec())),
             ),
             (SkillConfigTarget::GrokConfig, Ok(None)),
+            (SkillConfigTarget::HermesConfig, Ok(None)),
         ]);
 
         let observations = live.observe(&skill_request(), &configs);
@@ -567,6 +615,94 @@ mod tests {
             .issue
             .as_deref()
             .is_some_and(|issue| issue.contains("disabled globally")));
+    }
+
+    #[test]
+    fn hermes_native_disabled_state_is_observed_and_platform_controls_are_read_only() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join(".cc-switch/skills");
+        let unified = directory.path().join(".agents/skills");
+        fs::create_dir_all(source.join("docs")).unwrap();
+        fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
+        let roots = app_roots(directory.path());
+        for (_, root) in &roots {
+            fs::create_dir_all(root).unwrap();
+        }
+        let hermes_root = roots
+            .iter()
+            .find(|(app, _)| *app == AppType::Hermes)
+            .unwrap()
+            .1
+            .clone();
+        apply_skill_deployment(
+            &source,
+            &hermes_root.join("skills"),
+            "docs",
+            true,
+            SkillSyncMethod::Copy,
+        )
+        .unwrap()
+        .commit()
+        .unwrap();
+        let live = SkillLiveConfig::new(source, unified, SkillSyncMethod::Copy, roots).unwrap();
+        let mut configs = enabled_configs();
+        configs.insert(
+            SkillConfigTarget::HermesConfig,
+            Ok(Some(b"skills:\n  disabled: [Docs]\n".to_vec())),
+        );
+        let observations = live.observe(&skill_request(), &configs);
+        assert_eq!(observations[0].app_overrides["hermes"].enabled, Some(false));
+        assert!(observations[0].app_overrides["hermes"].issue.is_none());
+
+        configs.insert(
+            SkillConfigTarget::HermesConfig,
+            Ok(Some(
+                b"skills:\n  platform_disabled:\n    telegram: [Docs]\n".to_vec(),
+            )),
+        );
+        let observations = live.observe(&skill_request(), &configs);
+        let state = &observations[0].app_overrides["hermes"];
+        assert_eq!(state.enabled, Some(false));
+        assert!(state
+            .issue
+            .as_deref()
+            .is_some_and(|issue| issue.contains("platform-specific")));
+    }
+
+    #[test]
+    fn duplicate_native_names_are_reported_per_application() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join(".cc-switch/skills");
+        for name in ["docs", "other"] {
+            fs::create_dir_all(source.join(name)).unwrap();
+            fs::write(source.join(name).join("SKILL.md"), "# Skill").unwrap();
+        }
+        let roots = app_roots(directory.path());
+        for (_, root) in &roots {
+            fs::create_dir_all(root).unwrap();
+        }
+        let live = SkillLiveConfig::new(
+            source,
+            directory.path().join(".agents/skills"),
+            SkillSyncMethod::Copy,
+            roots,
+        )
+        .unwrap();
+        let skills = vec![
+            ("one".to_owned(), "Docs".to_owned(), "docs".to_owned()),
+            ("two".to_owned(), "Ｄocs".to_owned(), "other".to_owned()),
+        ];
+
+        let observations = live.observe(&skills, &enabled_configs());
+        for observation in observations {
+            for app in ["gemini", "grokbuild", "hermes"] {
+                assert!(observation.app_overrides[app]
+                    .issue
+                    .as_deref()
+                    .is_some_and(|issue| issue.contains("native name")));
+            }
+            assert!(observation.app_overrides["claude"].issue.is_none());
+        }
     }
 
     #[test]
@@ -588,7 +724,7 @@ mod tests {
         for descriptor in builtin_app_registry().descriptors().filter(|descriptor| {
             descriptor
                 .skill_contract()
-                .is_some_and(|contract| contract.unified_control().is_some())
+                .is_some_and(|contract| contract.discovery() == SkillDiscoveryMode::Unified)
         }) {
             let state = &observations[0].app_overrides[descriptor.id()];
             assert_eq!(state.enabled, None, "{}", descriptor.id());

@@ -9,7 +9,7 @@ use std::{
 use cc_switch_core::{
     builtin_app_registry, fs::shared_live_config_lock_path, project_skill_config_enabled, AppType,
     ContentExpectation, PlannedWrite, SkillConfigTarget, SkillDeploymentReceipt, SkillSyncMethod,
-    UnifiedSkillControl, MAX_OPERATION_CONTENT_BYTES, OPERATION_CONTRACT_MAJOR,
+    MAX_OPERATION_CONTENT_BYTES, OPERATION_CONTRACT_MAJOR,
 };
 use fs4::{FileExt, TryLockError};
 use serde::Deserialize;
@@ -68,11 +68,16 @@ impl LiveError {
 }
 
 pub struct LiveConfig {
+    home: PathBuf,
     native: NativeLiveConfig,
     mcp: McpLiveConfig,
-    skill: SkillLiveConfig,
     lock_path: PathBuf,
     gate: Mutex<()>,
+}
+
+struct SkillRuntime {
+    native: NativeLiveConfig,
+    skill: SkillLiveConfig,
 }
 
 pub(crate) struct LockedLiveReceipt<'a, T> {
@@ -141,28 +146,8 @@ impl LiveConfig {
         let settings = load_shared_path_settings(home);
         let dirs = resolve_config_dirs(home, &settings)?;
         let claude_mcp = claude_mcp_path(home, &dirs.claude)?;
-        let skill_roots = vec![
-            (AppType::Claude, dirs.claude.clone()),
-            (AppType::Codex, dirs.codex.clone()),
-            (AppType::Gemini, dirs.gemini.clone()),
-            (AppType::GrokBuild, dirs.grok.clone()),
-            (AppType::OpenCode, dirs.opencode.clone()),
-            (AppType::Hermes, dirs.hermes.clone()),
-            (AppType::Pi, dirs.pi.clone()),
-        ]
-        .into_iter()
-        .map(|(app, root)| absolute_skill_root(&root).map(|root| (app, root)))
-        .collect::<Result<Vec<_>, _>>()?;
-        let skill = SkillLiveConfig::new(
-            absolute_skill_root(&skill_source_root(
-                home,
-                settings.skill_storage_location.as_deref(),
-            ))?,
-            absolute_skill_root(&home.join(".agents/skills"))?,
-            skill_sync_method(settings.skill_sync_method.as_deref()),
-            skill_roots,
-        )?;
         Ok(Self {
+            home: home.to_owned(),
             native: NativeLiveConfig::from_home(home, &dirs)?,
             mcp: McpLiveConfig::new(
                 (claude_mcp, dirs.claude),
@@ -172,7 +157,6 @@ impl LiveConfig {
                 (dirs.opencode.join("opencode.json"), dirs.opencode),
                 (dirs.hermes.join("config.yaml"), dirs.hermes),
             ),
-            skill,
             lock_path: shared_live_config_lock_path(home),
             gate: Mutex::new(()),
         })
@@ -200,10 +184,11 @@ impl LiveConfig {
         enabled: bool,
     ) -> Result<SkillWriteReceipt<'_>, LiveError> {
         self.lock_result(|| {
-            let route = self.skill.route(directory, app)?;
+            let runtime = self.current_skill_runtime()?;
+            let route = runtime.skill.route(directory, app)?;
             let configuration = if let Some(target) = route.config_target {
                 let logical_target = target.logical_target();
-                let (paths, current) = self.native.observe_target(logical_target)?;
+                let (paths, current) = runtime.native.observe_target(logical_target)?;
                 if let Some(contents) =
                     project_skill_config_enabled(target, current.as_deref(), name, enabled)
                         .map_err(SkillLiveError::from)?
@@ -231,7 +216,7 @@ impl LiveConfig {
                 None
             };
             let deployment = if route.deploy_native {
-                match self.skill.apply_deployment(directory, app, enabled) {
+                match runtime.skill.apply_deployment(directory, app, enabled) {
                     Ok(receipt) => Some(receipt),
                     Err(error) => {
                         if let Some(receipt) = configuration {
@@ -259,31 +244,57 @@ impl LiveConfig {
         skills: &[(String, String, String)],
     ) -> Result<Vec<SkillObservation>, LiveError> {
         self.with_lock(|| {
-            let configs = self.observe_skill_configs();
-            Ok(self.skill.observe(skills, &configs))
+            let runtime = self.current_skill_runtime()?;
+            let configs = Self::observe_skill_configs(&runtime.native);
+            Ok(runtime.skill.observe(skills, &configs))
         })
     }
 
-    fn observe_skill_configs(&self) -> SkillConfigDocuments {
+    fn observe_skill_configs(native: &NativeLiveConfig) -> SkillConfigDocuments {
         let targets = builtin_app_registry()
             .descriptors()
             .filter_map(|descriptor| descriptor.skill_contract())
-            .filter_map(|contract| match contract.unified_control() {
-                Some(UnifiedSkillControl::DisabledNameList(target)) => Some(target),
-                Some(UnifiedSkillControl::ReadOnly) | None => None,
-            })
+            .filter_map(|contract| contract.config_target())
             .collect::<std::collections::HashSet<_>>();
         targets
             .into_iter()
             .map(|target| {
-                let contents = self
-                    .native
+                let contents = native
                     .observe_target(target.logical_target())
                     .map(|(_, contents)| contents)
                     .map_err(|error| error.to_string());
                 (target, contents)
             })
             .collect::<HashMap<SkillConfigTarget, _>>()
+    }
+
+    fn current_skill_runtime(&self) -> Result<SkillRuntime, LiveError> {
+        let settings = load_shared_path_settings_strict(&self.home)?;
+        let dirs = resolve_config_dirs(&self.home, &settings)?;
+        let roots = vec![
+            (AppType::Claude, dirs.claude.clone()),
+            (AppType::Codex, dirs.codex.clone()),
+            (AppType::Gemini, dirs.gemini.clone()),
+            (AppType::GrokBuild, dirs.grok.clone()),
+            (AppType::OpenCode, dirs.opencode.clone()),
+            (AppType::Hermes, dirs.hermes.clone()),
+            (AppType::Pi, dirs.pi.clone()),
+        ]
+        .into_iter()
+        .map(|(app, root)| absolute_skill_root(&root).map(|root| (app, root)))
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok(SkillRuntime {
+            native: NativeLiveConfig::from_home(&self.home, &dirs)?,
+            skill: SkillLiveConfig::new(
+                absolute_skill_root(&skill_source_root(
+                    &self.home,
+                    settings.skill_storage_location.as_deref(),
+                ))?,
+                absolute_skill_root(&self.home.join(".agents/skills"))?,
+                skill_sync_method(settings.skill_sync_method.as_deref()),
+                roots,
+            )?,
+        })
     }
 
     pub fn rollback_mcp(&self, receipt: McpWriteReceipt<'_>) -> Result<(), LiveError> {
@@ -511,6 +522,10 @@ impl RecoverableSkillChange for SkillWriteReceipt<'_> {
         drop(gate);
         result
     }
+
+    fn recovery_incomplete(error: &Self::Error) -> bool {
+        matches!(error, LiveError::Recovery(_))
+    }
 }
 
 fn resolve_config_dirs(
@@ -597,6 +612,24 @@ fn load_shared_path_settings(home: &Path) -> SharedPathSettings {
         return SharedPathSettings::default();
     }
     serde_json::from_slice(&contents).unwrap_or_default()
+}
+
+fn load_shared_path_settings_strict(home: &Path) -> Result<SharedPathSettings, LiveError> {
+    let path = device_settings_path(home);
+    let contents = match fs::read(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SharedPathSettings::default())
+        }
+        Err(source) => return Err(LiveError::Io { path, source }),
+    };
+    if contents.len() > MAX_OPERATION_CONTENT_BYTES {
+        return Err(LiveError::InvalidConfig(
+            "shared settings document is too large".to_owned(),
+        ));
+    }
+    serde_json::from_slice(&contents)
+        .map_err(|_| LiveError::InvalidConfig("shared settings document is invalid".to_owned()))
 }
 
 fn device_settings_path(home: &Path) -> PathBuf {
@@ -884,6 +917,54 @@ mod tests {
                 .unwrap()
                 .join("profiles/claude")
         );
+    }
+
+    #[test]
+    fn skill_operations_reload_shared_paths_storage_and_sync_method() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let shared = directory.path().join(".cc-switch");
+        let initial_claude = directory.path().join("claude-initial");
+        let current_claude = directory.path().join("claude-current");
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(&initial_claude).unwrap();
+        fs::write(
+            shared.join("settings.json"),
+            serde_json::to_vec(&json!({
+                "claudeConfigDir": initial_claude,
+                "skillStorageLocation": "cc_switch",
+                "skillSyncMethod": "symlink"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let live = LiveConfig::from_home(directory.path()).unwrap();
+
+        let unified = directory.path().join(".agents/skills/docs");
+        fs::create_dir_all(&unified).unwrap();
+        fs::write(unified.join("SKILL.md"), "# Docs").unwrap();
+        fs::create_dir_all(&current_claude).unwrap();
+        fs::write(
+            shared.join("settings.json"),
+            serde_json::to_vec(&json!({
+                "claudeConfigDir": current_claude,
+                "skillStorageLocation": "unified",
+                "skillSyncMethod": "copy"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let receipt = live
+            .apply_skill_recoverable("Docs", "docs", &AppType::Claude, true)
+            .unwrap();
+        receipt.verify().unwrap();
+        receipt.commit().unwrap();
+        let deployed = current_claude.join("skills/docs");
+        assert!(fs::symlink_metadata(&deployed)
+            .unwrap()
+            .file_type()
+            .is_dir());
+        assert!(!initial_claude.join("skills/docs").exists());
     }
 
     #[test]

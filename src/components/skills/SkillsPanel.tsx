@@ -70,11 +70,7 @@ export function SkillsPanel({
       Object.fromEntries(
         apps.map((app) => [
           app.id,
-          skills.filter(
-            (skill) =>
-              skill.apps[app.id]?.enabled === true &&
-              !skill.apps[app.id]?.issue,
-          ).length,
+          skills.filter((skill) => skill.apps[app.id]?.enabled === true).length,
         ]),
       ),
     [apps, skills],
@@ -254,16 +250,28 @@ export function SkillsPanel({
                       };
                       const enabled = appState.enabled === true;
                       const key = `${skill.id}:${app.id}`;
-                      const appIssue = appState.issue;
-                      if (appIssue) {
+                      const readOnlyIssue = appState.issue || skill.issue;
+                      const stateLabel =
+                        appState.enabled == null
+                          ? "state unknown"
+                          : enabled
+                            ? "enabled"
+                            : "disabled";
+                      if (readOnlyIssue) {
                         return (
                           <span
                             key={app.id}
                             role="status"
                             tabIndex={0}
-                            aria-label={`${definition.label}: read-only. ${appIssue}`}
-                            title={appIssue}
-                            className="relative flex h-7 w-7 items-center justify-center rounded-lg bg-muted text-muted-foreground opacity-70"
+                            aria-label={`${definition.label}: ${stateLabel}, read-only. ${readOnlyIssue}`}
+                            title={`${stateLabel}; ${readOnlyIssue}`}
+                            className={`relative flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground ${
+                              enabled
+                                ? "bg-emerald-500/15 opacity-100"
+                                : appState.enabled == null
+                                  ? "border border-amber-500/40 bg-muted opacity-70"
+                                  : "bg-muted opacity-45"
+                            }`}
                           >
                             <ProviderIcon
                               icon={definition.icon}
@@ -277,7 +285,7 @@ export function SkillsPanel({
                           </span>
                         );
                       }
-                      const disabled = pending !== null || Boolean(skill.issue);
+                      const disabled = pending !== null;
                       return (
                         <button
                           key={app.id}
