@@ -443,6 +443,15 @@ fn merge_imports(
                     ));
                     continue;
                 }
+                if import.enabled {
+                    if let Err(error) = validate_app_activation(&app, &current.id, &current.server)
+                    {
+                        report
+                            .failed_apps
+                            .push(format!("{}: {error}", app.as_str()));
+                        continue;
+                    }
+                }
                 if current.apps.enabled(&app) != import.enabled {
                     current.apps.set(&app, import.enabled)?;
                     let column = enabled_column(&app)?;
@@ -608,9 +617,7 @@ fn validate_server(server: &McpServer) -> Result<(), McpError> {
     }
     for app in AppType::all() {
         if server.apps.enabled(&app) {
-            require_mcp_app(&app)?;
-            validate_mcp_server_for_app(&app, &server.id, &server.server)
-                .map_err(|error| McpError::InvalidServer(error.to_string()))?;
+            validate_app_activation(&app, &server.id, &server.server)?;
         }
     }
     if server.tags.len() > 32
@@ -636,6 +643,12 @@ fn validate_server(server: &McpServer) -> Result<(), McpError> {
         }
     }
     Ok(())
+}
+
+fn validate_app_activation(app: &AppType, id: &str, server: &Value) -> Result<(), McpError> {
+    require_mcp_app(app)?;
+    validate_mcp_server_for_app(app, id, server)
+        .map_err(|error| McpError::InvalidServer(error.to_string()))
 }
 
 fn require_mcp_app(app: &AppType) -> Result<(), McpError> {
@@ -1101,6 +1114,43 @@ mod tests {
         let report = import_observed(&store, import(true), true).unwrap();
         assert_eq!(report.enabled_apps, 1);
         assert!(store.list().unwrap().remove(0).apps.opencode);
+    }
+
+    #[test]
+    fn import_rejects_activation_the_target_cannot_represent() {
+        let directory = tempdir().unwrap();
+        let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let mut record = server();
+        record.server = json!({"type":"stdio","command":"npx","cwd":"/repo"});
+        record.apps = McpApps::default();
+        store
+            .upsert_with_live(record, |_| Ok::<_, ()>(()), |_| Ok(()))
+            .unwrap()
+            .unwrap();
+
+        let report = import_observed(
+            &store,
+            vec![(
+                AppType::OpenCode,
+                Ok(vec![cc_switch_core::McpImport {
+                    id: "context7".to_owned(),
+                    server: json!({"type":"stdio","command":"npx"}),
+                    enabled: true,
+                    native_snapshot: None,
+                }]),
+            )],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.enabled_apps, 0);
+        assert_eq!(report.failed_apps.len(), 1);
+        assert!(!store.list().unwrap().remove(0).apps.opencode);
+        assert!(
+            get_native_link(&store.connect().unwrap(), "context7", &AppType::OpenCode)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
