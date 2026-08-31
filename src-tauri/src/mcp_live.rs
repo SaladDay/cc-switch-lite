@@ -87,7 +87,7 @@ impl McpLiveConfig {
         }
     }
 
-    pub fn apply(&self, changes: &[McpLiveChange]) -> Result<McpLiveReceipt, LiveError> {
+    pub fn apply(&self, changes: &mut [McpLiveChange]) -> Result<McpLiveReceipt, LiveError> {
         let mut receipt = McpLiveReceipt { writes: Vec::new() };
         for change in changes {
             if let Err(error) = self.apply_one(change, &mut receipt) {
@@ -152,19 +152,19 @@ impl McpLiveConfig {
 
     fn apply_one(
         &self,
-        change: &McpLiveChange,
+        change: &mut McpLiveChange,
         receipt: &mut McpLiveReceipt,
     ) -> Result<(), LiveError> {
-        let configured = self.path_for_app(change.app())?;
+        let app = change.app().clone();
+        let configured = self.path_for_app(&app)?;
         if !configured.path.exists() && !configured.install_marker.exists() {
             return Ok(());
         }
         let path = resolve_write_path(&configured.path)?;
         let before = read_optional(&path)?;
-        let adapter = builtin_app_adapter(change.app());
+        let adapter = builtin_app_adapter(&app);
         let imports = match adapter.import_mcp_servers(before.as_deref()) {
             Ok(imports) => imports,
-            Err(_) if !change.is_strict() => return Ok(()),
             Err(error) => return Err(LiveError::InvalidConfig(error.to_string())),
         };
         let current = imports.iter().find(|entry| entry.id == change.id());
@@ -173,49 +173,54 @@ impl McpLiveConfig {
                 id,
                 previous,
                 server,
+                native_snapshot,
                 ..
             } => {
                 if current.is_some_and(|current| {
-                    !mcp_servers_equivalent(change.app(), &current.server, server)
+                    !mcp_servers_equivalent(&app, &current.server, server)
                         && previous.as_ref().is_none_or(|previous| {
-                            !mcp_servers_equivalent(change.app(), &current.server, previous)
+                            !mcp_servers_equivalent(&app, &current.server, previous)
                         })
                 }) {
                     return Err(OperationError::Conflict.into());
                 }
-                (id.as_str(), McpServerProjection::Enable(server))
+                let projection = if current.is_none() {
+                    native_snapshot
+                        .as_ref()
+                        .map_or(McpServerProjection::Enable(server), |snapshot| {
+                            McpServerProjection::Restore { server, snapshot }
+                        })
+                } else {
+                    McpServerProjection::Enable(server)
+                };
+                (id.as_str(), projection)
             }
             McpLiveChange::Disable {
                 id,
                 previous,
                 server,
-                strict,
+                native_snapshot,
                 ..
             } => {
                 let Some(current) = current else {
                     return Ok(());
                 };
-                if !mcp_servers_equivalent(change.app(), &current.server, previous)
-                    && !mcp_servers_equivalent(change.app(), &current.server, server)
+                if !mcp_servers_equivalent(&app, &current.server, previous)
+                    && !mcp_servers_equivalent(&app, &current.server, server)
                 {
-                    if *strict {
-                        return Err(OperationError::Conflict.into());
-                    }
-                    return Ok(());
+                    return Err(OperationError::Conflict.into());
+                }
+                if let Some(snapshot) = &current.native_snapshot {
+                    *native_snapshot = Some(snapshot.clone());
                 }
                 (id.as_str(), McpServerProjection::Disable(server))
             }
-            McpLiveChange::Remove {
-                id, server, strict, ..
-            } => {
+            McpLiveChange::Remove { id, server, .. } => {
                 let Some(current) = current else {
                     return Ok(());
                 };
-                if !mcp_servers_equivalent(change.app(), &current.server, server) {
-                    if *strict {
-                        return Err(OperationError::Conflict.into());
-                    }
-                    return Ok(());
+                if !mcp_servers_equivalent(&app, &current.server, server) {
+                    return Err(OperationError::Conflict.into());
                 }
                 (id.as_str(), McpServerProjection::Remove)
             }
@@ -227,6 +232,9 @@ impl McpLiveConfig {
             return Ok(());
         };
         let after = projected.into_bytes();
+        if let McpLiveChange::Upsert { applied, .. } = change {
+            *applied = true;
+        }
         if before.as_deref() == Some(after.as_slice()) {
             return Ok(());
         }
@@ -323,21 +331,25 @@ mod tests {
         )
         .unwrap();
         let live = config(directory.path());
-        let changes = [
+        let mut changes = [
             McpLiveChange::Upsert {
                 app: AppType::Claude,
                 id: "server".to_owned(),
                 previous: None,
                 server: json!({"type":"stdio","command":"npx"}),
+                native_snapshot: None,
+                applied: false,
             },
             McpLiveChange::Upsert {
                 app: AppType::Codex,
                 id: "server".to_owned(),
                 previous: None,
                 server: json!({"type":"stdio","command":"npx"}),
+                native_snapshot: None,
+                applied: false,
             },
         ];
-        let receipt = live.apply(&changes).unwrap();
+        let receipt = live.apply(&mut changes).unwrap();
         let claude: Value =
             serde_json::from_slice(&fs::read(directory.path().join(".claude.json")).unwrap())
                 .unwrap();
@@ -363,14 +375,15 @@ mod tests {
     fn skips_writes_for_apps_that_are_not_installed() {
         let directory = tempdir().unwrap();
         let live = config(directory.path());
-        let receipt = live
-            .apply(&[McpLiveChange::Upsert {
-                app: AppType::Gemini,
-                id: "server".to_owned(),
-                previous: None,
-                server: json!({"type":"stdio","command":"npx"}),
-            }])
-            .unwrap();
+        let mut changes = [McpLiveChange::Upsert {
+            app: AppType::Gemini,
+            id: "server".to_owned(),
+            previous: None,
+            server: json!({"type":"stdio","command":"npx"}),
+            native_snapshot: None,
+            applied: false,
+        }];
+        let receipt = live.apply(&mut changes).unwrap();
         assert!(receipt.writes.is_empty());
         assert!(!directory.path().join(".gemini/settings.json").exists());
     }
@@ -390,57 +403,94 @@ mod tests {
         let previous = json!({"type":"stdio","command":"old"});
         let updated = json!({"type":"stdio","command":"new"});
 
-        live.apply(&[McpLiveChange::Disable {
+        let mut disable = [McpLiveChange::Disable {
             app: AppType::OpenCode,
             id: "server".to_owned(),
             previous,
             server: updated.clone(),
-            strict: true,
-        }])
-        .unwrap();
+            native_snapshot: None,
+        }];
+        live.apply(&mut disable).unwrap();
         let disabled: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(disabled["mcp"]["server"]["command"], json!(["new"]));
         assert_eq!(disabled["mcp"]["server"]["timeout"], 30);
         assert_eq!(disabled["mcp"]["server"]["enabled"], false);
 
-        live.apply(&[McpLiveChange::Upsert {
+        let mut enable = [McpLiveChange::Upsert {
             app: AppType::OpenCode,
             id: "server".to_owned(),
             previous: Some(updated.clone()),
             server: updated,
-        }])
-        .unwrap();
+            native_snapshot: None,
+            applied: false,
+        }];
+        live.apply(&mut enable).unwrap();
         let enabled: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(enabled["mcp"]["server"]["timeout"], 30);
         assert_eq!(enabled["mcp"]["server"]["enabled"], true);
     }
 
     #[test]
-    fn catalog_delete_does_not_remove_a_conflicting_native_entry() {
+    fn removable_native_entry_restores_application_owned_fields() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join(".gemini");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"mcpServers":{"server":{"command":"old","timeout":30,"trust":true}}}"#,
+        )
+        .unwrap();
+        let live = config(directory.path());
+        let shared = json!({"type":"stdio","command":"old"});
+        let mut disable = [McpLiveChange::Disable {
+            app: AppType::Gemini,
+            id: "server".to_owned(),
+            previous: shared.clone(),
+            server: shared.clone(),
+            native_snapshot: None,
+        }];
+
+        live.apply(&mut disable).unwrap();
+        let snapshot = match &disable[0] {
+            McpLiveChange::Disable {
+                native_snapshot: Some(snapshot),
+                ..
+            } => snapshot.clone(),
+            _ => panic!("Gemini disable must capture its native entry"),
+        };
+        let disabled: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(disabled["mcpServers"].get("server").is_none());
+
+        let mut enable = [McpLiveChange::Upsert {
+            app: AppType::Gemini,
+            id: "server".to_owned(),
+            previous: Some(shared),
+            server: json!({"type":"stdio","command":"new"}),
+            native_snapshot: Some(snapshot),
+            applied: false,
+        }];
+        live.apply(&mut enable).unwrap();
+        let enabled: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(enabled["mcpServers"]["server"]["command"], "new");
+        assert_eq!(enabled["mcpServers"]["server"]["timeout"], 30);
+        assert_eq!(enabled["mcpServers"]["server"]["trust"], true);
+    }
+
+    #[test]
+    fn owned_delete_rejects_a_diverged_native_entry() {
         let directory = tempdir().unwrap();
         fs::create_dir_all(directory.path().join(".claude")).unwrap();
         let path = directory.path().join(".claude.json");
         let original = r#"{"mcpServers":{"server":{"command":"external"}}}"#;
         fs::write(&path, original).unwrap();
 
-        let receipt = config(directory.path())
-            .apply(&[McpLiveChange::Remove {
-                app: AppType::Claude,
-                id: "server".to_owned(),
-                server: json!({"type":"stdio","command":"shared"}),
-                strict: false,
-            }])
-            .unwrap();
-
-        assert!(receipt.writes.is_empty());
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
-
-        let result = config(directory.path()).apply(&[McpLiveChange::Remove {
+        let mut changes = [McpLiveChange::Remove {
             app: AppType::Claude,
             id: "server".to_owned(),
             server: json!({"type":"stdio","command":"shared"}),
-            strict: true,
-        }]);
+        }];
+        let result = config(directory.path()).apply(&mut changes);
         let error = match result {
             Err(error) => error,
             Ok(_) => panic!("an enabled link must not silently diverge"),

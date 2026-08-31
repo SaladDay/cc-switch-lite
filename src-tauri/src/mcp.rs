@@ -2,7 +2,7 @@ use std::{collections::HashSet, fmt, path::PathBuf, time::Duration};
 
 use cc_switch_core::{
     builtin_app_adapter, builtin_app_registry, mcp_servers_equivalent, validate_mcp_server,
-    AppCapability, AppType,
+    validate_mcp_server_for_app, AppCapability, AppType, McpNativeSnapshot,
 };
 use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior};
@@ -139,19 +139,20 @@ pub enum McpLiveChange {
         id: String,
         previous: Option<Value>,
         server: Value,
+        native_snapshot: Option<McpNativeSnapshot>,
+        applied: bool,
     },
     Disable {
         app: AppType,
         id: String,
         previous: Value,
         server: Value,
-        strict: bool,
+        native_snapshot: Option<McpNativeSnapshot>,
     },
     Remove {
         app: AppType,
         id: String,
         server: Value,
-        strict: bool,
     },
 }
 
@@ -165,13 +166,6 @@ impl McpLiveChange {
     pub fn id(&self) -> &str {
         match self {
             Self::Upsert { id, .. } | Self::Disable { id, .. } | Self::Remove { id, .. } => id,
-        }
-    }
-
-    pub fn is_strict(&self) -> bool {
-        match self {
-            Self::Upsert { .. } => true,
-            Self::Disable { strict, .. } | Self::Remove { strict, .. } => *strict,
         }
     }
 }
@@ -217,7 +211,7 @@ impl McpStore {
     pub fn upsert_with_live<T, E>(
         &self,
         server: McpServer,
-        apply: impl FnOnce(&[McpLiveChange]) -> Result<T, E>,
+        apply: impl FnOnce(&mut [McpLiveChange]) -> Result<T, E>,
         rollback: impl FnOnce(T) -> Result<(), String>,
     ) -> Result<Result<(), E>, McpError> {
         validate_server(&server)?;
@@ -225,8 +219,8 @@ impl McpStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = get_server(&transaction, &server.id, &self.revision_key)?;
         ensure_expected_revision(current.as_ref(), server.revision)?;
-        let changes = live_changes(current.as_ref(), Some(&server));
-        let receipt = match apply(&changes) {
+        let mut changes = live_changes(&transaction, current.as_ref(), Some(&server))?;
+        let receipt = match apply(&mut changes) {
             Ok(receipt) => receipt,
             Err(error) => {
                 transaction.rollback()?;
@@ -234,6 +228,7 @@ impl McpStore {
             }
         };
         let finalize = (|| -> Result<(), McpError> {
+            persist_native_links(&transaction, &changes)?;
             save_server(&transaction, &server)?;
             transaction.commit()?;
             Ok(())
@@ -248,7 +243,7 @@ impl McpStore {
         expected_revision: u64,
         app: AppType,
         enabled: bool,
-        apply: impl FnOnce(&[McpLiveChange]) -> Result<T, E>,
+        apply: impl FnOnce(&mut [McpLiveChange]) -> Result<T, E>,
         rollback: impl FnOnce(T) -> Result<(), String>,
     ) -> Result<Result<(), E>, McpError> {
         require_mcp_app(&app)?;
@@ -263,8 +258,9 @@ impl McpStore {
         }
         let mut updated = current.clone();
         updated.apps.set(&app, enabled)?;
-        let changes = live_changes(Some(&current), Some(&updated));
-        let receipt = match apply(&changes) {
+        validate_server(&updated)?;
+        let mut changes = live_changes(&transaction, Some(&current), Some(&updated))?;
+        let receipt = match apply(&mut changes) {
             Ok(receipt) => receipt,
             Err(error) => {
                 transaction.rollback()?;
@@ -272,6 +268,7 @@ impl McpStore {
             }
         };
         let finalize = (|| -> Result<(), McpError> {
+            persist_native_links(&transaction, &changes)?;
             let column = enabled_column(&app)?;
             let changed = transaction.execute(
                 &format!("UPDATE mcp_servers SET {column} = ?1 WHERE id = ?2"),
@@ -291,7 +288,7 @@ impl McpStore {
         &self,
         id: &str,
         expected_revision: u64,
-        apply: impl FnOnce(&[McpLiveChange]) -> Result<T, E>,
+        apply: impl FnOnce(&mut [McpLiveChange]) -> Result<T, E>,
         rollback: impl FnOnce(T) -> Result<(), String>,
     ) -> Result<Result<(), E>, McpError> {
         let mut connection = self.connect()?;
@@ -299,8 +296,8 @@ impl McpStore {
         let current = get_server(&transaction, id, &self.revision_key)?
             .ok_or_else(|| McpError::NotFound(id.into()))?;
         ensure_expected_revision(Some(&current), expected_revision)?;
-        let changes = live_changes(Some(&current), None);
-        let receipt = match apply(&changes) {
+        let mut changes = live_changes(&transaction, Some(&current), None)?;
+        let receipt = match apply(&mut changes) {
             Ok(receipt) => receipt,
             Err(error) => {
                 transaction.rollback()?;
@@ -308,6 +305,7 @@ impl McpStore {
             }
         };
         let finalize = (|| -> Result<(), McpError> {
+            persist_native_links(&transaction, &changes)?;
             let changed = transaction.execute("DELETE FROM mcp_servers WHERE id = ?1", [id])?;
             if changed != 1 {
                 return Err(McpError::NotFound(id.to_owned()));
@@ -368,7 +366,17 @@ impl McpStore {
                 enabled_grokbuild BOOLEAN NOT NULL DEFAULT 0,
                 enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
                 enabled_hermes BOOLEAN NOT NULL DEFAULT 0
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS mcp_native_links (
+                server_id TEXT NOT NULL,
+                app_id TEXT NOT NULL,
+                native_snapshot TEXT,
+                PRIMARY KEY (server_id, app_id)
+            );
+            DELETE FROM mcp_native_links
+             WHERE NOT EXISTS (
+                SELECT 1 FROM mcp_servers WHERE mcp_servers.id = mcp_native_links.server_id
+             );",
         )?;
         for (column, definition) in [
             ("description", "TEXT"),
@@ -440,6 +448,9 @@ fn merge_imports(
                         report.disabled_apps += 1;
                     }
                 }
+                if import.enabled {
+                    upsert_native_link(transaction, &import.id, &app, None, false)?;
+                }
             } else {
                 let mut apps = McpApps::default();
                 apps.set(&app, import.enabled)?;
@@ -456,6 +467,9 @@ fn merge_imports(
                 };
                 validate_server(&server)?;
                 save_server(transaction, &server)?;
+                if import.enabled {
+                    upsert_native_link(transaction, &server.id, &app, None, false)?;
+                }
                 report.new_servers += 1;
             }
         }
@@ -586,6 +600,8 @@ fn validate_server(server: &McpServer) -> Result<(), McpError> {
     for app in AppType::all() {
         if server.apps.enabled(&app) {
             require_mcp_app(&app)?;
+            validate_mcp_server_for_app(&app, &server.id, &server.server)
+                .map_err(|error| McpError::InvalidServer(error.to_string()))?;
         }
     }
     if server.tags.len() > 32
@@ -639,49 +655,127 @@ fn enabled_column(app: &AppType) -> Result<&'static str, McpError> {
     })
 }
 
-fn live_changes(before: Option<&McpServer>, after: Option<&McpServer>) -> Vec<McpLiveChange> {
-    AppType::all()
-        .filter(|app| {
-            builtin_app_registry()
-                .for_app(app)
-                .supports(AppCapability::Mcp)
-        })
-        .filter_map(|app| {
-            let was_enabled = before.is_some_and(|server| server.apps.enabled(&app));
-            let is_enabled = after.is_some_and(|server| server.apps.enabled(&app));
-            match (before, after, was_enabled, is_enabled) {
-                (previous, Some(server), _, true)
-                    if !was_enabled
-                        || previous.is_none_or(|current| current.server != server.server) =>
-                {
-                    Some(McpLiveChange::Upsert {
-                        app,
-                        id: server.id.clone(),
-                        previous: previous.map(|server| server.server.clone()),
-                        server: server.server.clone(),
-                    })
-                }
-                (Some(previous), Some(server), _, false)
-                    if was_enabled || previous.server != server.server =>
-                {
-                    Some(McpLiveChange::Disable {
-                        app,
-                        id: server.id.clone(),
-                        previous: previous.server.clone(),
-                        server: server.server.clone(),
-                        strict: was_enabled,
-                    })
-                }
-                (Some(previous), None, _, _) => Some(McpLiveChange::Remove {
+fn live_changes(
+    transaction: &rusqlite::Transaction<'_>,
+    before: Option<&McpServer>,
+    after: Option<&McpServer>,
+) -> Result<Vec<McpLiveChange>, McpError> {
+    let mut changes = Vec::new();
+    for app in AppType::all().filter(|app| {
+        builtin_app_registry()
+            .for_app(app)
+            .supports(AppCapability::Mcp)
+    }) {
+        let id = after
+            .or(before)
+            .expect("a live change has a server")
+            .id
+            .as_str();
+        let native_link = get_native_link(transaction, id, &app)?;
+        let was_enabled = before.is_some_and(|server| server.apps.enabled(&app));
+        let is_enabled = after.is_some_and(|server| server.apps.enabled(&app));
+        match (before, after, was_enabled, is_enabled) {
+            (previous, Some(server), _, true)
+                if !was_enabled
+                    || previous.is_none_or(|current| current.server != server.server) =>
+            {
+                changes.push(McpLiveChange::Upsert {
+                    app,
+                    id: server.id.clone(),
+                    previous: previous.map(|server| server.server.clone()),
+                    server: server.server.clone(),
+                    native_snapshot: native_link.clone().flatten(),
+                    applied: false,
+                });
+            }
+            (Some(previous), Some(server), true, false) => {
+                changes.push(McpLiveChange::Disable {
+                    app,
+                    id: server.id.clone(),
+                    previous: previous.server.clone(),
+                    server: server.server.clone(),
+                    native_snapshot: native_link.clone().flatten(),
+                });
+            }
+            (Some(previous), None, _, _) if was_enabled || native_link.is_some() => {
+                changes.push(McpLiveChange::Remove {
                     app,
                     id: previous.id.clone(),
                     server: previous.server.clone(),
-                    strict: was_enabled,
-                }),
-                _ => None,
+                });
             }
+            _ => {}
+        }
+    }
+    Ok(changes)
+}
+
+fn get_native_link(
+    connection: &Connection,
+    server_id: &str,
+    app: &AppType,
+) -> Result<Option<Option<McpNativeSnapshot>>, McpError> {
+    let raw = connection
+        .query_row(
+            "SELECT native_snapshot FROM mcp_native_links WHERE server_id = ?1 AND app_id = ?2",
+            params![server_id, app.as_str()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    raw.map(|raw| {
+        raw.map(|raw| {
+            serde_json::from_str(&raw).map_err(|error| McpError::InvalidStore(error.to_string()))
         })
-        .collect()
+        .transpose()
+    })
+    .transpose()
+}
+
+fn persist_native_links(
+    connection: &Connection,
+    changes: &[McpLiveChange],
+) -> Result<(), McpError> {
+    for change in changes {
+        match change {
+            McpLiveChange::Upsert {
+                app, id, applied, ..
+            } => upsert_native_link(connection, id, app, None, *applied)?,
+            McpLiveChange::Disable {
+                app,
+                id,
+                native_snapshot,
+                ..
+            } => upsert_native_link(connection, id, app, native_snapshot.as_ref(), true)?,
+            McpLiveChange::Remove { app, id, .. } => {
+                connection.execute(
+                    "DELETE FROM mcp_native_links WHERE server_id = ?1 AND app_id = ?2",
+                    params![id, app.as_str()],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn upsert_native_link(
+    connection: &Connection,
+    server_id: &str,
+    app: &AppType,
+    snapshot: Option<&McpNativeSnapshot>,
+    replace_snapshot: bool,
+) -> Result<(), McpError> {
+    let snapshot = snapshot
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| McpError::InvalidStore(error.to_string()))?;
+    connection.execute(
+        "INSERT INTO mcp_native_links (server_id, app_id, native_snapshot)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(server_id, app_id) DO UPDATE SET native_snapshot =
+           CASE WHEN ?4 THEN excluded.native_snapshot ELSE mcp_native_links.native_snapshot END",
+        params![server_id, app.as_str(), snapshot, replace_snapshot],
+    )?;
+    Ok(())
 }
 
 fn recover_on_failure<T>(
@@ -737,6 +831,17 @@ fn verify_schema(connection: &Connection) -> Result<(), McpError> {
         if !columns.contains(required) {
             return Err(McpError::InvalidStore(format!(
                 "mcp_servers is missing required column '{required}'"
+            )));
+        }
+    }
+    let mut statement = connection.prepare("PRAGMA table_info(mcp_native_links)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<HashSet<_>, _>>()?;
+    for required in ["server_id", "app_id", "native_snapshot"] {
+        if !columns.contains(required) {
+            return Err(McpError::InvalidStore(format!(
+                "mcp_native_links is missing required column '{required}'"
             )));
         }
     }
@@ -916,6 +1021,7 @@ mod tests {
                         id: "shared".to_owned(),
                         server: json!({"type":"stdio","command":"npx"}),
                         enabled: true,
+                        native_snapshot: None,
                     }]),
                 ),
                 (
@@ -924,6 +1030,7 @@ mod tests {
                         id: "shared".to_owned(),
                         server: json!({"type":"stdio","command":"uvx"}),
                         enabled: true,
+                        native_snapshot: None,
                     }]),
                 ),
             ],
@@ -949,6 +1056,7 @@ mod tests {
                     id: "local".to_owned(),
                     server: json!({"type":"stdio","command":"npx"}),
                     enabled,
+                    native_snapshot: None,
                 }]),
             )]
         };
@@ -984,27 +1092,150 @@ mod tests {
     }
 
     #[test]
-    fn live_changes_keep_disabled_native_entries_current_and_delete_all_links() {
+    fn disabled_unowned_native_entries_are_never_mutated() {
+        let directory = tempdir().unwrap();
+        let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let mut connection = store.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
         let mut previous = server();
         previous.apps = McpApps::default();
         let mut updated = previous.clone();
         updated.server = json!({"type":"stdio","command":"uvx"});
-        let app_count = builtin_app_registry()
-            .descriptors()
-            .filter(|descriptor| descriptor.supports(AppCapability::Mcp))
-            .count();
 
-        let disabled_updates = live_changes(Some(&previous), Some(&updated));
-        assert_eq!(disabled_updates.len(), app_count);
-        assert!(disabled_updates
-            .iter()
-            .all(|change| matches!(change, McpLiveChange::Disable { strict: false, .. })));
+        assert!(live_changes(&transaction, Some(&previous), Some(&updated))
+            .unwrap()
+            .is_empty());
+        assert!(live_changes(&transaction, Some(&previous), None)
+            .unwrap()
+            .is_empty());
 
-        let removals = live_changes(Some(&previous), None);
-        assert_eq!(removals.len(), app_count);
-        assert!(removals
-            .iter()
-            .all(|change| matches!(change, McpLiveChange::Remove { .. })));
+        upsert_native_link(&transaction, &previous.id, &AppType::Claude, None, false).unwrap();
+        let removals = live_changes(&transaction, Some(&previous), None).unwrap();
+        assert_eq!(removals.len(), 1);
+        assert!(matches!(
+            &removals[0],
+            McpLiveChange::Remove {
+                app: AppType::Claude,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn native_snapshot_is_transactional_link_state() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cc-switch.db");
+        let store = McpStore::open(path.clone()).unwrap();
+        let mut record = server();
+        record.apps = McpApps {
+            gemini: true,
+            ..Default::default()
+        };
+        store
+            .upsert_with_live(record, |_| Ok::<_, ()>(()), |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        let snapshot = cc_switch_core::import_mcp_servers(
+            &AppType::Gemini,
+            Some(br#"{"mcpServers":{"context7":{"command":"npx","timeout":30}}}"#),
+        )
+        .unwrap()
+        .remove(0)
+        .native_snapshot
+        .unwrap();
+
+        let current = store.list().unwrap().remove(0);
+        store
+            .toggle_with_live(
+                &current.id,
+                current.revision,
+                AppType::Gemini,
+                false,
+                |changes| {
+                    let McpLiveChange::Disable {
+                        native_snapshot, ..
+                    } = &mut changes[0]
+                    else {
+                        panic!("expected disable");
+                    };
+                    *native_snapshot = Some(snapshot.clone());
+                    Ok::<_, ()>(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        assert!(connection
+            .query_row(
+                "SELECT native_snapshot FROM mcp_native_links WHERE server_id='context7' AND app_id='gemini'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .is_some());
+
+        let current = store.list().unwrap().remove(0);
+        store
+            .toggle_with_live(
+                &current.id,
+                current.revision,
+                AppType::Gemini,
+                true,
+                |changes| {
+                    let McpLiveChange::Upsert {
+                        native_snapshot,
+                        applied,
+                        ..
+                    } = &mut changes[0]
+                    else {
+                        panic!("expected upsert");
+                    };
+                    assert!(native_snapshot.is_some());
+                    *applied = true;
+                    Ok::<_, ()>(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(connection
+            .query_row(
+                "SELECT native_snapshot FROM mcp_native_links WHERE server_id='context7' AND app_id='gemini'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn enabling_an_app_rejects_fields_its_native_format_cannot_express() {
+        let directory = tempdir().unwrap();
+        let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let mut record = server();
+        record.server = json!({"type":"stdio","command":"npx","cwd":"/repo"});
+        store
+            .upsert_with_live(record, |_| Ok::<_, ()>(()), |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        let current = store.list().unwrap().remove(0);
+        let applied = std::cell::Cell::new(false);
+
+        let result = store.toggle_with_live(
+            &current.id,
+            current.revision,
+            AppType::OpenCode,
+            true,
+            |_| {
+                applied.set(true);
+                Ok::<_, ()>(())
+            },
+            |_| Ok(()),
+        );
+
+        assert!(matches!(result, Err(McpError::InvalidServer(_))));
+        assert!(!applied.get());
     }
 
     #[test]
@@ -1017,6 +1248,7 @@ mod tests {
                 id: "context7".to_owned(),
                 server: json!({"command":"npx"}),
                 enabled: true,
+                native_snapshot: None,
             }]),
         )];
 

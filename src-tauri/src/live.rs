@@ -120,7 +120,7 @@ impl LiveConfig {
 
     pub fn apply_mcp_recoverable(
         &self,
-        changes: &[McpLiveChange],
+        changes: &mut [McpLiveChange],
     ) -> Result<McpWriteReceipt<'_>, LiveError> {
         self.lock_result(|| self.mcp.apply(changes))
     }
@@ -288,20 +288,22 @@ impl LiveConfig {
 
 fn resolve_config_dirs(home: &Path) -> Result<ResolvedConfigDirs, LiveError> {
     let settings = load_shared_path_settings(home);
+    let claude_env = std::env::var_os("CLAUDE_CONFIG_DIR");
+    let codex_env = std::env::var_os("CODEX_HOME");
     let hermes_env = std::env::var_os("HERMES_HOME");
     let pi_env = std::env::var_os("PI_CODING_AGENT_DIR");
     Ok(ResolvedConfigDirs {
         claude: configured_root(
             home,
             settings.claude_config_dir.as_deref(),
-            None,
+            claude_env.as_deref(),
             &home.join(".claude"),
             "Claude config directory",
         )?,
         codex: configured_root(
             home,
             settings.codex_config_dir.as_deref(),
-            None,
+            codex_env.as_deref(),
             &home.join(".codex"),
             "Codex config directory",
         )?,
@@ -652,14 +654,15 @@ mod tests {
         fs::create_dir(directory.path().join(".claude")).unwrap();
         fs::write(directory.path().join(".claude.json"), "{}").unwrap();
         let live = LiveConfig::from_home(directory.path()).unwrap();
-        let receipt = live
-            .apply_mcp_recoverable(&[McpLiveChange::Upsert {
-                app: cc_switch_core::AppType::Claude,
-                id: "server".to_owned(),
-                previous: None,
-                server: json!({"command":"npx"}),
-            }])
-            .unwrap();
+        let mut changes = [McpLiveChange::Upsert {
+            app: cc_switch_core::AppType::Claude,
+            id: "server".to_owned(),
+            previous: None,
+            server: json!({"command":"npx"}),
+            native_snapshot: None,
+            applied: false,
+        }];
+        let receipt = live.apply_mcp_recoverable(&mut changes).unwrap();
         let contender = OpenOptions::new()
             .read(true)
             .write(true)
