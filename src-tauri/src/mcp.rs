@@ -296,75 +296,36 @@ impl McpStore {
         Ok(Ok(()))
     }
 
-    pub fn import_checked(
+    pub fn import_with_live<T, E>(
         &self,
-        imports: McpImportsByApp,
-        verify_live_snapshot: impl FnOnce() -> bool,
-    ) -> Result<McpImportReport, McpError> {
+        observe: impl FnOnce() -> Result<(McpImportsByApp, T), E>,
+        verify_live_snapshot: impl FnOnce(&T) -> bool,
+    ) -> Result<Result<McpImportReport, E>, McpError> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut report = McpImportReport::default();
-        for (app, imports) in imports {
-            require_mcp_app(&app)?;
-            let imports = match imports {
-                Ok(imports) => imports,
-                Err(error) => {
-                    report
-                        .failed_apps
-                        .push(format!("{}: {error}", app.as_str()));
-                    continue;
-                }
-            };
-            for import in imports {
-                if let Some(mut current) = get_server(&transaction, &import.id, &self.revision_key)?
-                {
-                    if !mcp_servers_equivalent(&current.server, &import.server) {
-                        report.failed_apps.push(format!(
-                            "{}: server '{}' conflicts with the shared catalog",
-                            app.as_str(),
-                            import.id
-                        ));
-                        continue;
-                    }
-                    if current.apps.enabled(&app) != import.enabled {
-                        current.apps.set(&app, import.enabled)?;
-                        let column = enabled_column(&app)?;
-                        transaction.execute(
-                            &format!("UPDATE mcp_servers SET {column} = ?1 WHERE id = ?2"),
-                            params![import.enabled, &import.id],
-                        )?;
-                        if import.enabled {
-                            report.enabled_apps += 1;
-                        } else {
-                            report.disabled_apps += 1;
-                        }
-                    }
-                } else {
-                    let mut apps = McpApps::default();
-                    apps.set(&app, import.enabled)?;
-                    let server = McpServer {
-                        id: import.id.clone(),
-                        name: import.id,
-                        server: import.server,
-                        apps,
-                        description: None,
-                        homepage: None,
-                        docs: None,
-                        tags: Vec::new(),
-                        revision: 0,
-                    };
-                    validate_server(&server)?;
-                    save_server(&transaction, &server)?;
-                    report.new_servers += 1;
-                }
+        let (imports, observation) = match observe() {
+            Ok(observed) => observed,
+            Err(error) => {
+                transaction.rollback()?;
+                return Ok(Err(error));
             }
-        }
-        if !verify_live_snapshot() {
+        };
+        let report = match merge_imports(&transaction, imports, &self.revision_key) {
+            Ok(report) => report,
+            Err(error) => {
+                transaction.rollback()?;
+                drop(observation);
+                return Err(error);
+            }
+        };
+        if !verify_live_snapshot(&observation) {
             transaction.rollback()?;
+            drop(observation);
             return Err(McpError::Conflict);
         }
         transaction.commit()?;
-        Ok(report)
+        drop(observation);
+        Ok(Ok(report))
     }
 
     fn initialize(&self) -> Result<(), McpError> {
@@ -414,6 +375,69 @@ impl McpStore {
         connection.pragma_update(None, "foreign_keys", true)?;
         Ok(connection)
     }
+}
+
+fn merge_imports(
+    transaction: &rusqlite::Transaction<'_>,
+    imports: McpImportsByApp,
+    revision_key: &[u8; 16],
+) -> Result<McpImportReport, McpError> {
+    let mut report = McpImportReport::default();
+    for (app, imports) in imports {
+        require_mcp_app(&app)?;
+        let imports = match imports {
+            Ok(imports) => imports,
+            Err(error) => {
+                report
+                    .failed_apps
+                    .push(format!("{}: {error}", app.as_str()));
+                continue;
+            }
+        };
+        for import in imports {
+            if let Some(mut current) = get_server(transaction, &import.id, revision_key)? {
+                if !mcp_servers_equivalent(&current.server, &import.server) {
+                    report.failed_apps.push(format!(
+                        "{}: server '{}' conflicts with the shared catalog",
+                        app.as_str(),
+                        import.id
+                    ));
+                    continue;
+                }
+                if current.apps.enabled(&app) != import.enabled {
+                    current.apps.set(&app, import.enabled)?;
+                    let column = enabled_column(&app)?;
+                    transaction.execute(
+                        &format!("UPDATE mcp_servers SET {column} = ?1 WHERE id = ?2"),
+                        params![import.enabled, &import.id],
+                    )?;
+                    if import.enabled {
+                        report.enabled_apps += 1;
+                    } else {
+                        report.disabled_apps += 1;
+                    }
+                }
+            } else {
+                let mut apps = McpApps::default();
+                apps.set(&app, import.enabled)?;
+                let server = McpServer {
+                    id: import.id.clone(),
+                    name: import.id,
+                    server: import.server,
+                    apps,
+                    description: None,
+                    homepage: None,
+                    docs: None,
+                    tags: Vec::new(),
+                    revision: 0,
+                };
+                validate_server(&server)?;
+                save_server(transaction, &server)?;
+                report.new_servers += 1;
+            }
+        }
+    }
+    Ok(report)
 }
 
 fn row_to_server(row: &Row<'_>) -> rusqlite::Result<McpServer> {
@@ -705,6 +729,14 @@ mod tests {
         }
     }
 
+    fn import_observed(
+        store: &McpStore,
+        imports: McpImportsByApp,
+        snapshot_is_current: bool,
+    ) -> Result<McpImportReport, McpError> {
+        store.import_with_live(|| Ok::<_, McpError>((imports, ())), |_| snapshot_is_current)?
+    }
+
     #[test]
     fn shared_schema_round_trips_servers() {
         let directory = tempdir().unwrap();
@@ -838,29 +870,29 @@ mod tests {
     fn import_reports_same_id_connection_conflicts_without_merging_flags() {
         let directory = tempdir().unwrap();
         let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
-        let report = store
-            .import_checked(
-                vec![
-                    (
-                        AppType::Claude,
-                        Ok(vec![cc_switch_core::McpImport {
-                            id: "shared".to_owned(),
-                            server: json!({"type":"stdio","command":"npx"}),
-                            enabled: true,
-                        }]),
-                    ),
-                    (
-                        AppType::Codex,
-                        Ok(vec![cc_switch_core::McpImport {
-                            id: "shared".to_owned(),
-                            server: json!({"type":"stdio","command":"uvx"}),
-                            enabled: true,
-                        }]),
-                    ),
-                ],
-                || true,
-            )
-            .unwrap();
+        let report = import_observed(
+            &store,
+            vec![
+                (
+                    AppType::Claude,
+                    Ok(vec![cc_switch_core::McpImport {
+                        id: "shared".to_owned(),
+                        server: json!({"type":"stdio","command":"npx"}),
+                        enabled: true,
+                    }]),
+                ),
+                (
+                    AppType::Codex,
+                    Ok(vec![cc_switch_core::McpImport {
+                        id: "shared".to_owned(),
+                        server: json!({"type":"stdio","command":"uvx"}),
+                        enabled: true,
+                    }]),
+                ),
+            ],
+            true,
+        )
+        .unwrap();
         assert_eq!(report.new_servers, 1);
         assert_eq!(report.failed_apps.len(), 1);
         let current = store.list().unwrap().remove(0);
@@ -883,10 +915,10 @@ mod tests {
                 }]),
             )]
         };
-        store.import_checked(import(false), || true).unwrap();
+        import_observed(&store, import(false), true).unwrap();
         assert!(!store.list().unwrap().remove(0).apps.opencode);
 
-        let report = store.import_checked(import(true), || true).unwrap();
+        let report = import_observed(&store, import(true), true).unwrap();
         assert_eq!(report.enabled_apps, 1);
         assert!(store.list().unwrap().remove(0).apps.opencode);
     }
@@ -927,9 +959,7 @@ mod tests {
             }]),
         )];
 
-        let error = store
-            .import_checked(imports, || false)
-            .expect_err("changed live snapshot");
+        let error = import_observed(&store, imports, false).expect_err("changed live snapshot");
 
         assert!(matches!(error, McpError::Conflict));
         assert!(store.list().unwrap().is_empty());

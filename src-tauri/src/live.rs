@@ -2,7 +2,7 @@ use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     path::{Component, Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, MutexGuard},
 };
 
 use cc_switch_core::{fs::shared_live_config_lock_path, MAX_OPERATION_CONTENT_BYTES};
@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::{
     mcp::{McpImportsByApp, McpLiveChange},
-    mcp_live::{McpLiveConfig, McpLiveReceipt},
+    mcp_live::{McpImportSnapshot, McpLiveConfig, McpLiveReceipt},
     native_live::NativeLiveConfig,
     operation::{LivePaths, OperationError, OperationExecutor, OperationPlan, OperationReceipt},
     provider::{NativeImport, ProviderRecord},
@@ -61,9 +61,15 @@ pub struct LiveConfig {
     gate: Mutex<()>,
 }
 
-pub struct LiveWriteReceipt {
-    operation: OperationReceipt,
+pub(crate) struct LockedLiveReceipt<'a, T> {
+    value: T,
+    gate: MutexGuard<'a, ()>,
+    file_lock: File,
 }
+
+pub(crate) type LiveWriteReceipt<'a> = LockedLiveReceipt<'a, OperationReceipt>;
+pub(crate) type McpWriteReceipt<'a> = LockedLiveReceipt<'a, McpLiveReceipt>;
+pub(crate) type McpImportObservation<'a> = LockedLiveReceipt<'a, McpImportSnapshot>;
 
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -115,31 +121,37 @@ impl LiveConfig {
     pub fn apply_mcp_recoverable(
         &self,
         changes: &[McpLiveChange],
-    ) -> Result<McpLiveReceipt, LiveError> {
-        self.with_lock(|| self.mcp.apply(changes))
+    ) -> Result<McpWriteReceipt<'_>, LiveError> {
+        self.lock_result(|| self.mcp.apply(changes))
     }
 
-    pub fn rollback_mcp(&self, receipt: McpLiveReceipt) -> Result<(), LiveError> {
-        self.with_lock(|| self.mcp.rollback(receipt))
+    pub fn rollback_mcp(&self, receipt: McpWriteReceipt<'_>) -> Result<(), LiveError> {
+        let LockedLiveReceipt {
+            value,
+            gate,
+            file_lock,
+        } = receipt;
+        let result = self.mcp.rollback(value);
+        drop(file_lock);
+        drop(gate);
+        result
     }
 
-    pub fn import_mcp_checked<T, E>(
-        &self,
-        action: impl FnOnce(McpImportsByApp, &dyn Fn() -> bool) -> Result<T, E>,
-    ) -> Result<Result<T, E>, LiveError> {
-        self.with_lock(|| {
-            let snapshot = self.mcp.import_snapshot();
-            let imports = snapshot.imports.clone();
-            let verify = || self.mcp.snapshot_is_current(&snapshot);
-            Ok(action(imports, &verify))
-        })
+    pub fn observe_mcp(&self) -> Result<(McpImportsByApp, McpImportObservation<'_>), LiveError> {
+        let observation = self.lock_result(|| Ok(self.mcp.import_snapshot()))?;
+        let imports = observation.value.imports.clone();
+        Ok((imports, observation))
+    }
+
+    pub fn mcp_observation_is_current(&self, observation: &McpImportObservation<'_>) -> bool {
+        self.mcp.snapshot_is_current(&observation.value)
     }
 
     pub fn switch_native_recoverable(
         &self,
         provider: &ProviderRecord,
         common_snippet: Option<&str>,
-    ) -> Result<LiveWriteReceipt, LiveError> {
+    ) -> Result<LiveWriteReceipt<'_>, LiveError> {
         let app = provider
             .app_id
             .parse::<cc_switch_core::AppType>()
@@ -154,7 +166,7 @@ impl LiveConfig {
                 "provider does not use its native application adapter".to_owned(),
             ));
         }
-        self.with_lock(|| {
+        self.lock_result(|| {
             let prepared = self.native.prepare_apply_plan(provider, common_snippet)?;
             self.execute_recoverable_plan(&prepared.paths, &prepared.plan)
         })
@@ -163,7 +175,7 @@ impl LiveConfig {
     pub fn remove_native_recoverable(
         &self,
         provider: &ProviderRecord,
-    ) -> Result<LiveWriteReceipt, LiveError> {
+    ) -> Result<LiveWriteReceipt<'_>, LiveError> {
         let app = provider
             .app_id
             .parse::<cc_switch_core::AppType>()
@@ -179,34 +191,59 @@ impl LiveConfig {
                 "provider does not use an additive native adapter".to_owned(),
             ));
         }
-        self.with_lock(|| {
+        self.lock_result(|| {
             let prepared = self.native.prepare_remove_plan(provider)?;
             self.execute_recoverable_plan(&prepared.paths, &prepared.plan)
         })
     }
 
-    pub fn rollback(&self, receipt: LiveWriteReceipt) -> Result<(), LiveError> {
-        self.with_lock(|| receipt.operation.rollback().map_err(LiveError::from))
+    pub fn rollback(&self, receipt: LiveWriteReceipt<'_>) -> Result<(), LiveError> {
+        let LockedLiveReceipt {
+            value,
+            gate,
+            file_lock,
+        } = receipt;
+        let result = value.rollback().map_err(LiveError::from);
+        drop(file_lock);
+        drop(gate);
+        result
     }
 
     fn execute_recoverable_plan(
         &self,
         paths: &LivePaths,
         plan: &OperationPlan,
-    ) -> Result<LiveWriteReceipt, LiveError> {
+    ) -> Result<OperationReceipt, LiveError> {
         OperationExecutor::new(paths)
             .execute_recoverable(plan)
-            .map(|operation| LiveWriteReceipt { operation })
             .map_err(Into::into)
     }
 
     fn with_lock<T>(&self, action: impl FnOnce() -> Result<T, LiveError>) -> Result<T, LiveError> {
-        let _guard = self
+        let (_guard, _file_lock) = self.acquire_lock()?;
+        action()
+    }
+
+    fn lock_result<T>(
+        &self,
+        action: impl FnOnce() -> Result<T, LiveError>,
+    ) -> Result<LockedLiveReceipt<'_, T>, LiveError> {
+        let (gate, file_lock) = self.acquire_lock()?;
+        let value = action()?;
+        Ok(LockedLiveReceipt {
+            value,
+            gate,
+            file_lock,
+        })
+    }
+
+    fn acquire_lock(&self) -> Result<(MutexGuard<'_, ()>, File), LiveError> {
+        let guard = self
             .gate
             .try_lock()
             .map_err(|_| LiveError::LockUnavailable)?;
-        let _file_lock = self.lock_file()?;
-        action()
+        let file_lock = self.lock_file()?;
+        Ok((guard, file_lock))
     }
 
     fn lock_file(&self) -> Result<File, LiveError> {
@@ -490,6 +527,7 @@ fn config_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn config_roots_require_absolute_paths_and_allow_missing_directories() {
@@ -561,6 +599,33 @@ mod tests {
                 .unwrap()
                 .join("profiles/claude")
         );
+    }
+
+    #[test]
+    fn mcp_receipt_holds_the_shared_lock_until_the_database_outcome() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::create_dir(directory.path().join(".claude")).unwrap();
+        fs::write(directory.path().join(".claude.json"), "{}").unwrap();
+        let live = LiveConfig::from_home(directory.path()).unwrap();
+        let receipt = live
+            .apply_mcp_recoverable(&[McpLiveChange::Upsert {
+                app: cc_switch_core::AppType::Claude,
+                id: "server".to_owned(),
+                server: json!({"command":"npx"}),
+            }])
+            .unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(shared_live_config_lock_path(directory.path()))
+            .unwrap();
+
+        assert!(matches!(
+            FileExt::try_lock(&contender),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(receipt);
+        FileExt::try_lock(&contender).unwrap();
     }
 
     #[cfg(unix)]

@@ -522,7 +522,13 @@ fn import_mcp_from_apps(
     store: State<'_, McpStore>,
     live: State<'_, LiveConfig>,
 ) -> CommandResult<McpImportReport> {
-    match live.import_mcp_checked(|imports, verify| store.import_checked(imports, verify))? {
+    match store
+        .import_with_live(
+            || live.observe_mcp(),
+            |observation| live.mcp_observation_is_current(observation),
+        )
+        .map_err(CommandError::from)?
+    {
         Ok(report) => Ok(report),
         Err(error) => Err(error.into()),
     }
