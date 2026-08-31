@@ -1,7 +1,0 @@
-package cc-switch:plugin@1.0.0;
-
-/// A capability-free adapter component. Requests and responses are bounded
-/// UTF-8 JSON envelopes defined by the host API major in the signed manifest.
-world adapter {
-  export invoke: func(request: string) -> result<string, string>;
-}

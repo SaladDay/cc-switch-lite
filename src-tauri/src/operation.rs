@@ -6,13 +6,15 @@ use std::{
 };
 
 use cc_switch_core::{
+    execute_operation_plan,
     fs::{atomic_write, FileError},
-    ConfigFormat, MAX_OPERATION_CONTENT_BYTES,
+    CompareExchangeOutcome, ConfigFormat, OperationExecutionError, OperationFailure, OperationHost,
+    OperationRead, OperationReceipt as CoreOperationReceipt, OperationRollbackError,
+    MAX_OPERATION_CONTENT_BYTES,
 };
-pub use cc_switch_core::{
-    ContentExpectation, LogicalTarget, OperationPlan, PlannedWrite, OPERATION_CONTRACT_MAJOR,
-};
-use sha2::{Digest, Sha256};
+#[cfg(test)]
+use cc_switch_core::{ContentExpectation, PlannedWrite, OPERATION_CONTRACT_MAJOR};
+pub use cc_switch_core::{LogicalTarget, OperationPlan};
 use thiserror::Error;
 use toml_edit::DocumentMut;
 
@@ -125,26 +127,70 @@ pub struct OperationExecutor<'a> {
     paths: &'a LivePaths,
 }
 
-struct PreparedWrite<'a> {
-    write: &'a PlannedWrite,
-    path: PathBuf,
-    original: Option<Vec<u8>>,
-}
-
-struct AppliedWrite {
-    target: LogicalTarget,
-    path: PathBuf,
-    original: Option<Vec<u8>>,
-    written: Option<Vec<u8>>,
-}
-
 pub(crate) struct OperationReceipt {
-    applied: Vec<AppliedWrite>,
+    inner: CoreOperationReceipt<PathBuf>,
+    paths: LivePaths,
 }
 
 impl OperationReceipt {
     pub(crate) fn rollback(self) -> Result<(), OperationError> {
-        rollback_applied(&self.applied)
+        let Self { inner, paths } = self;
+        let mut host = FileOperationHost { paths: &paths };
+        inner.rollback(&mut host).map_err(map_rollback_error)
+    }
+}
+
+struct FileOperationHost<'a> {
+    paths: &'a LivePaths,
+}
+
+impl OperationHost for FileOperationHost<'_> {
+    type Resource = PathBuf;
+    type Error = OperationError;
+
+    fn resolve(&mut self, target: LogicalTarget) -> Result<Self::Resource, Self::Error> {
+        resolve_write_path(self.paths.path_for(target))
+    }
+
+    fn read(
+        &mut self,
+        resource: &Self::Resource,
+        maximum: usize,
+    ) -> Result<OperationRead, Self::Error> {
+        match read_optional_no_follow(resource, maximum) {
+            Ok(Some(contents)) => Ok(OperationRead::Contents(contents)),
+            Ok(None) => Ok(OperationRead::Missing),
+            Err(OperationError::TooLarge { .. }) => Ok(OperationRead::TooLarge),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn compare_exchange(
+        &mut self,
+        resource: &Self::Resource,
+        expected: Option<&[u8]>,
+        replacement: Option<&[u8]>,
+    ) -> Result<CompareExchangeOutcome, Self::Error> {
+        if !resource_matches(resource, expected)? {
+            return Ok(CompareExchangeOutcome::Conflict);
+        }
+
+        match replacement {
+            Some(contents) => atomic_write(resource, contents)?,
+            None => match fs::remove_file(resource) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(CompareExchangeOutcome::Conflict);
+                }
+                Err(source) => {
+                    return Err(OperationError::Io {
+                        path: resource.clone(),
+                        source,
+                    });
+                }
+            },
+        }
+        Ok(CompareExchangeOutcome::Applied)
     }
 }
 
@@ -163,70 +209,12 @@ impl<'a> OperationExecutor<'a> {
         plan: &OperationPlan,
     ) -> Result<OperationReceipt, OperationError> {
         self.validate(plan)?;
-
-        let mut paths = HashSet::new();
-        let mut prepared = Vec::with_capacity(plan.writes.len());
-        for write in &plan.writes {
-            let path = resolve_write_path(self.paths.path_for(write.target))?;
-            if !paths.insert(path.clone()) {
-                return Err(OperationError::InvalidPlan(
-                    "logical targets resolve to the same file".to_owned(),
-                ));
-            }
-            let original = read_optional(&path)?;
-            if !write.expected.matches(original.as_deref()) {
-                return Err(OperationError::Conflict);
-            }
-            prepared.push(PreparedWrite {
-                write,
-                path,
-                original,
-            });
-        }
-
-        let mut applied = Vec::with_capacity(prepared.len());
-        for prepared_write in prepared {
-            let current = match read_optional(&prepared_write.path) {
-                Ok(current) => current,
-                Err(error) => return Err(self.failure_after_rollback(error, &applied)),
-            };
-            if current != prepared_write.original
-                || !prepared_write.write.expected.matches(current.as_deref())
-            {
-                return Err(self.failure_after_rollback(OperationError::Conflict, &applied));
-            }
-
-            let written = match &prepared_write.write.contents {
-                Some(contents) => {
-                    if let Err(error) = atomic_write(&prepared_write.path, contents.as_bytes()) {
-                        return Err(
-                            self.failure_after_rollback(OperationError::File(error), &applied)
-                        );
-                    }
-                    Some(contents.as_bytes().to_vec())
-                }
-                None => match fs::remove_file(&prepared_write.path) {
-                    Ok(()) => None,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(source) => {
-                        return Err(self.failure_after_rollback(
-                            OperationError::Io {
-                                path: prepared_write.path.clone(),
-                                source,
-                            },
-                            &applied,
-                        ));
-                    }
-                },
-            };
-            applied.push(AppliedWrite {
-                target: prepared_write.write.target,
-                path: prepared_write.path,
-                original: prepared_write.original,
-                written,
-            });
-        }
-        Ok(OperationReceipt { applied })
+        let mut host = FileOperationHost { paths: self.paths };
+        let inner = execute_operation_plan(plan, &mut host).map_err(map_execution_error)?;
+        Ok(OperationReceipt {
+            inner,
+            paths: self.paths.clone(),
+        })
     }
 
     fn validate(&self, plan: &OperationPlan) -> Result<(), OperationError> {
@@ -237,61 +225,55 @@ impl<'a> OperationExecutor<'a> {
         }
         Ok(())
     }
+}
 
-    fn failure_after_rollback(
-        &self,
-        error: OperationError,
-        applied: &[AppliedWrite],
-    ) -> OperationError {
-        match rollback_applied(applied) {
-            Ok(()) => error,
-            Err(rollback_error) => OperationError::Rollback(format!(
-                "operation error: {error}; rollback error: {rollback_error}"
-            )),
-        }
+fn resource_matches(path: &Path, expected: Option<&[u8]>) -> Result<bool, OperationError> {
+    let maximum = expected.map_or(0, <[u8]>::len);
+    match read_optional_no_follow(path, maximum) {
+        Ok(contents) => Ok(contents.as_deref() == expected),
+        Err(OperationError::TooLarge { .. }) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
-fn rollback_applied(applied: &[AppliedWrite]) -> Result<(), OperationError> {
-    let mut failures = Vec::new();
-    for applied_write in applied.iter().rev() {
-        let current = match read_optional_no_follow(&applied_write.path, MAX_CONTENT_BYTES) {
-            Ok(current) => current,
-            Err(error) => {
-                failures.push(error.to_string());
-                continue;
-            }
-        };
-        if current.as_deref() != applied_write.written.as_deref() {
-            failures.push(format!(
-                "{:?} changed after Lite wrote it; external contents were preserved",
-                applied_write.target
-            ));
-            continue;
-        }
+fn map_execution_error(error: OperationExecutionError<OperationError>) -> OperationError {
+    let (failure, rollback_failures) = error.into_parts();
+    if !rollback_failures.is_empty() {
+        let rollback = rollback_failures
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return OperationError::Rollback(format!(
+            "operation error: {failure}; rollback error: {rollback}"
+        ));
+    }
 
-        let result = match &applied_write.original {
-            Some(contents) => {
-                atomic_write(&applied_write.path, contents).map_err(OperationError::File)
-            }
-            None => match fs::remove_file(&applied_write.path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(source) => Err(OperationError::Io {
-                    path: applied_write.path.clone(),
-                    source,
-                }),
-            },
-        };
-        if let Err(error) = result {
-            failures.push(error.to_string());
+    match failure {
+        OperationFailure::InvalidPlan(error) => OperationError::InvalidPlan(error.to_string()),
+        OperationFailure::Resolve { source, .. }
+        | OperationFailure::Read { source, .. }
+        | OperationFailure::Write { source, .. } => source,
+        OperationFailure::AliasedTargets { .. } => {
+            OperationError::InvalidPlan("logical targets resolve to the same file".to_owned())
         }
+        OperationFailure::ObservedContentTooLarge { limit, .. } => {
+            OperationError::TooLarge { limit }
+        }
+        OperationFailure::Conflict { .. } => OperationError::Conflict,
+        other => OperationError::InvalidPlan(other.to_string()),
     }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(OperationError::Rollback(failures.join("; ")))
-    }
+}
+
+fn map_rollback_error(error: OperationRollbackError<OperationError>) -> OperationError {
+    OperationError::Rollback(
+        error
+            .into_failures()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
 }
 
 pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, OperationError> {
@@ -538,11 +520,6 @@ fn validate_env_contents(contents: &str) -> Result<(), OperationError> {
     Ok(())
 }
 
-pub(crate) fn sha256(contents: &[u8]) -> String {
-    let digest = Sha256::digest(contents);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,15 +678,22 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = paths(directory.path());
         fs::create_dir_all(paths.claude_settings.parent().unwrap()).unwrap();
-        fs::write(&paths.claude_settings, b"external").unwrap();
-        let applied = AppliedWrite {
-            target: LogicalTarget::ClaudeSettings,
-            path: paths.claude_settings.clone(),
-            original: Some(b"original".to_vec()),
-            written: Some(b"lite".to_vec()),
+        fs::write(&paths.claude_settings, b"original").unwrap();
+        let plan = OperationPlan {
+            contract_major: OPERATION_CONTRACT_MAJOR,
+            app_id: "claude".to_owned(),
+            writes: vec![PlannedWrite {
+                target: LogicalTarget::ClaudeSettings,
+                expected: ContentExpectation::for_contents(Some(b"original")),
+                contents: Some("{\"managed\":true}\n".to_owned()),
+            }],
         };
+        let receipt = OperationExecutor::new(&paths)
+            .execute_recoverable(&plan)
+            .expect("execute plan");
+        fs::write(&paths.claude_settings, b"external").unwrap();
 
-        let result = rollback_applied(&[applied]);
+        let result = receipt.rollback();
 
         assert!(matches!(result, Err(OperationError::Rollback(_))));
         assert_eq!(fs::read(paths.claude_settings).unwrap(), b"external");

@@ -113,7 +113,6 @@ export function ProviderCard({
         </div>
 
         <div className="ml-auto flex min-w-0 items-center gap-3">
-          <span className="text-xs text-muted-foreground">Stored locally</span>
           <div className="flex flex-shrink-0 items-center gap-1.5 opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-100 group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:pointer-events-auto">
             <ProviderActions
               providerName={provider.name}

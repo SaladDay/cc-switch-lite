@@ -16,7 +16,6 @@ import type {
   CurrentProvider,
   ProviderRecord,
 } from "./lib/provider-types";
-import type { MarketplacePlugin } from "./lib/plugin-types";
 
 const api = vi.hoisted(() => ({
   supportedApps: vi.fn(),
@@ -25,26 +24,15 @@ const api = vi.hoisted(() => ({
   create: vi.fn(),
   update: vi.fn(),
   delete: vi.fn(),
-  importLive: vi.fn(),
   importNative: vi.fn(),
   switch: vi.fn(),
   removeFromLive: vi.fn(),
   currentProviders: vi.fn(),
 }));
 
-const pluginApi = vi.hoisted(() => ({
-  listRegistries: vi.fn(),
-  saveRegistry: vi.fn(),
-  removeRegistry: vi.fn(),
-  refresh: vi.fn(),
-  listInstalled: vi.fn(),
-  install: vi.fn(),
-  uninstall: vi.fn(),
-}));
-
 vi.mock("./lib/providers", async (importOriginal) => {
   const original = await importOriginal<typeof import("./lib/providers")>();
-  return { ...original, providersApi: api, pluginsApi: pluginApi };
+  return { ...original, providersApi: api };
 });
 
 const adapters: AdapterDescriptor[] = [
@@ -109,35 +97,6 @@ const workProvider: ProviderRecord = {
   settings: { apiKey: "secret", baseUrl: "https://proxy.example.com" },
 };
 
-const marketplacePlugin: MarketplacePlugin = {
-  registryId: "registry-1",
-  registryRevision: 3,
-  registryLabel: "Community",
-  manifestSha256: "a".repeat(64),
-  packageSha256: "b".repeat(64),
-  publisherKeySha256: "d".repeat(64),
-  permissions: [
-    "Read Claude Code user settings",
-    "Change Claude Code provider routing",
-  ],
-  manifest: {
-    id: "dev.example.claude",
-    version: "1.0.0",
-    name: "Example Claude adapter",
-    description: "Adds an example provider form.",
-    publisher: {
-      id: "dev.example",
-      keyId: "release-1",
-      algorithm: "ed25519",
-    },
-    adapters: [],
-    capabilities: [
-      { kind: "readClaudeSettings" },
-      { kind: "writeClaudeSettings" },
-    ],
-  },
-};
-
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((complete) => {
@@ -167,13 +126,35 @@ function nativeAdapter(appId: string): AdapterDescriptor {
 
 function coreApps(appIds: AppId[]): CoreAppDescriptor[] {
   const additive = new Set<AppId>(["opencode", "openclaw", "hermes", "pi"]);
-  return appIds.map((id) => ({
-    id,
-    displayName: id,
-    brandKey: id,
-    configurationMode: additive.has(id) ? "additive" : "switch",
-    capabilities: ["provider-management", "live-configuration"],
-  }));
+  const mcp = new Set<AppId>([
+    "claude",
+    "codex",
+    "gemini",
+    "grokbuild",
+    "opencode",
+    "hermes",
+  ]);
+  const skills = new Set<AppId>([
+    "claude",
+    "codex",
+    "gemini",
+    "grokbuild",
+    "opencode",
+    "hermes",
+    "pi",
+  ]);
+  return appIds.map((id) => {
+    const capabilities = ["provider-management", "live-configuration"];
+    if (mcp.has(id)) capabilities.push("mcp");
+    if (skills.has(id)) capabilities.push("skills");
+    return {
+      id,
+      displayName: id,
+      brandKey: id,
+      configurationMode: additive.has(id) ? "additive" : "switch",
+      capabilities,
+    };
+  });
 }
 
 describe("App", () => {
@@ -201,13 +182,6 @@ describe("App", () => {
     api.switch.mockResolvedValue(undefined);
     api.removeFromLive.mockResolvedValue(undefined);
     api.currentProviders.mockResolvedValue([]);
-    for (const mock of Object.values(pluginApi)) mock.mockReset();
-    pluginApi.listRegistries.mockResolvedValue([]);
-    pluginApi.listInstalled.mockResolvedValue([]);
-    pluginApi.refresh.mockResolvedValue({
-      plugins: [],
-      failures: [],
-    });
   });
 
   it("shows every application from the shared core boundary", async () => {
@@ -230,6 +204,171 @@ describe("App", () => {
     expect(switcher.getAllByRole("button")).toHaveLength(9);
   });
 
+  it("uses core capabilities for the Lite feature navigation", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Add your first Claude Code provider",
+    });
+    await user.click(screen.getByRole("button", { name: "Manage Skills" }));
+    expect(screen.getByRole("heading", { name: "Skills" })).toBeVisible();
+    expect(screen.getByLabelText("Skills placeholder")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Back to providers" }));
+    await user.click(
+      screen.getByRole("button", { name: "Manage MCP servers" }),
+    );
+    expect(screen.getByRole("heading", { name: "MCP Servers" })).toBeVisible();
+    expect(screen.getByLabelText("MCP Servers placeholder")).toBeVisible();
+  });
+
+  it("hides feature entries not declared by core", async () => {
+    const native = nativeAdapter("openclaw");
+    window.localStorage.setItem("cc-switch-lite:last-app", "openclaw");
+    api.supportedApps.mockResolvedValue(coreApps(["openclaw"]));
+    api.listAdapters.mockResolvedValue([native]);
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Add your first OpenClaw provider",
+    });
+    expect(
+      screen.queryByRole("button", { name: "Manage Skills" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Manage MCP servers" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("disables provider and live actions when core declares neither capability", async () => {
+    const native = nativeAdapter("claude");
+    const catalog = coreApps(["claude"]);
+    catalog[0].capabilities = [];
+    api.supportedApps.mockResolvedValue(catalog);
+    api.listAdapters.mockResolvedValue([native]);
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Add your first Claude Code provider",
+      }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Add Claude Code provider" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", {
+        name: "Import Claude Code user configuration",
+      }),
+    ).toBeDisabled();
+    expect(api.currentProviders).not.toHaveBeenCalled();
+  });
+
+  it("keeps provider CRUD separate from the live configuration capability", async () => {
+    const native = nativeAdapter("claude");
+    const catalog = coreApps(["claude"]);
+    catalog[0].capabilities = ["provider-management"];
+    api.supportedApps.mockResolvedValue(catalog);
+    api.listAdapters.mockResolvedValue([native]);
+    api.list.mockResolvedValue([
+      { ...workProvider, adapter: native.reference },
+    ]);
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Add Claude Code provider" }),
+    ).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Edit Work" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Delete Work" })).toBeEnabled();
+    expect(
+      screen.getByRole("button", {
+        name: "Import Claude Code user configuration",
+      }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Switch to Work" }),
+    ).toBeDisabled();
+  });
+
+  it("keeps live configuration actions independent from provider CRUD", async () => {
+    const user = userEvent.setup();
+    const native = nativeAdapter("claude");
+    const catalog = coreApps(["claude"]);
+    catalog[0].capabilities = ["live-configuration"];
+    api.supportedApps.mockResolvedValue(catalog);
+    api.listAdapters.mockResolvedValue([native]);
+    api.list.mockResolvedValue([
+      { ...workProvider, adapter: native.reference },
+    ]);
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Add Claude Code provider" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Switch to Work" }),
+    ).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Edit Work" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Delete Work" })).toBeDisabled();
+    const importButton = screen.getByRole("button", {
+      name: "Import Claude Code user configuration",
+    });
+    expect(importButton).toBeEnabled();
+
+    await user.click(importButton);
+    await waitFor(() =>
+      expect(api.importNative).toHaveBeenCalledWith("claude"),
+    );
+  });
+
+  it("allows additive provider deletion without live configuration access", async () => {
+    const native = nativeAdapter("pi");
+    const catalog = coreApps(["pi"]);
+    catalog[0].capabilities = ["provider-management"];
+    window.localStorage.setItem("cc-switch-lite:last-app", "pi");
+    api.supportedApps.mockResolvedValue(catalog);
+    api.listAdapters.mockResolvedValue([native]);
+    api.list.mockResolvedValue([
+      {
+        ...workProvider,
+        appId: "pi",
+        adapter: native.reference,
+        name: "Pi Work",
+      },
+    ]);
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Pi Work" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Delete Pi Work" }),
+    ).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "Add Pi Work to configuration" }),
+    ).toBeDisabled();
+    expect(api.currentProviders).toHaveBeenCalledWith("pi");
+  });
+
+  it("closes a stored feature view when the core catalog is unavailable", async () => {
+    window.localStorage.setItem("cc-switch-lite:last-view", "mcp");
+    api.supportedApps.mockRejectedValue(new Error("catalog unavailable"));
+    render(<App />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "catalog unavailable",
+    );
+    expect(
+      screen.queryByRole("heading", { name: "MCP Servers" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("MCP Servers placeholder"),
+    ).not.toBeInTheDocument();
+  });
+
   it("uses the core response as the application membership source", async () => {
     api.supportedApps.mockResolvedValue(coreApps(["pi"]));
     render(<App />);
@@ -248,6 +387,29 @@ describe("App", () => {
       "true",
     );
     expect(api.list).toHaveBeenLastCalledWith("pi");
+  });
+
+  it("accepts a new application declared by core without a Lite whitelist", async () => {
+    const futureApp: CoreAppDescriptor = {
+      id: "future-agent",
+      displayName: "Future Agent",
+      brandKey: "future-agent",
+      configurationMode: "switch",
+      capabilities: ["provider-management", "live-configuration"],
+    };
+    api.supportedApps.mockResolvedValue([futureApp]);
+    api.listAdapters.mockResolvedValue([nativeAdapter(futureApp.id)]);
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Add your first Future Agent provider",
+      }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Future Agent" }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(api.list).toHaveBeenLastCalledWith("future-agent");
   });
 
   it("uses the core configuration mode instead of UI presentation metadata", async () => {
@@ -339,24 +501,6 @@ describe("App", () => {
     );
   });
 
-  it("announces the plugin marketplace loading state", async () => {
-    const user = userEvent.setup();
-    pluginApi.listRegistries.mockImplementation(
-      () => new Promise<never>(() => undefined),
-    );
-    render(<App />);
-
-    await user.click(
-      await screen.findByRole("button", { name: "Open plugin marketplace" }),
-    );
-
-    expect(
-      within(
-        screen.getByRole("dialog", { name: "Plugin marketplace" }),
-      ).getByRole("status"),
-    ).toHaveTextContent("Loading plugin marketplace");
-  });
-
   it("ignores a stale current-provider response after changing applications", async () => {
     const user = userEvent.setup();
     const claudeCurrent = deferred<CurrentProvider[]>();
@@ -428,206 +572,10 @@ describe("App", () => {
     );
     const adapterSelect = screen.getByLabelText("Adapter");
     expect(adapterSelect).toHaveValue("0");
-    expect(screen.getByLabelText("API key")).toBeVisible();
+    expect(screen.getByLabelText("Configuration JSON")).toBeVisible();
 
     await user.selectOptions(adapterSelect, "1");
-    expect(screen.getByLabelText("Configuration JSON")).toBeVisible();
-  });
-
-  it("creates a provider with an installed plugin adapter", async () => {
-    const user = userEvent.setup();
-    const pluginAdapter: AdapterDescriptor = {
-      ...adapters[0],
-      displayName: "Example Claude adapter",
-      reference: {
-        ...adapters[0].reference,
-        pluginId: "dev.example.claude",
-        pluginVersion: "1.0.0",
-        adapterId: "example.claude",
-      },
-    };
-    api.listAdapters.mockResolvedValue([...adapters, pluginAdapter]);
-    api.create.mockResolvedValue({
-      ...workProvider,
-      adapter: pluginAdapter.reference,
-    });
-    render(<App />);
-
-    await user.click(
-      await screen.findByRole("button", { name: "Add Claude Code provider" }),
-    );
-    const dialog = screen.getByRole("dialog", { name: "Add provider" });
-    await user.selectOptions(within(dialog).getByLabelText("Adapter"), "1");
-    await user.type(within(dialog).getByLabelText("Provider name"), "Plugin");
-    await user.type(within(dialog).getByLabelText("API key"), "secret");
-    await user.click(
-      within(dialog).getByRole("button", { name: "Save provider" }),
-    );
-
-    await waitFor(() =>
-      expect(api.create).toHaveBeenCalledWith(
-        expect.objectContaining({ adapter: pluginAdapter.reference }),
-      ),
-    );
-  });
-
-  it("requires explicit permission approval before installing a plugin", async () => {
-    const user = userEvent.setup();
-    pluginApi.refresh.mockResolvedValue({
-      plugins: [marketplacePlugin],
-      failures: [],
-    });
-    pluginApi.install.mockResolvedValue({
-      id: marketplacePlugin.manifest.id,
-      version: marketplacePlugin.manifest.version,
-      registryId: marketplacePlugin.registryId,
-      packageSha256: marketplacePlugin.packageSha256,
-      manifestSha256: marketplacePlugin.manifestSha256,
-      publisher: marketplacePlugin.manifest.publisher,
-      publisherKeySha256: marketplacePlugin.publisherKeySha256,
-      grantedCapabilities: marketplacePlugin.manifest.capabilities,
-    });
-    render(<App />);
-
-    await user.click(
-      await screen.findByRole("button", { name: "Open plugin marketplace" }),
-    );
-    const dialog = await screen.findByRole("dialog", {
-      name: "Plugin marketplace",
-    });
-    expect(dialog).toHaveAccessibleDescription(
-      "Signed provider adapters from sources you trust.",
-    );
-    const install = within(dialog).getByRole("button", { name: "Install" });
-    expect(install).toBeDisabled();
-    await user.click(
-      within(dialog).getByLabelText(
-        "Approve exactly these permissions for this signed version",
-      ),
-    );
-    await user.click(install);
-
-    await waitFor(() =>
-      expect(pluginApi.install).toHaveBeenCalledWith(
-        {
-          registryId: marketplacePlugin.registryId,
-          registryRevision: marketplacePlugin.registryRevision,
-          pluginId: marketplacePlugin.manifest.id,
-          version: marketplacePlugin.manifest.version,
-          manifestSha256: marketplacePlugin.manifestSha256,
-          packageSha256: marketplacePlugin.packageSha256,
-          publisherKeySha256: marketplacePlugin.publisherKeySha256,
-        },
-        marketplacePlugin.manifest.capabilities,
-      ),
-    );
-  });
-
-  it("clears permission approval when the signed manifest changes", async () => {
-    const user = userEvent.setup();
-    const changed = {
-      ...marketplacePlugin,
-      manifestSha256: "c".repeat(64),
-    };
-    pluginApi.refresh
-      .mockResolvedValueOnce({ plugins: [marketplacePlugin], failures: [] })
-      .mockResolvedValueOnce({ plugins: [changed], failures: [] });
-    render(<App />);
-
-    await user.click(
-      await screen.findByRole("button", { name: "Open plugin marketplace" }),
-    );
-    const dialog = await screen.findByRole("dialog", {
-      name: "Plugin marketplace",
-    });
-    const approval = within(dialog).getByLabelText(
-      "Approve exactly these permissions for this signed version",
-    );
-    await user.click(approval);
-    expect(approval).toBeChecked();
-
-    await user.click(within(dialog).getByRole("button", { name: "Refresh" }));
-
-    await waitFor(() => expect(pluginApi.refresh).toHaveBeenCalledTimes(2));
-    expect(
-      within(dialog).getByLabelText(
-        "Approve exactly these permissions for this signed version",
-      ),
-    ).not.toBeChecked();
-    expect(
-      within(dialog).getByRole("button", { name: "Install" }),
-    ).toBeDisabled();
-  });
-
-  it("does not treat a different source as a plugin update", async () => {
-    const user = userEvent.setup();
-    const installed = {
-      id: marketplacePlugin.manifest.id,
-      version: "0.9.0",
-      registryId: "registry-other",
-      packageSha256: "e".repeat(64),
-      manifestSha256: "f".repeat(64),
-      publisher: marketplacePlugin.manifest.publisher,
-      publisherKeySha256: marketplacePlugin.publisherKeySha256,
-      grantedCapabilities: marketplacePlugin.manifest.capabilities,
-    };
-    pluginApi.listInstalled.mockResolvedValue([installed]);
-    pluginApi.refresh.mockResolvedValue({
-      plugins: [{ ...marketplacePlugin, installed }],
-      failures: [],
-    });
-    render(<App />);
-
-    await user.click(
-      await screen.findByRole("button", { name: "Open plugin marketplace" }),
-    );
-    const dialog = await screen.findByRole("dialog", {
-      name: "Plugin marketplace",
-    });
-
-    expect(
-      within(dialog).getByRole("button", { name: "ID collision" }),
-    ).toBeDisabled();
-    expect(
-      within(dialog).queryByLabelText(
-        "Approve exactly these permissions for this signed version",
-      ),
-    ).not.toBeInTheDocument();
-  });
-
-  it("can remove an installed plugin after its source disappears", async () => {
-    const user = userEvent.setup();
-    pluginApi.listInstalled.mockResolvedValue([
-      {
-        id: marketplacePlugin.manifest.id,
-        version: marketplacePlugin.manifest.version,
-        registryId: marketplacePlugin.registryId,
-        packageSha256: marketplacePlugin.packageSha256,
-        manifestSha256: marketplacePlugin.manifestSha256,
-        publisher: marketplacePlugin.manifest.publisher,
-        publisherKeySha256: marketplacePlugin.publisherKeySha256,
-        grantedCapabilities: marketplacePlugin.manifest.capabilities,
-      },
-    ]);
-    render(<App />);
-
-    await user.click(
-      await screen.findByRole("button", { name: "Open plugin marketplace" }),
-    );
-    const dialog = await screen.findByRole("dialog", {
-      name: "Plugin marketplace",
-    });
-    expect(
-      within(dialog).getByText(marketplacePlugin.manifest.id),
-    ).toBeVisible();
-
-    await user.click(within(dialog).getByRole("button", { name: "Remove" }));
-
-    await waitFor(() =>
-      expect(pluginApi.uninstall).toHaveBeenCalledWith(
-        marketplacePlugin.manifest.id,
-      ),
-    );
+    expect(screen.getByLabelText("API key")).toBeVisible();
   });
 
   it("edits and deletes a stored provider without switching live config", async () => {
@@ -693,7 +641,11 @@ describe("App", () => {
 
   it("imports the current live provider through the host", async () => {
     const user = userEvent.setup();
-    api.importLive.mockResolvedValue(workProvider);
+    const native = nativeAdapter("claude");
+    api.listAdapters.mockResolvedValue([native, ...adapters]);
+    api.importNative.mockResolvedValue([
+      { ...workProvider, adapter: native.reference },
+    ]);
     api.list.mockResolvedValueOnce([]).mockResolvedValue([workProvider]);
     api.currentProviders
       .mockResolvedValueOnce([])
@@ -706,50 +658,14 @@ describe("App", () => {
       }),
     );
 
-    await waitFor(() => expect(api.importLive).toHaveBeenCalledWith("claude"));
+    await waitFor(() =>
+      expect(api.importNative).toHaveBeenCalledWith("claude"),
+    );
     expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
     expect(screen.getAllByText("In Use")[0]).toBeVisible();
     expect(screen.getByRole("status")).toHaveTextContent(
       "Imported the Claude Code user configuration.",
     );
-  });
-
-  it("imports through a selected plugin adapter", async () => {
-    const user = userEvent.setup();
-    const pluginAdapter: AdapterDescriptor = {
-      ...adapters[0],
-      displayName: "Example Claude adapter",
-      reference: {
-        ...adapters[0].reference,
-        pluginId: marketplacePlugin.manifest.id,
-        pluginVersion: marketplacePlugin.manifest.version,
-        adapterId: "example.claude",
-      },
-    };
-    const imported = { ...workProvider, adapter: pluginAdapter.reference };
-    api.listAdapters.mockResolvedValue([...adapters, pluginAdapter]);
-    api.importLive.mockResolvedValue(imported);
-    api.list.mockResolvedValueOnce([]).mockResolvedValue([imported]);
-    render(<App />);
-
-    await user.click(
-      await screen.findByRole("button", {
-        name: "Import Claude Code user configuration",
-      }),
-    );
-    const dialog = screen.getByRole("dialog", { name: "Import provider" });
-    await user.selectOptions(within(dialog).getByLabelText("Adapter"), "1");
-    await user.click(
-      within(dialog).getByRole("button", { name: "Import provider" }),
-    );
-
-    await waitFor(() =>
-      expect(api.importLive).toHaveBeenCalledWith(
-        "claude",
-        pluginAdapter.reference,
-      ),
-    );
-    expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
   });
 
   it("switches a stored provider and marks it current", async () => {
@@ -896,7 +812,6 @@ describe("App", () => {
     await waitFor(() =>
       expect(api.importNative).toHaveBeenCalledWith("claude"),
     );
-    expect(api.importLive).not.toHaveBeenCalled();
     expect(await screen.findByRole("heading", { name: "Work" })).toBeVisible();
   });
 
@@ -997,6 +912,7 @@ describe("App", () => {
         _cc_source: "providers_dict",
         base_url: "https://hermes.example.com",
       },
+      liteConfigWritable: false,
     };
     api.supportedApps.mockResolvedValue(coreApps(["hermes"]));
     api.listAdapters.mockResolvedValue([native]);
@@ -1004,9 +920,9 @@ describe("App", () => {
     api.currentProviders.mockResolvedValue([current(provider)]);
     render(<App />);
 
-    expect(await screen.findByText("Hermes managed")).toBeVisible();
+    expect(await screen.findByText("Not supported in Lite")).toBeVisible();
     expect(
-      screen.getByRole("button", { name: "Managed: Hermes managed" }),
+      screen.getByRole("button", { name: "Managed: Not supported in Lite" }),
     ).toBeDisabled();
     expect(screen.getByRole("button", { name: "Edit Managed" })).toBeDisabled();
     expect(
@@ -1044,45 +960,6 @@ describe("App", () => {
     ).toBeDisabled();
   });
 
-  it("shows settings for all core applications and persists visibility", async () => {
-    const user = userEvent.setup();
-    render(<App />);
-
-    await user.click(
-      await screen.findByRole("button", { name: "Open settings" }),
-    );
-    const settings = screen.getByRole("dialog", { name: "Settings" });
-    const pi = within(settings).getByRole("button", { name: "Pi" });
-    expect(
-      within(settings).getByRole("button", { name: "Claude Desktop" }),
-    ).toBeVisible();
-    expect(pi).toHaveAttribute("aria-pressed", "true");
-
-    await user.click(pi);
-    expect(pi).toHaveAttribute("aria-pressed", "false");
-    expect(
-      window.localStorage.getItem("cc-switch-lite:visible-apps"),
-    ).toContain('"pi":false');
-  });
-
-  it("keeps the core application order in settings", async () => {
-    const user = userEvent.setup();
-    api.supportedApps.mockResolvedValue(coreApps(["pi", "claude"]));
-    render(<App />);
-
-    await user.click(
-      await screen.findByRole("button", { name: "Open settings" }),
-    );
-    const settings = screen.getByRole("dialog", { name: "Settings" });
-    const pi = within(settings).getByRole("button", { name: "Pi" });
-    const claude = within(settings).getByRole("button", {
-      name: "Claude Code",
-    });
-    expect(
-      pi.compareDocumentPosition(claude) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-  });
-
   it("keeps the dialog fallback modal and closes it with Escape", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -1115,16 +992,19 @@ describe("App", () => {
     expect(trigger).toHaveFocus();
   });
 
-  it("applies and remembers the chosen theme", async () => {
-    const user = userEvent.setup();
+  it("does not expose settings or a plugin marketplace", async () => {
     render(<App />);
 
-    await user.click(
-      await screen.findByRole("button", { name: "Open settings" }),
-    );
-    await user.click(screen.getByRole("button", { name: "Dark" }));
-
-    expect(document.documentElement).toHaveClass("dark");
-    expect(window.localStorage.getItem("cc-switch-lite:theme")).toBe("dark");
+    expect(
+      await screen.findByRole("heading", {
+        name: "Add your first Claude Code provider",
+      }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Open settings" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Open plugin marketplace" }),
+    ).not.toBeInTheDocument();
   });
 });

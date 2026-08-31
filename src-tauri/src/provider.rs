@@ -168,11 +168,37 @@ pub fn is_lite_writable(provider: &ProviderRecord) -> bool {
     let Ok(app) = provider.app_id.parse::<AppType>() else {
         return false;
     };
+    let managed_provider = matches!(
+        provider
+            .metadata
+            .get("providerType")
+            .and_then(Value::as_str),
+        Some("github_copilot" | "codex_oauth" | "xai_oauth")
+    ) || provider
+        .metadata
+        .pointer("/authBinding/source")
+        .and_then(Value::as_str)
+        == Some("managed_account")
+        || provider
+            .settings
+            .get("env")
+            .and_then(Value::as_object)
+            .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+            .and_then(Value::as_str)
+            .or_else(|| provider.settings.get("baseUrl").and_then(Value::as_str))
+            .is_some_and(|endpoint| {
+                let endpoint = endpoint.to_ascii_lowercase();
+                endpoint.contains("githubcopilot.com")
+                    || endpoint.contains("chatgpt.com/backend-api/codex")
+            });
+    if managed_provider || provider.category.as_deref() == Some("aggregator") {
+        return false;
+    }
     if !provider
         .adapter
         .same_identity(&native_adapter_reference(&app))
     {
-        return true;
+        return adapter_for_reference(&provider.app_id, &provider.adapter).is_some();
     }
 
     match app {
@@ -313,33 +339,6 @@ pub fn validate_name(name: &str) -> Result<String, String> {
     Ok(normalized.to_owned())
 }
 
-pub fn validate_descriptor_schema(descriptor: &AdapterDescriptor) -> Result<(), String> {
-    if descriptor.fields.is_empty() || descriptor.fields.len() > 32 {
-        return Err("an adapter must declare between 1 and 32 fields".to_owned());
-    }
-    let mut keys = std::collections::HashSet::new();
-    for field in &descriptor.fields {
-        if field.key.is_empty()
-            || field.key.len() > 64
-            || !field
-                .key
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-            || !keys.insert(&field.key)
-        {
-            return Err("adapter field keys must be unique safe identifiers".to_owned());
-        }
-        if field.label.trim().is_empty()
-            || field.label.chars().count() > 80
-            || field.placeholder.len() > 256
-            || field.help.len() > 512
-        {
-            return Err("adapter field presentation exceeds host limits".to_owned());
-        }
-    }
-    Ok(())
-}
-
 pub fn validate_settings(
     descriptor: &AdapterDescriptor,
     settings: &Map<String, Value>,
@@ -424,7 +423,6 @@ mod tests {
     fn native_adapters_cover_every_core_application() {
         let adapters = native_adapters();
 
-        assert_eq!(adapters.len(), 9);
         assert_eq!(
             adapters
                 .iter()
@@ -468,7 +466,61 @@ mod tests {
             .insert("_cc_source".to_owned(), json!("providers_dict"));
         assert!(!is_lite_writable(&hermes_dictionary));
 
+        let mut aggregator = native_provider(AppType::Claude);
+        aggregator.category = Some("aggregator".to_owned());
+        assert!(!is_lite_writable(&aggregator));
+
+        for provider_type in ["github_copilot", "codex_oauth", "xai_oauth"] {
+            let mut managed = native_provider(AppType::Claude);
+            managed.metadata = json!({"providerType": provider_type});
+            assert!(!is_lite_writable(&managed));
+        }
+
+        let mut managed_binding = native_provider(AppType::Codex);
+        managed_binding.metadata = json!({"authBinding": {"source": "managed_account"}});
+        assert!(!is_lite_writable(&managed_binding));
+
+        for endpoint in [
+            "https://api.githubcopilot.com",
+            "https://chatgpt.com/backend-api/codex",
+        ] {
+            let mut legacy_managed = native_provider(AppType::Claude);
+            legacy_managed
+                .settings
+                .insert("env".to_owned(), json!({"ANTHROPIC_BASE_URL": endpoint}));
+            assert!(!is_lite_writable(&legacy_managed));
+        }
+        let mut legacy_form_managed = native_provider(AppType::Claude);
+        legacy_form_managed.adapter = built_in_adapters()[0].reference.clone();
+        legacy_form_managed
+            .settings
+            .insert("baseUrl".to_owned(), json!("https://api.githubcopilot.com"));
+        assert!(!is_lite_writable(&legacy_form_managed));
+
         assert!(is_lite_writable(&native_provider(AppType::Pi)));
+    }
+
+    #[test]
+    fn lite_keeps_external_adapter_records_read_only() {
+        let app = AppType::Claude;
+        let mut provider = ProviderRecord {
+            id: "provider".to_owned(),
+            revision: 1,
+            app_id: app.as_str().to_owned(),
+            adapter: native_adapter_reference(&app),
+            name: "Provider".to_owned(),
+            settings: Map::new(),
+            category: None,
+            metadata: json!({}),
+            extensions: Map::new(),
+        };
+
+        provider.adapter.plugin_id = "dev.example.adapter".to_owned();
+        provider.adapter.adapter_id = "example.claude".to_owned();
+        assert!(!is_lite_writable(&provider));
+
+        provider.adapter = built_in_adapters()[0].reference.clone();
+        assert!(is_lite_writable(&provider));
     }
 
     #[test]

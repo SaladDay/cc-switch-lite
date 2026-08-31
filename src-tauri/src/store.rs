@@ -1,49 +1,31 @@
 use std::{
     collections::HashSet,
-    fs::{self, File, OpenOptions},
-    io::Read,
+    fs::{self, OpenOptions},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use cc_switch_core::AppType;
-use fs4::{FileExt, TryLockError};
 use hmac::{Hmac, Mac};
 use rusqlite::{
     params, types::ValueRef, Connection, OpenFlags, OptionalExtension, Row, Transaction,
     TransactionBehavior,
 };
-use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::Sha256;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::provider::{
-    is_lite_writable, native_adapter_reference, validate_name, validate_settings,
-    AdapterDescriptor, AdapterReference, CurrentProvider, NativeImport, ProviderDraft,
-    ProviderRecord, ProviderUpdate, BUILTIN_PLUGIN_ID,
+    adapter_for_reference, is_lite_writable, native_adapter_reference, validate_name,
+    validate_settings, AdapterDescriptor, AdapterReference, CurrentProvider, NativeImport,
+    ProviderDraft, ProviderRecord, ProviderUpdate, BUILTIN_PLUGIN_ID,
 };
 
 const SAFE_JS_INTEGER_MASK: u64 = (1_u64 << 53) - 1;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const ADAPTER_BINDINGS_TABLE: &str = "cc_switch_lite_provider_adapters";
-const MIGRATIONS_TABLE: &str = "cc_switch_lite_migrations";
-const MIGRATION_RECORDS_TABLE: &str = "cc_switch_lite_migration_records";
-const STORE_EXTENSIONS_TABLE: &str = "cc_switch_lite_store_extensions";
-const LEGACY_PROVIDER_MIGRATION: &str = "providers-json-v1";
-const LEGACY_STORE_VERSION: u32 = 1;
-const MAX_LEGACY_STORE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_NATIVE_SETTINGS_BYTES: usize = 1024 * 1024;
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LegacyProviderFile {
-    version: u32,
-    providers: Vec<ProviderRecord>,
-    #[serde(default, flatten)]
-    extensions: Map<String, Value>,
-}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -102,6 +84,29 @@ struct NewProvider {
     settings: Value,
     category: Option<String>,
     metadata: Value,
+}
+
+fn provider_for_live_action(
+    stored: &StoredProvider,
+    app: &AppType,
+) -> Result<ProviderRecord, StoreError> {
+    let mut provider = stored.record.clone();
+    if provider
+        .adapter
+        .same_identity(&native_adapter_reference(app))
+        || adapter_for_reference(&provider.app_id, &provider.adapter).is_none()
+    {
+        return Ok(provider);
+    }
+
+    provider.adapter = native_adapter_reference(app);
+    provider.settings = stored.native_settings.as_object().cloned().ok_or_else(|| {
+        StoreError::InvalidStore(format!(
+            "provider '{}' native settings must be an object",
+            provider.id
+        ))
+    })?;
+    Ok(provider)
 }
 
 pub struct ProviderStore {
@@ -169,7 +174,8 @@ impl ProviderStore {
         } else {
             None
         };
-        let receipt = match action(&provider.record, common_snippet.as_deref()) {
+        let live_provider = provider_for_live_action(&provider, &app)?;
+        let receipt = match action(&live_provider, common_snippet.as_deref()) {
             Ok(receipt) => receipt,
             Err(error) => {
                 transaction.rollback()?;
@@ -297,161 +303,6 @@ impl ProviderStore {
             return Err(error);
         }
         Ok(Ok(()))
-    }
-
-    pub fn with_all_providers<T, E>(
-        &self,
-        action: impl FnOnce(&[ProviderRecord]) -> Result<T, E>,
-    ) -> Result<Result<T, E>, StoreError> {
-        let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let providers = self
-            .stored_providers(&transaction, None)?
-            .into_iter()
-            .map(|provider| provider.record)
-            .collect::<Vec<_>>();
-        let result = action(&providers);
-        if result.is_err() {
-            transaction.rollback()?;
-            return Ok(result);
-        }
-        transaction.commit()?;
-        Ok(result)
-    }
-
-    pub fn migrate_legacy(&self, path: &Path) -> Result<(), StoreError> {
-        let connection = self.connect()?;
-        let already_migrated = connection
-            .query_row(
-                &format!("SELECT 1 FROM {MIGRATIONS_TABLE} WHERE id = ?1"),
-                [LEGACY_PROVIDER_MIGRATION],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if already_migrated {
-            return Ok(());
-        }
-        drop(connection);
-
-        let _legacy_lock = lock_legacy_store(path)?;
-        let Some(file) = read_legacy_file(path)? else {
-            return Ok(());
-        };
-        validate_legacy_file(&file)?;
-
-        let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let already_migrated = transaction
-            .query_row(
-                &format!("SELECT 1 FROM {MIGRATIONS_TABLE} WHERE id = ?1"),
-                [LEGACY_PROVIDER_MIGRATION],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if already_migrated {
-            transaction.commit()?;
-            return Ok(());
-        }
-
-        let base_time = now_millis()?;
-        let mut identities = HashSet::new();
-        for (offset, provider) in file.providers.iter().enumerate() {
-            let app = match parse_app(&provider.app_id) {
-                Ok(app) => app,
-                Err(_) => {
-                    archive_legacy_provider(&transaction, offset, "unsupported_app", provider)?;
-                    continue;
-                }
-            };
-            let identity = (app.as_str().to_owned(), provider.id.clone());
-            let exists = transaction
-                .query_row(
-                    "SELECT 1 FROM providers WHERE id = ?1 AND app_type = ?2",
-                    params![provider.id, app.as_str()],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-            if !identities.insert(identity) || exists {
-                archive_legacy_provider(&transaction, offset, "identity_conflict", provider)?;
-                continue;
-            }
-
-            let name = match validate_legacy_provider(provider) {
-                Ok(name) => name,
-                Err(_) => {
-                    archive_legacy_provider(&transaction, offset, "invalid_record", provider)?;
-                    continue;
-                }
-            };
-            let (settings, adapter, compatibility_settings) =
-                match migrate_legacy_provider(provider, &app) {
-                    Ok(migrated) => migrated,
-                    Err(_) => {
-                        archive_legacy_provider(&transaction, offset, "invalid_record", provider)?;
-                        continue;
-                    }
-                };
-            let created_at = base_time
-                .checked_add(i64::try_from(offset).map_err(|_| {
-                    StoreError::InvalidStore(
-                        "legacy provider count exceeds SQLite range".to_owned(),
-                    )
-                })?)
-                .ok_or_else(|| {
-                    StoreError::InvalidStore("legacy provider timestamp overflow".to_owned())
-                })?;
-            let sort_index: i64 = transaction.query_row(
-                "SELECT COALESCE(MAX(sort_index) + 1, 0) FROM providers WHERE app_type = ?1",
-                [app.as_str()],
-                |row| row.get(0),
-            )?;
-            transaction.execute(
-                "INSERT INTO providers
-                 (id, app_type, name, settings_config, created_at, sort_index, meta,
-                  is_current, in_failover_queue)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}', 0, 0)",
-                params![
-                    provider.id,
-                    app.as_str(),
-                    name,
-                    serde_json::to_string(&settings)
-                        .map_err(|error| StoreError::InvalidStore(error.to_string()))?,
-                    created_at,
-                    sort_index,
-                ],
-            )?;
-            self.save_adapter_binding(
-                &transaction,
-                &provider.id,
-                &app,
-                created_at,
-                ProviderBinding {
-                    adapter: &adapter,
-                    extensions: &provider.extensions,
-                    compatibility_settings: compatibility_settings.as_ref(),
-                },
-            )?;
-        }
-        transaction.execute(
-            &format!(
-                "INSERT INTO {STORE_EXTENSIONS_TABLE} (id, extensions_json)
-                 VALUES (?1, ?2)"
-            ),
-            params![
-                LEGACY_PROVIDER_MIGRATION,
-                serde_json::to_string(&file.extensions)
-                    .map_err(|error| StoreError::InvalidStore(error.to_string()))?,
-            ],
-        )?;
-        transaction.execute(
-            &format!("INSERT INTO {MIGRATIONS_TABLE} (id, completed_at) VALUES (?1, ?2)"),
-            params![LEGACY_PROVIDER_MIGRATION, now_millis()?],
-        )?;
-        transaction.commit()?;
-        Ok(())
     }
 
     pub fn create_resolved_from<E>(
@@ -1110,21 +961,6 @@ impl ProviderStore {
                 record_extensions_json TEXT NOT NULL DEFAULT '{{}}',
                 PRIMARY KEY (provider_id, app_type)
             );
-            CREATE TABLE IF NOT EXISTS {MIGRATIONS_TABLE} (
-                id TEXT PRIMARY KEY,
-                completed_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS {MIGRATION_RECORDS_TABLE} (
-                migration_id TEXT NOT NULL,
-                position INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                record_json TEXT NOT NULL,
-                PRIMARY KEY (migration_id, position)
-            );
-            CREATE TABLE IF NOT EXISTS {STORE_EXTENSIONS_TABLE} (
-                id TEXT PRIMARY KEY,
-                extensions_json TEXT NOT NULL
-            );
             CREATE TRIGGER IF NOT EXISTS cc_switch_lite_provider_adapter_delete
             AFTER DELETE ON providers
             BEGIN
@@ -1403,57 +1239,6 @@ fn parse_app(app_id: &str) -> Result<AppType, StoreError> {
     })
 }
 
-fn archive_legacy_provider(
-    transaction: &Transaction<'_>,
-    position: usize,
-    reason: &str,
-    provider: &ProviderRecord,
-) -> Result<(), StoreError> {
-    let position = i64::try_from(position).map_err(|_| {
-        StoreError::InvalidStore("legacy provider count exceeds SQLite range".to_owned())
-    })?;
-    transaction.execute(
-        &format!(
-            "INSERT INTO {MIGRATION_RECORDS_TABLE}
-             (migration_id, position, reason, record_json) VALUES (?1, ?2, ?3, ?4)"
-        ),
-        params![
-            LEGACY_PROVIDER_MIGRATION,
-            position,
-            reason,
-            serde_json::to_string(provider)
-                .map_err(|error| StoreError::InvalidStore(error.to_string()))?,
-        ],
-    )?;
-    Ok(())
-}
-
-fn lock_legacy_store(path: &Path) -> Result<File, StoreError> {
-    let lock_path = path.with_extension("lock");
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let lock = options.open(&lock_path).map_err(|source| StoreError::Io {
-        path: lock_path.clone(),
-        source,
-    })?;
-    FileExt::try_lock(&lock).map_err(|error| match error {
-        TryLockError::WouldBlock => StoreError::InvalidStore(
-            "legacy provider store is in use; close the older Lite process and try again"
-                .to_owned(),
-        ),
-        TryLockError::Error(source) => StoreError::Io {
-            path: lock_path,
-            source,
-        },
-    })?;
-    Ok(lock)
-}
-
 fn database_path(home: &Path) -> PathBuf {
     let default = home.join(".cc-switch").join("cc-switch.db");
 
@@ -1471,105 +1256,6 @@ fn database_path(home: &Path) -> PathBuf {
     }
 
     default
-}
-
-fn read_legacy_file(path: &Path) -> Result<Option<LegacyProviderFile>, StoreError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(StoreError::InvalidStore(
-                "legacy provider store must not be a symbolic link".to_owned(),
-            ));
-        }
-        Ok(metadata) if metadata.is_file() => metadata,
-        Ok(_) => {
-            return Err(StoreError::InvalidStore(
-                "legacy provider store must be a regular file".to_owned(),
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(StoreError::Io {
-                path: path.to_owned(),
-                source,
-            });
-        }
-    };
-    if metadata.len() > MAX_LEGACY_STORE_BYTES {
-        return Err(StoreError::InvalidStore(format!(
-            "legacy provider store exceeds the {MAX_LEGACY_STORE_BYTES} byte limit"
-        )));
-    }
-
-    let file = File::open(path).map_err(|source| StoreError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    let mut contents = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_LEGACY_STORE_BYTES + 1)
-        .read_to_end(&mut contents)
-        .map_err(|source| StoreError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-    if contents.len() as u64 > MAX_LEGACY_STORE_BYTES {
-        return Err(StoreError::InvalidStore(format!(
-            "legacy provider store exceeds the {MAX_LEGACY_STORE_BYTES} byte limit"
-        )));
-    }
-    serde_json::from_slice(&contents)
-        .map(Some)
-        .map_err(|error| StoreError::InvalidStore(format!("legacy provider store: {error}")))
-}
-
-fn validate_legacy_file(file: &LegacyProviderFile) -> Result<(), StoreError> {
-    if file.version != LEGACY_STORE_VERSION {
-        return Err(StoreError::InvalidStore(format!(
-            "unsupported legacy provider store version {}",
-            file.version
-        )));
-    }
-    Ok(())
-}
-
-fn validate_legacy_provider(provider: &ProviderRecord) -> Result<String, StoreError> {
-    if provider.id.is_empty()
-        || provider.revision == 0
-        || provider.adapter.plugin_id.is_empty()
-        || provider.adapter.plugin_version.is_empty()
-        || provider.adapter.adapter_id.is_empty()
-        || provider.adapter.contract_major == 0
-        || provider.adapter.schema_version == 0
-    {
-        return Err(StoreError::InvalidStore(
-            "a legacy provider record is incomplete".to_owned(),
-        ));
-    }
-    validate_name(&provider.name).map_err(StoreError::InvalidProvider)
-}
-
-fn migrate_legacy_provider(
-    provider: &ProviderRecord,
-    app: &AppType,
-) -> Result<(Value, AdapterReference, Option<Value>), StoreError> {
-    let legacy = crate::provider::adapter_for_reference(&provider.app_id, &provider.adapter);
-    if legacy.is_none() {
-        let settings = Value::Object(provider.settings.clone());
-        validate_native_settings(&provider.settings)?;
-        return Ok((settings, provider.adapter.clone(), None));
-    }
-
-    let settings = apply_legacy_settings_to_native(
-        app,
-        &provider.name,
-        &provider.settings,
-        &provider.id,
-        None,
-    )?;
-    Ok((
-        settings,
-        provider.adapter.clone(),
-        Some(legacy_settings_extras(&provider.settings)),
-    ))
 }
 
 fn apply_legacy_settings_to_native(
@@ -2085,6 +1771,23 @@ mod tests {
             .unwrap();
         let stored: Value = serde_json::from_str(&stored).unwrap();
         assert_eq!(stored["env"]["ANTHROPIC_API_KEY"], "secret");
+
+        store
+            .switch_with_provider(
+                "claude",
+                &created.id,
+                created.revision,
+                |provider, _| {
+                    assert!(provider
+                        .adapter
+                        .same_identity(&native_adapter_reference(&AppType::Claude)));
+                    assert_eq!(provider.settings["env"]["ANTHROPIC_API_KEY"], "secret");
+                    Ok::<_, StoreError>(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
@@ -2623,290 +2326,6 @@ mod tests {
     }
 
     #[test]
-    fn migrates_the_legacy_lite_store_once_without_losing_plugin_identity() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("cc-switch.db");
-        let legacy_path = directory.path().join("providers.json");
-        let plugin_adapter = AdapterReference {
-            plugin_id: "example.plugin".to_owned(),
-            plugin_version: "1.2.3".to_owned(),
-            adapter_id: "example.claude".to_owned(),
-            contract_major: 1,
-            schema_version: 2,
-            extensions: Map::from_iter([("future".to_owned(), Value::Bool(true))]),
-        };
-        fs::write(
-            &legacy_path,
-            serde_json::to_vec(&serde_json::json!({
-                "version": 1,
-                "futureFileState": {"keep": true},
-                "providers": [
-                    {
-                        "id": "legacy-claude",
-                        "revision": 4,
-                        "appId": "claude",
-                        "adapter": crate::provider::built_in_adapters()[0].reference,
-                        "name": "Claude legacy",
-                        "settings": {
-                            "apiKey": "claude-secret",
-                            "baseUrl": "https://claude.example",
-                            "model": "claude-model",
-                            "futureSetting": {"keep": true}
-                        },
-                        "futureProviderState": {"keep": true}
-                    },
-                    {
-                        "id": "legacy-plugin",
-                        "revision": 9,
-                        "appId": "claude",
-                        "adapter": plugin_adapter,
-                        "name": "Plugin legacy",
-                        "settings": {"token": "plugin-secret"}
-                    }
-                ]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let store = ProviderStore::open(path.clone()).unwrap();
-
-        store.migrate_legacy(&legacy_path).unwrap();
-        store.migrate_legacy(&legacy_path).unwrap();
-        let providers = store.list("claude").unwrap();
-
-        assert_eq!(providers.len(), 2);
-        let compatibility = providers
-            .iter()
-            .find(|provider| provider.id == "legacy-claude")
-            .unwrap()
-            .clone();
-        assert!(crate::provider::adapter_for_reference("claude", &compatibility.adapter).is_some());
-        assert_eq!(compatibility.settings["apiKey"], "claude-secret");
-        assert_eq!(compatibility.settings["futureSetting"]["keep"], true);
-        assert_eq!(
-            compatibility.extensions["futureProviderState"]["keep"],
-            true
-        );
-        let native: String = Connection::open(&path)
-            .unwrap()
-            .query_row(
-                "SELECT settings_config FROM providers
-                 WHERE id='legacy-claude' AND app_type='claude'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let native: Value = serde_json::from_str(&native).unwrap();
-        assert_eq!(native["env"]["ANTHROPIC_API_KEY"], "claude-secret");
-        Connection::open(&path)
-            .unwrap()
-            .execute(
-                "UPDATE providers SET settings_config=?1
-                 WHERE id='legacy-claude' AND app_type='claude'",
-                [serde_json::json!({
-                    "env": {
-                        "ANTHROPIC_API_KEY": "rotated-by-full",
-                        "ANTHROPIC_BASE_URL": "https://full.example",
-                        "futureEnv": {"keep": true}
-                    },
-                    "futureNative": {"keep": true}
-                })
-                .to_string()],
-            )
-            .unwrap();
-        let refreshed = store
-            .list("claude")
-            .unwrap()
-            .into_iter()
-            .find(|provider| provider.id == "legacy-claude")
-            .unwrap();
-        assert_eq!(refreshed.settings["apiKey"], "rotated-by-full");
-        assert_eq!(refreshed.settings["baseUrl"], "https://full.example");
-        assert_eq!(refreshed.settings["futureSetting"]["keep"], true);
-        let descriptor = crate::provider::built_in_adapters()
-            .into_iter()
-            .find(|adapter| adapter.app_id == "claude")
-            .unwrap();
-        store
-            .update_from(
-                "claude",
-                "legacy-claude",
-                ProviderUpdate {
-                    expected_revision: refreshed.revision,
-                    name: "Renamed".to_owned(),
-                    settings: refreshed.settings,
-                },
-                |_, _| Ok::<_, StoreError>(descriptor),
-            )
-            .unwrap()
-            .unwrap();
-        let after_lite: String = Connection::open(&path)
-            .unwrap()
-            .query_row(
-                "SELECT settings_config FROM providers
-                 WHERE id='legacy-claude' AND app_type='claude'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let after_lite: Value = serde_json::from_str(&after_lite).unwrap();
-        assert_eq!(after_lite["env"]["ANTHROPIC_API_KEY"], "rotated-by-full");
-        assert_eq!(after_lite["env"]["futureEnv"]["keep"], true);
-        assert_eq!(after_lite["futureNative"]["keep"], true);
-        let plugin = providers
-            .iter()
-            .find(|provider| provider.id == "legacy-plugin")
-            .unwrap();
-        assert_eq!(plugin.adapter.plugin_id, "example.plugin");
-        assert_eq!(plugin.adapter.extensions["future"], true);
-        assert_eq!(plugin.settings["token"], "plugin-secret");
-        let root_extensions: String = Connection::open(&path)
-            .unwrap()
-            .query_row(
-                &format!("SELECT extensions_json FROM {STORE_EXTENSIONS_TABLE} WHERE id=?1"),
-                [LEGACY_PROVIDER_MIGRATION],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let root_extensions: Value = serde_json::from_str(&root_extensions).unwrap();
-        assert_eq!(root_extensions["futureFileState"]["keep"], true);
-        assert!(legacy_path.exists());
-        assert_eq!(
-            Connection::open(path)
-                .unwrap()
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM {MIGRATIONS_TABLE}"),
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn legacy_migration_respects_the_previous_store_lock() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let legacy_path = directory.path().join("providers.json");
-        fs::write(&legacy_path, br#"{"version":1,"providers":[]}"#).unwrap();
-        let lock_path = legacy_path.with_extension("lock");
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .unwrap();
-        FileExt::lock(&lock).unwrap();
-        let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
-
-        assert!(matches!(
-            store.migrate_legacy(&legacy_path),
-            Err(StoreError::InvalidStore(_))
-        ));
-        FileExt::unlock(&lock).unwrap();
-        store.migrate_legacy(&legacy_path).unwrap();
-    }
-
-    #[test]
-    fn legacy_migration_archives_conflicts_without_blocking_other_records() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let legacy_path = directory.path().join("providers.json");
-        let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
-        store
-            .connect()
-            .unwrap()
-            .execute(
-                "INSERT INTO providers
-                 (id, app_type, name, settings_config, created_at, sort_index, meta,
-                  is_current, in_failover_queue)
-                 VALUES ('same-id', 'claude', 'Existing', '{}', 1, 0, '{}', 0, 0)",
-                [],
-            )
-            .unwrap();
-        fs::write(
-            &legacy_path,
-            serde_json::to_vec(&serde_json::json!({
-                "version": 1,
-                "providers": [
-                    {
-                        "id": "same-id",
-                        "revision": 1,
-                        "appId": "claude",
-                        "adapter": native_adapter_reference(&AppType::Claude),
-                        "name": "Conflicting",
-                        "settings": {}
-                    },
-                    {
-                        "id": "codex-kept",
-                        "revision": 1,
-                        "appId": "codex",
-                        "adapter": native_adapter_reference(&AppType::Codex),
-                        "name": "Codex kept",
-                        "settings": {"auth": {}, "config": ""}
-                    },
-                    {
-                        "id": "invalid-claude",
-                        "revision": 1,
-                        "appId": "claude",
-                        "adapter": native_adapter_reference(&AppType::Claude),
-                        "name": "",
-                        "settings": {}
-                    },
-                    {
-                        "id": "codex-kept",
-                        "revision": 2,
-                        "appId": "codex",
-                        "adapter": native_adapter_reference(&AppType::Codex),
-                        "name": "",
-                        "settings": {"auth": {}, "config": ""}
-                    },
-                    {
-                        "id": "future-kept",
-                        "revision": 1,
-                        "appId": "future-client",
-                        "adapter": {
-                            "pluginId": "example.future",
-                            "pluginVersion": "1.0.0",
-                            "adapterId": "future.adapter",
-                            "contractMajor": 1,
-                            "schemaVersion": 1
-                        },
-                        "name": "",
-                        "settings": {"token": "secret"}
-                    }
-                ]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        store.migrate_legacy(&legacy_path).unwrap();
-
-        assert_eq!(store.list("codex").unwrap()[0].id, "codex-kept");
-        let connection = store.connect().unwrap();
-        let mut statement = connection
-            .prepare(&format!(
-                "SELECT reason, record_json FROM {MIGRATION_RECORDS_TABLE} ORDER BY position"
-            ))
-            .unwrap();
-        let archived = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<Result<Vec<(String, String)>, _>>()
-            .unwrap();
-        assert_eq!(archived.len(), 4);
-        assert_eq!(archived[0].0, "identity_conflict");
-        assert!(archived[0].1.contains("Conflicting"));
-        assert_eq!(archived[1].0, "invalid_record");
-        assert!(archived[1].1.contains("invalid-claude"));
-        assert_eq!(archived[2].0, "identity_conflict");
-        assert!(archived[2].1.contains("\"revision\":2"));
-        assert_eq!(archived[3].0, "unsupported_app");
-        assert!(archived[3].1.contains("future-kept"));
-    }
-
-    #[test]
     fn exclusive_current_rows_cannot_be_deleted_but_additive_rows_can() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
@@ -3015,14 +2434,13 @@ mod tests {
     }
 
     #[test]
-    fn plugin_bindings_are_internal_and_do_not_change_native_rows() {
+    fn external_adapter_bindings_remain_internal_and_read_only() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
         let app = AppType::Gemini;
         let mut descriptor = native_descriptor(&app);
         descriptor.reference.plugin_id = "example.plugin".to_owned();
         descriptor.reference.adapter_id = "example.gemini".to_owned();
-        let descriptor_for_update = descriptor.clone();
         let mut expected = descriptor.reference.clone();
         expected
             .extensions
@@ -3052,23 +2470,83 @@ mod tests {
             .unwrap();
         let refreshed = store.list(app.as_str()).unwrap().pop().unwrap();
         assert_eq!(refreshed.adapter, expected);
-        let updated = store
-            .update_from(
-                app.as_str(),
-                &created.id,
-                ProviderUpdate {
-                    expected_revision: refreshed.revision,
-                    name: "Updated".to_owned(),
-                    settings: Map::from_iter([
-                        ("env".to_owned(), Value::String("new-secret".to_owned())),
-                        ("futureSetting".to_owned(), Value::Bool(false)),
-                    ]),
-                },
-                |_, _| Ok::<_, StoreError>(descriptor_for_update),
+        assert!(!is_lite_writable(&refreshed));
+        let result = store.update_from(
+            app.as_str(),
+            &created.id,
+            ProviderUpdate {
+                expected_revision: refreshed.revision,
+                name: "Updated".to_owned(),
+                settings: Map::from_iter([
+                    ("env".to_owned(), Value::String("new-secret".to_owned())),
+                    ("futureSetting".to_owned(), Value::Bool(false)),
+                ]),
+            },
+            |_, _| Ok::<_, StoreError>(native_descriptor(&app)),
+        );
+        assert!(matches!(result, Err(StoreError::InvalidProvider(_))));
+
+        let unchanged = store.list(app.as_str()).unwrap().pop().unwrap();
+        assert_eq!(unchanged.adapter, expected);
+        assert_eq!(unchanged.name, "Plugin");
+        assert_eq!(unchanged.settings["env"], "secret");
+        assert_eq!(unchanged.settings["futureSetting"]["keep"], true);
+    }
+
+    #[test]
+    fn unbound_full_app_managed_records_remain_read_only() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cc-switch.db");
+        let store = ProviderStore::open(path.clone()).unwrap();
+        let aggregator = create_native(&store, &AppType::Claude, "Aggregator");
+        let managed = create_native(&store, &AppType::Codex, "Managed OAuth");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                &format!(
+                    "DELETE FROM {ADAPTER_BINDINGS_TABLE}
+                     WHERE (provider_id = ?1 AND app_type = 'claude')
+                        OR (provider_id = ?2 AND app_type = 'codex')"
+                ),
+                params![aggregator.id, managed.id],
             )
-            .unwrap()
             .unwrap();
-        assert_eq!(updated.settings["env"], "new-secret");
-        assert_eq!(updated.settings["futureSetting"]["keep"], true);
+        connection
+            .execute(
+                "UPDATE providers SET category = 'aggregator'
+                 WHERE id = ?1 AND app_type = 'claude'",
+                [&aggregator.id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE providers SET meta = '{\"providerType\":\"codex_oauth\"}'
+                 WHERE id = ?1 AND app_type = 'codex'",
+                [&managed.id],
+            )
+            .unwrap();
+
+        for app in [AppType::Claude, AppType::Codex] {
+            let provider = store.list(app.as_str()).unwrap().pop().unwrap();
+            assert!(!is_lite_writable(&provider));
+            assert!(matches!(
+                store.update_from(
+                    app.as_str(),
+                    &provider.id,
+                    ProviderUpdate {
+                        expected_revision: provider.revision,
+                        name: "Changed".to_owned(),
+                        settings: provider.settings.clone(),
+                    },
+                    |_, _| Ok::<_, StoreError>(native_descriptor(&app)),
+                ),
+                Err(StoreError::InvalidProvider(_))
+            ));
+            assert!(matches!(
+                store.delete(app.as_str(), &provider.id, provider.revision),
+                Err(StoreError::InvalidProvider(_))
+            ));
+            assert_eq!(store.list(app.as_str()).unwrap()[0].name, provider.name);
+        }
     }
 }

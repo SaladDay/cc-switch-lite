@@ -7,6 +7,15 @@ export interface AppDefinition {
   emptyTitle: string;
 }
 
+export type LiteFeature = "providers" | "liveConfiguration" | "mcp" | "skills";
+
+const FEATURE_CAPABILITIES: Record<LiteFeature, string> = {
+  providers: "provider-management",
+  liveConfiguration: "live-configuration",
+  mcp: "mcp",
+  skills: "skills",
+};
+
 export const APPS: AppDefinition[] = [
   {
     id: "claude",
@@ -64,14 +73,11 @@ export const APPS: AppDefinition[] = [
   },
 ];
 
-export const APP_IDS = APPS.map((app) => app.id);
-
 export function parseCoreAppCatalog(value: unknown): CoreAppDescriptor[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new Error("Core returned an invalid application catalog");
   }
 
-  const knownIds = new Set<string>(APP_IDS);
   const seenIds = new Set<string>();
   return value.map((candidate) => {
     if (
@@ -87,7 +93,7 @@ export function parseCoreAppCatalog(value: unknown): CoreAppDescriptor[] {
       descriptor;
     if (
       typeof id !== "string" ||
-      !knownIds.has(id) ||
+      id.trim() === "" ||
       seenIds.has(id) ||
       typeof displayName !== "string" ||
       typeof brandKey !== "string" ||
@@ -100,7 +106,7 @@ export function parseCoreAppCatalog(value: unknown): CoreAppDescriptor[] {
     seenIds.add(id);
 
     return {
-      id: id as AppId,
+      id,
       displayName,
       brandKey,
       configurationMode,
@@ -109,11 +115,35 @@ export function parseCoreAppCatalog(value: unknown): CoreAppDescriptor[] {
   });
 }
 
-export function appDefinition(appId: AppId): AppDefinition {
-  return APPS.find((app) => app.id === appId) ?? APPS[0];
+export function appDefinition(
+  appId: AppId,
+  catalog: CoreAppDescriptor[] = [],
+): AppDefinition {
+  const known = APPS.find((app) => app.id === appId);
+  if (known) return known;
+  const descriptor = catalog.find((app) => app.id === appId);
+  const label = descriptor?.displayName ?? appId;
+  return {
+    id: appId,
+    label,
+    icon: descriptor?.brandKey ?? appId,
+    emptyTitle: `Add your first ${label} provider`,
+  };
 }
 
-const NATIVE_SETTINGS_TEMPLATES: Record<AppId, Record<string, JsonValue>> = {
+export function supportsFeature(
+  catalog: CoreAppDescriptor[],
+  appId: AppId,
+  feature: LiteFeature,
+): boolean {
+  return (
+    catalog
+      .find((descriptor) => descriptor.id === appId)
+      ?.capabilities.includes(FEATURE_CAPABILITIES[feature]) ?? false
+  );
+}
+
+const NATIVE_SETTINGS_TEMPLATES: Record<string, Record<string, JsonValue>> = {
   claude: { env: {} },
   "claude-desktop": {
     env: { ANTHROPIC_BASE_URL: "", ANTHROPIC_AUTH_TOKEN: "" },

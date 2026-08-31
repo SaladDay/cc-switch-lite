@@ -1,13 +1,4 @@
-export type AppId =
-  | "claude"
-  | "claude-desktop"
-  | "codex"
-  | "gemini"
-  | "grokbuild"
-  | "opencode"
-  | "openclaw"
-  | "hermes"
-  | "pi";
+export type AppId = string;
 
 export interface CoreAppDescriptor {
   id: AppId;
