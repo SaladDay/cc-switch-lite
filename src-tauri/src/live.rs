@@ -1,14 +1,18 @@
 use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Mutex,
 };
 
+use cc_switch_core::{fs::shared_live_config_lock_path, MAX_OPERATION_CONTENT_BYTES};
 use fs4::{FileExt, TryLockError};
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
+    mcp::{McpImportsByApp, McpLiveChange},
+    mcp_live::{McpLiveConfig, McpLiveReceipt},
     native_live::NativeLiveConfig,
     operation::{LivePaths, OperationError, OperationExecutor, OperationPlan, OperationReceipt},
     provider::{NativeImport, ProviderRecord},
@@ -32,6 +36,8 @@ pub enum LiveError {
         #[source]
         source: std::io::Error,
     },
+    #[error("live recovery was incomplete: {0}")]
+    Recovery(String),
 }
 
 impl LiveError {
@@ -43,12 +49,14 @@ impl LiveError {
             Self::InvalidProvider(_) => "invalid_provider",
             Self::LockUnavailable => "lock_unavailable",
             Self::Io { .. } => "live_io_error",
+            Self::Recovery(_) => "rollback_failed",
         }
     }
 }
 
 pub struct LiveConfig {
     native: NativeLiveConfig,
+    mcp: McpLiveConfig,
     lock_path: PathBuf,
     gate: Mutex<()>,
 }
@@ -57,21 +65,42 @@ pub struct LiveWriteReceipt {
     operation: OperationReceipt,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct SharedPathSettings {
+    claude_config_dir: Option<String>,
+    codex_config_dir: Option<String>,
+    gemini_config_dir: Option<String>,
+    grok_config_dir: Option<String>,
+    opencode_config_dir: Option<String>,
+    hermes_config_dir: Option<String>,
+}
+
+pub(crate) struct ResolvedConfigDirs {
+    pub(crate) claude: PathBuf,
+    pub(crate) codex: PathBuf,
+    pub(crate) gemini: PathBuf,
+    pub(crate) grok: PathBuf,
+    pub(crate) opencode: PathBuf,
+    pub(crate) hermes: PathBuf,
+    pub(crate) pi: PathBuf,
+}
+
 impl LiveConfig {
-    pub fn from_home(home: &Path, lock_path: PathBuf) -> Result<Self, LiveError> {
-        let claude_dir = config_root(
-            std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
-            &home.join(".claude"),
-            "CLAUDE_CONFIG_DIR",
-        )?;
-        let codex_dir = config_root(
-            std::env::var_os("CODEX_HOME").as_deref(),
-            &home.join(".codex"),
-            "CODEX_HOME",
-        )?;
+    pub fn from_home(home: &Path) -> Result<Self, LiveError> {
+        let dirs = resolve_config_dirs(home)?;
+        let claude_mcp = claude_mcp_path(home, &dirs.claude)?;
         Ok(Self {
-            native: NativeLiveConfig::from_home(home, claude_dir, codex_dir)?,
-            lock_path,
+            native: NativeLiveConfig::from_home(home, &dirs)?,
+            mcp: McpLiveConfig::new(
+                (claude_mcp, dirs.claude),
+                (dirs.codex.join("config.toml"), dirs.codex),
+                (dirs.gemini.join("settings.json"), dirs.gemini),
+                (dirs.grok.join("config.toml"), dirs.grok),
+                (dirs.opencode.join("opencode.json"), dirs.opencode),
+                (dirs.hermes.join("config.yaml"), dirs.hermes),
+            ),
+            lock_path: shared_live_config_lock_path(home),
             gate: Mutex::new(()),
         })
     }
@@ -81,6 +110,29 @@ impl LiveConfig {
             LiveError::InvalidProvider("application is not available in Lite".to_owned())
         })?;
         self.with_lock(|| self.native.import_drafts(app))
+    }
+
+    pub fn apply_mcp_recoverable(
+        &self,
+        changes: &[McpLiveChange],
+    ) -> Result<McpLiveReceipt, LiveError> {
+        self.with_lock(|| self.mcp.apply(changes))
+    }
+
+    pub fn rollback_mcp(&self, receipt: McpLiveReceipt) -> Result<(), LiveError> {
+        self.with_lock(|| self.mcp.rollback(receipt))
+    }
+
+    pub fn import_mcp_checked<T, E>(
+        &self,
+        action: impl FnOnce(McpImportsByApp, &dyn Fn() -> bool) -> Result<T, E>,
+    ) -> Result<Result<T, E>, LiveError> {
+        self.with_lock(|| {
+            let snapshot = self.mcp.import_snapshot();
+            let imports = snapshot.imports.clone();
+            let verify = || self.mcp.snapshot_is_current(&snapshot);
+            Ok(action(imports, &verify))
+        })
     }
 
     pub fn switch_native_recoverable(
@@ -197,6 +249,186 @@ impl LiveConfig {
     }
 }
 
+fn resolve_config_dirs(home: &Path) -> Result<ResolvedConfigDirs, LiveError> {
+    let settings = load_shared_path_settings(home);
+    let hermes_env = std::env::var_os("HERMES_HOME");
+    let pi_env = std::env::var_os("PI_CODING_AGENT_DIR");
+    Ok(ResolvedConfigDirs {
+        claude: configured_root(
+            home,
+            settings.claude_config_dir.as_deref(),
+            None,
+            &home.join(".claude"),
+            "Claude config directory",
+        )?,
+        codex: configured_root(
+            home,
+            settings.codex_config_dir.as_deref(),
+            None,
+            &home.join(".codex"),
+            "Codex config directory",
+        )?,
+        gemini: configured_root(
+            home,
+            settings.gemini_config_dir.as_deref(),
+            None,
+            &home.join(".gemini"),
+            "Gemini config directory",
+        )?,
+        grok: configured_root(
+            home,
+            settings.grok_config_dir.as_deref(),
+            None,
+            &home.join(".grok"),
+            "Grok config directory",
+        )?,
+        opencode: configured_root(
+            home,
+            settings.opencode_config_dir.as_deref(),
+            None,
+            &home.join(".config/opencode"),
+            "OpenCode config directory",
+        )?,
+        hermes: configured_root(
+            home,
+            settings.hermes_config_dir.as_deref(),
+            hermes_env.as_deref(),
+            &crate::native_live::default_hermes_dir(home),
+            "Hermes config directory",
+        )?,
+        pi: configured_root(
+            home,
+            None,
+            pi_env.as_deref(),
+            &home.join(".pi/agent"),
+            "Pi config directory",
+        )?,
+    })
+}
+
+fn load_shared_path_settings(home: &Path) -> SharedPathSettings {
+    let path = home.join(".cc-switch/settings.json");
+    let Ok(contents) = fs::read(path) else {
+        return SharedPathSettings::default();
+    };
+    if contents.len() > MAX_OPERATION_CONTENT_BYTES {
+        return SharedPathSettings::default();
+    }
+    serde_json::from_slice(&contents).unwrap_or_default()
+}
+
+fn configured_root(
+    home: &Path,
+    setting: Option<&str>,
+    environment: Option<&OsStr>,
+    default: &Path,
+    label: &str,
+) -> Result<PathBuf, LiveError> {
+    let setting = setting
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| resolve_shared_path(home, value));
+    let environment = environment
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let configured = setting.or(environment);
+    config_root(configured.as_deref().map(Path::as_os_str), default, label)
+}
+
+fn resolve_shared_path(home: &Path, raw: &str) -> PathBuf {
+    if raw == "~" {
+        home.to_owned()
+    } else if let Some(path) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        home.join(path)
+    } else {
+        PathBuf::from(raw)
+    }
+}
+
+fn claude_mcp_path(home: &Path, config_dir: &Path) -> Result<PathBuf, LiveError> {
+    let default_dir = config_root(None, &home.join(".claude"), "Claude config directory")?;
+    if path_eq_lexical(config_dir, &default_dir) {
+        return Ok(home.join(".claude.json"));
+    }
+    #[cfg(windows)]
+    if let Some(path) = derive_wsl_default_mcp_path(config_dir) {
+        return Ok(path);
+    }
+    Ok(config_dir.join(".claude.json"))
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn path_eq_lexical(left: &Path, right: &Path) -> bool {
+    comparable_path_key(left) == comparable_path_key(right)
+}
+
+fn comparable_path_key(path: &Path) -> String {
+    let mut key = normalize_path_lexically(path).to_string_lossy().to_string();
+    #[cfg(windows)]
+    {
+        key = key.replace('\\', "/");
+    }
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
+    #[cfg(windows)]
+    key.make_ascii_lowercase();
+    key
+}
+
+#[cfg(windows)]
+fn derive_wsl_default_mcp_path(dir: &Path) -> Option<PathBuf> {
+    use std::path::Prefix;
+
+    let normalized = normalize_path_lexically(dir);
+    let mut components = normalized.components();
+    let prefix = match components.next()? {
+        Component::Prefix(prefix) => prefix,
+        _ => return None,
+    };
+    let server = match prefix.kind() {
+        Prefix::UNC(server, _) | Prefix::VerbatimUNC(server, _) => server.to_string_lossy(),
+        _ => return None,
+    };
+    if !server.eq_ignore_ascii_case("wsl$") && !server.eq_ignore_ascii_case("wsl.localhost") {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in components {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    let home_default =
+        parts.len() == 3 && parts[0] == "home" && !parts[1].is_empty() && parts[2] == ".claude";
+    let root_default = parts.len() == 2 && parts[0] == "root" && parts[1] == ".claude";
+    (home_default || root_default)
+        .then(|| {
+            normalized
+                .parent()
+                .map(|parent| parent.join(".claude.json"))
+        })
+        .flatten()
+}
+
 fn config_root(
     override_value: Option<&OsStr>,
     default: &Path,
@@ -271,6 +503,63 @@ mod tests {
         assert_eq!(
             config_root(None, &default, "CODEX_HOME").unwrap(),
             fs::canonicalize(directory.path()).unwrap().join("default")
+        );
+    }
+
+    #[test]
+    fn claude_default_directory_always_uses_the_home_mcp_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let default = directory.path().join(".claude");
+        for configured in [
+            configured_root(
+                directory.path(),
+                None,
+                Some(OsStr::new("")),
+                &default,
+                "Claude config directory",
+            )
+            .unwrap(),
+            configured_root(
+                directory.path(),
+                default.to_str(),
+                None,
+                &default,
+                "Claude config directory",
+            )
+            .unwrap(),
+        ] {
+            assert_eq!(
+                claude_mcp_path(directory.path(), &configured).unwrap(),
+                directory.path().join(".claude.json")
+            );
+        }
+    }
+
+    #[test]
+    fn reads_only_shared_directory_settings_and_expands_home() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::create_dir(directory.path().join(".cc-switch")).unwrap();
+        fs::write(
+            directory.path().join(".cc-switch/settings.json"),
+            r#"{"claudeConfigDir":"~/profiles/claude","webdavSync":{"password":"ignored"}}"#,
+        )
+        .unwrap();
+
+        let settings = load_shared_path_settings(directory.path());
+        let resolved = configured_root(
+            directory.path(),
+            settings.claude_config_dir.as_deref(),
+            None,
+            &directory.path().join(".claude"),
+            "Claude config directory",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            fs::canonicalize(directory.path())
+                .unwrap()
+                .join("profiles/claude")
         );
     }
 

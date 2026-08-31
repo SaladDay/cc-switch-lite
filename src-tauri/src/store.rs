@@ -1393,7 +1393,7 @@ fn parse_app(app_id: &str) -> Result<AppType, StoreError> {
     })
 }
 
-fn database_path(home: &Path) -> PathBuf {
+pub(crate) fn database_path(home: &Path) -> PathBuf {
     let default = home.join(".cc-switch").join("cc-switch.db");
 
     #[cfg(windows)]

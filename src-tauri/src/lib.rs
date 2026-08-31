@@ -6,12 +6,15 @@ use cc_switch_core::{
 };
 
 mod live;
+mod mcp;
+mod mcp_live;
 mod native_live;
 mod operation;
 mod provider;
 mod store;
 
 use live::{LiveConfig, LiveError};
+use mcp::{McpError, McpImportReport, McpServer, McpStore};
 use provider::{
     built_in_adapters, is_lite_simple_editable, is_lite_writable, native_adapter_reference,
     native_adapters, validate_simple_provider_values, AdapterDescriptor, CurrentProvider,
@@ -49,6 +52,15 @@ impl From<StoreError> for CommandError {
 
 impl From<LiveError> for CommandError {
     fn from(error: LiveError) -> Self {
+        Self {
+            code: error.code(),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<McpError> for CommandError {
+    fn from(error: McpError) -> Self {
         Self {
             code: error.code(),
             message: error.to_string(),
@@ -421,19 +433,112 @@ fn current_providers(
         .map_err(Into::into)
 }
 
+#[tauri::command]
+fn list_mcp_servers(store: State<'_, McpStore>) -> CommandResult<Vec<McpServer>> {
+    store.list().map_err(Into::into)
+}
+
+#[tauri::command]
+fn upsert_mcp_server(
+    store: State<'_, McpStore>,
+    live: State<'_, LiveConfig>,
+    server: McpServer,
+) -> CommandResult<()> {
+    match store
+        .upsert_with_live(
+            server,
+            |changes| live.apply_mcp_recoverable(changes),
+            |receipt| {
+                live.rollback_mcp(receipt)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .map_err(CommandError::from)?
+    {
+        Ok(()) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[tauri::command]
+fn toggle_mcp_app(
+    store: State<'_, McpStore>,
+    live: State<'_, LiveConfig>,
+    server_id: String,
+    app_id: String,
+    enabled: bool,
+    expected_revision: u64,
+) -> CommandResult<()> {
+    let app = app_id.parse::<cc_switch_core::AppType>().map_err(|_| {
+        CommandError::from(McpError::InvalidServer(format!(
+            "application '{app_id}' is not supported"
+        )))
+    })?;
+    match store
+        .toggle_with_live(
+            &server_id,
+            expected_revision,
+            app,
+            enabled,
+            |changes| live.apply_mcp_recoverable(changes),
+            |receipt| {
+                live.rollback_mcp(receipt)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .map_err(CommandError::from)?
+    {
+        Ok(()) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[tauri::command]
+fn delete_mcp_server(
+    store: State<'_, McpStore>,
+    live: State<'_, LiveConfig>,
+    id: String,
+    expected_revision: u64,
+) -> CommandResult<()> {
+    match store
+        .delete_with_live(
+            &id,
+            expected_revision,
+            |changes| live.apply_mcp_recoverable(changes),
+            |receipt| {
+                live.rollback_mcp(receipt)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .map_err(CommandError::from)?
+    {
+        Ok(()) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[tauri::command]
+fn import_mcp_from_apps(
+    store: State<'_, McpStore>,
+    live: State<'_, LiveConfig>,
+) -> CommandResult<McpImportReport> {
+    match live.import_mcp_checked(|imports, verify| store.import_checked(imports, verify))? {
+        Ok(report) => Ok(report),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let app_data_dir = app.path().app_data_dir()?;
             let home_dir = app.path().home_dir()?;
             let store = ProviderStore::from_home(&home_dir)?;
+            let mcp_store = McpStore::open(store::database_path(&home_dir))?;
             // The shared database is authoritative; startup never imports old Lite files.
             app.manage(store);
-            app.manage(LiveConfig::from_home(
-                &home_dir,
-                app_data_dir.join("live-config.lock"),
-            )?);
+            app.manage(mcp_store);
+            app.manage(LiveConfig::from_home(&home_dir)?);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -448,6 +553,11 @@ pub fn run() {
             switch_provider,
             remove_provider_from_live,
             current_providers,
+            list_mcp_servers,
+            upsert_mcp_server,
+            toggle_mcp_app,
+            delete_mcp_server,
+            import_mcp_from_apps,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run CC Switch Lite");
