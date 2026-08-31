@@ -36,11 +36,11 @@ pub enum SkillLiveError {
 pub(crate) struct SkillObservation {
     pub(crate) id: String,
     pub(crate) source_issue: Option<String>,
-    pub(crate) native_apps: BTreeMap<String, SkillAppObservation>,
+    pub(crate) app_overrides: BTreeMap<String, SkillAppObservation>,
 }
 
 pub(crate) struct SkillAppObservation {
-    pub(crate) enabled: bool,
+    pub(crate) enabled: Option<bool>,
     pub(crate) issue: Option<String>,
 }
 
@@ -52,23 +52,23 @@ struct SkillTarget {
 
 pub(crate) struct SkillLiveConfig {
     source_root: PathBuf,
+    unified_discovery_root: PathBuf,
     sync_method: SkillSyncMethod,
-    unified_store: bool,
     targets: Vec<SkillTarget>,
 }
 
 impl SkillLiveConfig {
     pub(crate) fn new(
         source_root: PathBuf,
+        unified_discovery_root: PathBuf,
         sync_method: SkillSyncMethod,
-        unified_store: bool,
         app_roots: Vec<(AppType, PathBuf)>,
     ) -> Result<Self, SkillLiveError> {
         validate_targets(&app_roots)?;
         Ok(Self {
             source_root,
+            unified_discovery_root,
             sync_method,
-            unified_store,
             targets: app_roots
                 .into_iter()
                 .map(|(app, install_root)| SkillTarget {
@@ -92,15 +92,15 @@ impl SkillLiveConfig {
                         .err()
                         .map(|error| error.to_string())
                 });
-                let native_apps = if directory_issue.is_some() {
+                let app_overrides = if directory_issue.is_some() {
                     BTreeMap::new()
                 } else {
-                    self.observe_native_apps(directory, source_issue.is_none())
+                    self.observe_app_overrides(directory, source_issue.is_none())
                 };
                 SkillObservation {
                     id: id.clone(),
                     source_issue,
-                    native_apps,
+                    app_overrides,
                 }
             })
             .collect()
@@ -116,7 +116,9 @@ impl SkillLiveConfig {
         let Some(contract) = descriptor.skill_contract() else {
             return Err(SkillLiveError::Unsupported(app.as_str().to_owned()));
         };
-        if self.unified_store && contract.discovers_unified_store() {
+        if contract.discovers_unified_store()
+            && inspect_skill_presence(&self.unified_discovery_root, directory)?
+        {
             return Err(SkillLiveError::UnifiedDiscovery(
                 descriptor.display_name().to_owned(),
             ));
@@ -156,7 +158,7 @@ impl SkillLiveConfig {
         .map_err(Into::into)
     }
 
-    fn observe_native_apps(
+    fn observe_app_overrides(
         &self,
         directory: &str,
         source_valid: bool,
@@ -166,27 +168,11 @@ impl SkillLiveConfig {
             .filter_map(|descriptor| {
                 let contract = descriptor.skill_contract()?;
                 (contract.activation_source() == SkillActivationSource::NativePresence
-                    || (self.unified_store && contract.discovers_unified_store()))
+                    || contract.discovers_unified_store())
                 .then_some((descriptor, contract))
             })
-            .map(|(descriptor, contract)| {
-                let observation = if self.unified_store && contract.discovers_unified_store() {
-                    match inspect_skill_presence(&self.source_root, directory) {
-                        Ok(enabled) => SkillAppObservation {
-                            enabled,
-                            issue: enabled.then(|| {
-                                SkillLiveError::UnifiedDiscovery(
-                                    descriptor.display_name().to_owned(),
-                                )
-                                .to_string()
-                            }),
-                        },
-                        Err(error) => SkillAppObservation {
-                            enabled: false,
-                            issue: Some(error.to_string()),
-                        },
-                    }
-                } else {
+            .filter_map(|(descriptor, contract)| {
+                let native_observation = || {
                     self.target(descriptor.app())
                         .map(|target| {
                             observe_managed_presence(
@@ -197,14 +183,48 @@ impl SkillLiveConfig {
                             )
                         })
                         .unwrap_or_else(|| SkillAppObservation {
-                            enabled: false,
+                            enabled: Some(false),
                             issue: Some(
                                 SkillLiveError::MissingTarget(descriptor.id().to_owned())
                                     .to_string(),
                             ),
                         })
                 };
-                (descriptor.id().to_owned(), observation)
+                let observation = if contract.discovers_unified_store() {
+                    match inspect_skill_presence(&self.unified_discovery_root, directory) {
+                        Ok(true) => SkillAppObservation {
+                            enabled: Some(true),
+                            issue: Some(
+                                SkillLiveError::UnifiedDiscovery(
+                                    descriptor.display_name().to_owned(),
+                                )
+                                .to_string(),
+                            ),
+                        },
+                        Ok(false)
+                            if contract.activation_source()
+                                == SkillActivationSource::NativePresence =>
+                        {
+                            native_observation()
+                        }
+                        Ok(false) => return None,
+                        Err(error) => {
+                            let issue = error.to_string();
+                            if contract.activation_source() == SkillActivationSource::NativePresence
+                            {
+                                append_issue(native_observation(), issue)
+                            } else {
+                                SkillAppObservation {
+                                    enabled: None,
+                                    issue: Some(issue),
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    native_observation()
+                };
+                Some((descriptor.id().to_owned(), observation))
             })
             .collect()
     }
@@ -222,7 +242,7 @@ fn observe_managed_presence(
 ) -> SkillAppObservation {
     match inspect_skill_presence(destination_root, directory) {
         Ok(false) => SkillAppObservation {
-            enabled: false,
+            enabled: Some(false),
             issue: None,
         },
         Ok(true) => {
@@ -238,15 +258,23 @@ fn observe_managed_presence(
                 None
             };
             SkillAppObservation {
-                enabled: true,
+                enabled: Some(true),
                 issue,
             }
         }
         Err(error) => SkillAppObservation {
-            enabled: false,
+            enabled: Some(false),
             issue: Some(error.to_string()),
         },
     }
+}
+
+fn append_issue(mut observation: SkillAppObservation, issue: String) -> SkillAppObservation {
+    observation.issue = Some(match observation.issue {
+        Some(existing) => format!("{issue}; {existing}"),
+        None => issue,
+    });
+    observation
 }
 
 fn validate_targets(app_roots: &[(AppType, PathBuf)]) -> Result<(), SkillLiveError> {
@@ -287,8 +315,8 @@ mod tests {
         fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
         let live = SkillLiveConfig::new(
             source,
+            directory.path().join("unified"),
             SkillSyncMethod::Copy,
-            false,
             app_roots(directory.path()),
         )
         .unwrap();
@@ -314,44 +342,64 @@ mod tests {
             .find(|(app, _)| app == &AppType::Pi)
             .unwrap()
             .1 = pi.clone();
-        let live = SkillLiveConfig::new(source, SkillSyncMethod::Copy, false, roots).unwrap();
+        let live = SkillLiveConfig::new(
+            source,
+            directory.path().join("unified"),
+            SkillSyncMethod::Copy,
+            roots,
+        )
+        .unwrap();
         live.apply("docs", &AppType::Pi, true)
             .unwrap()
             .commit()
             .unwrap();
 
         let observations = live.observe(&[("skill".to_owned(), "docs".to_owned())]);
-        assert!(observations[0].native_apps["pi"].enabled);
-        assert_eq!(observations[0].native_apps["pi"].issue, None);
+        assert_eq!(observations[0].app_overrides["pi"].enabled, Some(true));
+        assert_eq!(observations[0].app_overrides["pi"].issue, None);
+        assert!(!observations[0].app_overrides.contains_key("codex"));
 
         fs::write(pi.join("skills/docs/extra"), "external change").unwrap();
         let observations = live.observe(&[("skill".to_owned(), "docs".to_owned())]);
-        assert!(observations[0].native_apps["pi"].enabled);
-        assert!(observations[0].native_apps["pi"].issue.is_some());
+        assert_eq!(observations[0].app_overrides["pi"].enabled, Some(true));
+        assert!(observations[0].app_overrides["pi"].issue.is_some());
     }
 
     #[test]
-    fn unified_store_is_reported_as_native_read_only_pi_state() {
+    fn external_unified_discovery_is_active_and_read_only_in_default_mode() {
         let directory = tempdir().unwrap();
-        let source = directory.path().join(".agents/skills");
+        let source = directory.path().join(".cc-switch/skills");
+        let unified = directory.path().join(".agents/skills");
         fs::create_dir_all(source.join("docs")).unwrap();
         fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
+        fs::create_dir_all(unified.join("docs")).unwrap();
+        fs::write(unified.join("docs/SKILL.md"), "# External Docs").unwrap();
         let live = SkillLiveConfig::new(
             source,
+            unified,
             SkillSyncMethod::Copy,
-            true,
             app_roots(directory.path()),
         )
         .unwrap();
 
         let observations = live.observe(&[("skill".to_owned(), "docs".to_owned())]);
-        let pi = &observations[0].native_apps["pi"];
-        assert!(pi.enabled);
-        assert!(pi.issue.as_deref().unwrap().contains("read-only"));
-        assert!(matches!(
-            live.apply("docs", &AppType::Pi, false),
-            Err(SkillLiveError::UnifiedDiscovery(_))
-        ));
+        for descriptor in builtin_app_registry().descriptors().filter(|descriptor| {
+            descriptor
+                .skill_contract()
+                .is_some_and(|contract| contract.discovers_unified_store())
+        }) {
+            let state = &observations[0].app_overrides[descriptor.id()];
+            assert_eq!(state.enabled, Some(true), "{}", descriptor.id());
+            assert!(
+                state.issue.as_deref().unwrap().contains("read-only"),
+                "{}",
+                descriptor.id()
+            );
+            assert!(matches!(
+                live.apply("docs", descriptor.app(), false),
+                Err(SkillLiveError::UnifiedDiscovery(_))
+            ));
+        }
     }
 
     #[test]
@@ -359,8 +407,8 @@ mod tests {
         assert!(matches!(
             SkillLiveConfig::new(
                 PathBuf::from("/source"),
+                PathBuf::from("/unified"),
                 SkillSyncMethod::Copy,
-                false,
                 Vec::new()
             ),
             Err(SkillLiveError::InvalidTargets(_))

@@ -572,8 +572,10 @@ fn list_installed_skills(
         if skill.issue.is_none() {
             skill.issue = observation.source_issue;
         }
-        for (app_id, state) in observation.native_apps {
-            skill.apps.insert(app_id.clone(), state.enabled);
+        for (app_id, state) in observation.app_overrides {
+            if let Some(enabled) = state.enabled {
+                skill.apps.insert(app_id.clone(), enabled);
+            }
             if let Some(issue) = state.issue {
                 skill.app_issues.insert(app_id, issue);
             } else {

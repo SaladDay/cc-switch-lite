@@ -279,7 +279,7 @@ dependencies = [
 [[package]]
 name = "cc-switch-core"
 version = "0.1.0"
-source = "git+https://github.com/SaladDay/cc-switch-core?rev=540b640cea797bae3b6c5fe223bca6efcd4bee91#540b640cea797bae3b6c5fe223bca6efcd4bee91"
+source = "git+https://github.com/SaladDay/cc-switch-core?rev=9c934b56028447dd08f16678e53d9a16ed058952#9c934b56028447dd08f16678e53d9a16ed058952"
 dependencies = [
  "http",
  "json-five",
@@ -290,6 +290,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.20",
  "toml_edit 0.25.13+spec-1.1.0",
+ "unicode-casefold",
  "unicode-normalization",
 ]
 
@@ -3905,6 +3906,12 @@ checksum = "96bd2f2237fe450fcd0a1d2f5f4e91711124f7857ba2e964247776ebeeb7b0c4"
 dependencies = [
  "unic-common",
 ]
+
+[[package]]
+name = "unicode-casefold"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f66b1c8f8caa2ab31dc6d3f35386f16efdab89668f93411e565ac368908e8f"
 
 [[package]]
 name = "unicode-general-category"

@@ -109,7 +109,6 @@ impl LiveConfig {
         let settings = load_shared_path_settings(home);
         let dirs = resolve_config_dirs(home, &settings)?;
         let claude_mcp = claude_mcp_path(home, &dirs.claude)?;
-        let unified_store = settings.skill_storage_location.as_deref() == Some("unified");
         let skill_roots = vec![
             (AppType::Claude, dirs.claude.clone()),
             (AppType::Codex, dirs.codex.clone()),
@@ -123,9 +122,12 @@ impl LiveConfig {
         .map(|(app, root)| absolute_skill_root(&root).map(|root| (app, root)))
         .collect::<Result<Vec<_>, _>>()?;
         let skill = SkillLiveConfig::new(
-            skill_source_root(home, settings.skill_storage_location.as_deref()),
+            absolute_skill_root(&skill_source_root(
+                home,
+                settings.skill_storage_location.as_deref(),
+            ))?,
+            absolute_skill_root(&home.join(".agents/skills"))?,
             skill_sync_method(settings.skill_sync_method.as_deref()),
-            unified_store,
             skill_roots,
         )?;
         Ok(Self {
