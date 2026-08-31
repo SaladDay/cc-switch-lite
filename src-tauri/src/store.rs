@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use cc_switch_core::AppType;
+use cc_switch_core::{builtin_app_adapter, AppType};
 use hmac::{Hmac, Mac};
 use rusqlite::{
     params, types::ValueRef, Connection, OpenFlags, OptionalExtension, Row, Transaction,
@@ -17,10 +17,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::provider::{
-    adapter_for_reference, is_lite_writable, native_adapter_reference, validate_name,
-    validate_settings, AdapterDescriptor, AdapterReference, CurrentProvider, NativeImport,
-    ProviderDraft, ProviderRecord, ProviderUpdate, BUILTIN_PLUGIN_ID,
+    adapter_for_reference, is_lite_simple_editable, is_lite_writable, native_adapter_reference,
+    validate_name, AdapterReference, CurrentProvider, NativeImport, ProviderDraft, ProviderRecord,
+    BUILTIN_PLUGIN_ID,
 };
+#[cfg(test)]
+use crate::provider::{validate_settings, AdapterDescriptor, ProviderUpdate};
 
 const SAFE_JS_INTEGER_MASK: u64 = (1_u64 << 53) - 1;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,6 +72,8 @@ struct StoredProvider {
     record: ProviderRecord,
     is_current: bool,
     native_settings: Value,
+    lite_writable: bool,
+    lite_simple_editable: bool,
 }
 
 struct ProviderBinding<'a> {
@@ -196,6 +200,7 @@ impl ProviderStore {
                             ))
                         })?;
                 metadata.insert("liveConfigManaged".to_owned(), Value::Bool(true));
+                metadata.remove("liveConfigStale");
                 let changed = transaction.execute(
                     "UPDATE providers SET meta = ?1 WHERE id = ?2 AND app_type = ?3",
                     params![
@@ -278,6 +283,7 @@ impl ProviderStore {
             }
         };
         metadata.insert("liveConfigManaged".to_owned(), Value::Bool(false));
+        metadata.remove("liveConfigStale");
         let finalize = (|| -> Result<(), StoreError> {
             let changed = transaction.execute(
                 "UPDATE providers SET meta = ?1 WHERE id = ?2 AND app_type = ?3",
@@ -305,6 +311,7 @@ impl ProviderStore {
         Ok(Ok(()))
     }
 
+    #[cfg(test)]
     pub fn create_resolved_from<E>(
         &self,
         app_id: &str,
@@ -361,6 +368,110 @@ impl ProviderStore {
         )?;
         transaction.commit()?;
         Ok(created)
+    }
+
+    pub fn update_simple_from<E>(
+        &self,
+        app_id: &str,
+        id: &str,
+        expected_revision: u64,
+        name: &str,
+        projection: impl FnOnce(&AppType, &Value) -> Result<Value, E>,
+    ) -> Result<Result<ProviderRecord, E>, StoreError> {
+        let app = parse_app(app_id)?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = self
+            .stored_provider(&transaction, &app, id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
+        ensure_revision(&current.record, expected_revision)?;
+        if !current.lite_simple_editable {
+            return Err(StoreError::InvalidProvider(
+                "this provider cannot be edited with the Lite simple form".to_owned(),
+            ));
+        }
+        let migrate_builtin_binding = current.record.adapter.plugin_id == BUILTIN_PLUGIN_ID
+            && !current
+                .record
+                .adapter
+                .same_identity(&native_adapter_reference(&app));
+        let settings = match projection(&app, &current.native_settings) {
+            Ok(settings) => settings,
+            Err(error) => return Ok(Err(error)),
+        };
+        let settings_object = settings.as_object().ok_or_else(|| {
+            StoreError::InvalidProvider(
+                "simple provider projection must produce native object settings".to_owned(),
+            )
+        })?;
+        validate_native_settings(settings_object)?;
+        let name = validate_name(name).map_err(StoreError::InvalidProvider)?;
+        let changed = transaction.execute(
+            "UPDATE providers SET name = ?1, settings_config = ?2
+             WHERE id = ?3 AND app_type = ?4",
+            params![
+                name,
+                serde_json::to_string(&settings)
+                    .map_err(|error| StoreError::InvalidProvider(error.to_string()))?,
+                id,
+                app.as_str(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(id.to_owned()));
+        }
+        if app.is_additive_mode() {
+            let mut metadata = current
+                .record
+                .metadata
+                .as_object()
+                .cloned()
+                .ok_or_else(|| {
+                    StoreError::InvalidStore(format!("provider '{id}' metadata is not an object"))
+                })?;
+            if metadata.get("liveConfigManaged").and_then(Value::as_bool) != Some(false) {
+                metadata.insert("liveConfigStale".to_owned(), Value::Bool(true));
+                transaction.execute(
+                    "UPDATE providers SET meta = ?1 WHERE id = ?2 AND app_type = ?3",
+                    params![
+                        serde_json::to_string(&Value::Object(metadata))
+                            .map_err(|error| StoreError::InvalidProvider(error.to_string()))?,
+                        id,
+                        app.as_str(),
+                    ],
+                )?;
+            }
+        }
+        if current.is_current && !app.is_additive_mode() {
+            transaction.execute(
+                "UPDATE providers SET is_current = 0 WHERE id = ?1 AND app_type = ?2",
+                params![id, app.as_str()],
+            )?;
+        }
+        if migrate_builtin_binding {
+            let changed = transaction.execute(
+                &format!(
+                    "UPDATE {ADAPTER_BINDINGS_TABLE}
+                     SET adapter_json = ?1, compatibility_settings_json = NULL
+                     WHERE provider_id = ?2 AND app_type = ?3"
+                ),
+                params![
+                    serde_json::to_string(&native_adapter_reference(&app))
+                        .map_err(|error| StoreError::InvalidProvider(error.to_string()))?,
+                    id,
+                    app.as_str(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::Conflict(id.to_owned()));
+            }
+        }
+        let updated = self
+            .stored_provider(&transaction, &app, id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_owned()))?
+            .record;
+        transaction.commit()?;
+        Ok(Ok(updated))
     }
 
     pub fn import_native_batch_from<E>(
@@ -424,7 +535,7 @@ impl ProviderStore {
                         "provider '{id}' is owned by a different adapter"
                     )));
                 }
-                if !is_lite_writable(&current.record) {
+                if !current.lite_writable {
                     let unchanged_hermes_dictionary = app == AppType::Hermes
                         && current
                             .record
@@ -449,6 +560,7 @@ impl ProviderStore {
                     .cloned()
                     .unwrap_or_default();
                 merged_metadata.extend(imported_metadata.clone());
+                merged_metadata.remove("liveConfigStale");
                 transaction.execute(
                     "UPDATE providers
                      SET name = CASE WHEN ?1 THEN ?2 ELSE name END,
@@ -581,6 +693,7 @@ impl ProviderStore {
         Ok(created)
     }
 
+    #[cfg(test)]
     pub fn update_from<E>(
         &self,
         app_id: &str,
@@ -598,7 +711,7 @@ impl ProviderStore {
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
         ensure_revision(&current.record, update.expected_revision)?;
-        if !is_lite_writable(&current.record) {
+        if !current.lite_writable {
             return Err(StoreError::InvalidProvider(
                 "this provider is read-only in Lite".to_owned(),
             ));
@@ -693,7 +806,7 @@ impl ProviderStore {
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
         ensure_revision(&current.record, expected_revision)?;
-        if !is_lite_writable(&current.record) {
+        if !current.lite_writable {
             return Err(StoreError::InvalidProvider(
                 "this provider is read-only in Lite".to_owned(),
             ));
@@ -739,7 +852,7 @@ impl ProviderStore {
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
         ensure_revision(&current.record, expected_revision)?;
-        if !is_lite_writable(&current.record) {
+        if !current.lite_writable {
             return Err(StoreError::InvalidProvider(
                 "this provider is read-only in Lite".to_owned(),
             ));
@@ -804,6 +917,15 @@ impl ProviderStore {
             .into_iter()
             .filter(|provider| {
                 if app.is_additive_mode() {
+                    if provider
+                        .record
+                        .metadata
+                        .get("liveConfigStale")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        return false;
+                    }
                     if provider
                         .record
                         .adapter
@@ -1139,7 +1261,7 @@ impl ProviderStore {
             })?,
             None => native_adapter_reference(&app),
         };
-        let extensions = match raw_extensions {
+        let mut extensions = match raw_extensions {
             Some(raw) => serde_json::from_str::<Value>(&raw)
                 .ok()
                 .and_then(|value| value.as_object().cloned())
@@ -1148,21 +1270,53 @@ impl ProviderStore {
                 })?,
             None => Map::new(),
         };
+        extensions.remove("simpleValues");
+        if let Ok(values) =
+            builtin_app_adapter(&app).extract_simple_provider_values(&native_settings)
+        {
+            extensions.insert(
+                "simpleValues".to_owned(),
+                serde_json::to_value(values).map_err(|error| {
+                    StoreError::InvalidStore(format!(
+                        "provider '{id}' simple values could not be serialized: {error}"
+                    ))
+                })?,
+            );
+        }
         let revision = snapshot_revision(connection, row, &id, &app, &self.revision_key)?;
+        let mut record = ProviderRecord {
+            id,
+            revision,
+            app_id,
+            adapter,
+            name,
+            settings: settings_object,
+            category,
+            metadata,
+            extensions,
+        };
+        let mut policy_record = record.clone();
+        policy_record.settings = native_settings.as_object().cloned().ok_or_else(|| {
+            StoreError::InvalidStore(format!(
+                "provider '{}' native settings must be an object",
+                record.id
+            ))
+        })?;
+        let lite_writable = is_lite_writable(&policy_record);
+        let lite_simple_editable = is_lite_simple_editable(&policy_record);
+        record
+            .extensions
+            .insert("liteConfigWritable".to_owned(), Value::Bool(lite_writable));
+        record.extensions.insert(
+            "liteSimpleEditable".to_owned(),
+            Value::Bool(lite_simple_editable),
+        );
         Ok(StoredProvider {
-            record: ProviderRecord {
-                id,
-                revision,
-                app_id,
-                adapter,
-                name,
-                settings: settings_object,
-                category,
-                metadata,
-                extensions,
-            },
+            record,
             is_current,
             native_settings,
+            lite_writable,
+            lite_simple_editable,
         })
     }
 
@@ -1258,6 +1412,7 @@ fn database_path(home: &Path) -> PathBuf {
     default
 }
 
+#[cfg(test)]
 fn apply_legacy_settings_to_native(
     app: &AppType,
     name: &str,
@@ -1417,6 +1572,7 @@ fn apply_legacy_settings_to_native(
     Ok(settings)
 }
 
+#[cfg(test)]
 fn legacy_settings_extras(settings: &Map<String, Value>) -> Value {
     let mut extras = settings.clone();
     for key in ["apiKey", "baseUrl", "model"] {
@@ -1445,7 +1601,15 @@ fn legacy_settings_from_native(
     match app {
         AppType::Claude => {
             let env = native.get("env").and_then(Value::as_object);
-            copy_string_setting(env, "ANTHROPIC_API_KEY", &mut settings, "apiKey");
+            if let Some(api_key) = env
+                .and_then(|env| {
+                    env.get("ANTHROPIC_AUTH_TOKEN")
+                        .or_else(|| env.get("ANTHROPIC_API_KEY"))
+                })
+                .and_then(Value::as_str)
+            {
+                settings.insert("apiKey".to_owned(), Value::String(api_key.to_owned()));
+            }
             copy_string_setting(env, "ANTHROPIC_BASE_URL", &mut settings, "baseUrl");
             copy_string_setting(env, "ANTHROPIC_MODEL", &mut settings, "model");
         }
@@ -1505,6 +1669,7 @@ fn copy_string_setting(
     }
 }
 
+#[cfg(test)]
 fn validate_draft(
     app: &AppType,
     draft: &ProviderDraft,
@@ -1640,6 +1805,9 @@ fn hash_row(hasher: &mut Hmac<Sha256>, row: &Row<'_>) -> Result<(), rusqlite::Er
 
 #[cfg(test)]
 mod tests {
+    use cc_switch_core::{SimpleProviderError, SimpleProviderValues};
+    use serde_json::json;
+
     use super::*;
 
     fn native_descriptor(app: &AppType) -> AdapterDescriptor {
@@ -1919,6 +2087,271 @@ mod tests {
                 1,
             )
         );
+    }
+
+    #[test]
+    fn simple_update_preserves_native_unknowns_and_checks_revision() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let app = AppType::Codex;
+        let adapter = builtin_app_adapter(&app);
+        let mut settings = adapter
+            .project_simple_provider_settings(
+                "Work",
+                &SimpleProviderValues::new("https://old.example/v1", "old-key", "old-model"),
+                None,
+            )
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        settings.insert("futureRoot".to_owned(), json!({"keep": true}));
+        let created = store
+            .create_native(ProviderDraft {
+                app_id: app.as_str().to_owned(),
+                adapter: native_adapter_reference(&app),
+                name: "Work".to_owned(),
+                settings,
+            })
+            .unwrap();
+        let created = store
+            .set_current(app.as_str(), &created.id, created.revision)
+            .unwrap();
+        let replacement =
+            SimpleProviderValues::new("https://new.example/v1", "new-key", "new-model");
+
+        let updated = store
+            .update_simple_from(
+                app.as_str(),
+                &created.id,
+                created.revision,
+                "Primary",
+                |stored_app, existing| {
+                    builtin_app_adapter(stored_app).project_simple_provider_settings(
+                        "Primary",
+                        &replacement,
+                        Some(existing),
+                    )
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(updated.name, "Primary");
+        assert_eq!(updated.adapter, native_adapter_reference(&app));
+        assert_eq!(updated.settings["futureRoot"]["keep"], true);
+        assert_eq!(
+            updated.extensions["simpleValues"]["baseUrl"],
+            replacement.base_url
+        );
+        assert_eq!(
+            updated.extensions["simpleValues"]["apiKey"],
+            replacement.api_key
+        );
+        assert!(store.current(app.as_str()).unwrap().is_empty());
+        assert!(matches!(
+            store.update_simple_from(
+                app.as_str(),
+                &created.id,
+                created.revision,
+                "Stale",
+                |_, existing| Ok::<_, SimpleProviderError>(existing.clone()),
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE providers SET category = 'official'
+                 WHERE id = ?1 AND app_type = 'codex'",
+                [&created.id],
+            )
+            .unwrap();
+        let official = store.list(app.as_str()).unwrap().pop().unwrap();
+        assert!(!is_lite_simple_editable(&official));
+        let projection_called = std::cell::Cell::new(false);
+        assert!(matches!(
+            store.update_simple_from(
+                app.as_str(),
+                &official.id,
+                official.revision,
+                "Official",
+                |_, existing| {
+                    projection_called.set(true);
+                    Ok::<_, SimpleProviderError>(existing.clone())
+                },
+            ),
+            Err(StoreError::InvalidProvider(_))
+        ));
+        assert!(!projection_called.get());
+    }
+
+    #[test]
+    fn simple_update_migrates_a_legacy_builtin_binding_atomically() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let app = AppType::Claude;
+        let descriptor = crate::provider::built_in_adapters()
+            .into_iter()
+            .find(|adapter| adapter.app_id == app.as_str())
+            .unwrap();
+        let draft = ProviderDraft {
+            app_id: app.as_str().to_owned(),
+            adapter: descriptor.reference.clone(),
+            name: "Legacy".to_owned(),
+            settings: Map::from_iter([
+                ("apiKey".to_owned(), Value::String("old-key".to_owned())),
+                (
+                    "baseUrl".to_owned(),
+                    Value::String("https://old.example.com".to_owned()),
+                ),
+            ]),
+        };
+        let created = store
+            .create_resolved_from(app.as_str(), false, || {
+                Ok::<_, StoreError>((draft, descriptor))
+            })
+            .unwrap()
+            .unwrap();
+        assert_ne!(created.adapter, native_adapter_reference(&app));
+
+        let values = SimpleProviderValues::new("https://new.example.com", "new-key", "model");
+        let updated = store
+            .update_simple_from(
+                app.as_str(),
+                &created.id,
+                created.revision,
+                "Migrated",
+                |stored_app, existing| {
+                    builtin_app_adapter(stored_app).project_simple_provider_settings(
+                        "Migrated",
+                        &values,
+                        Some(existing),
+                    )
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(updated.adapter, native_adapter_reference(&app));
+        assert_eq!(updated.settings["env"]["ANTHROPIC_API_KEY"], "new-key");
+        assert!(updated.settings["env"]
+            .get("ANTHROPIC_AUTH_TOKEN")
+            .is_none());
+        assert_eq!(updated.extensions["simpleValues"]["apiKey"], "new-key");
+        let compatibility: Option<String> = store
+            .connect()
+            .unwrap()
+            .query_row(
+                &format!(
+                    "SELECT compatibility_settings_json FROM {ADAPTER_BINDINGS_TABLE}
+                     WHERE provider_id = ?1 AND app_type = 'claude'"
+                ),
+                [&created.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(compatibility.is_none());
+        assert_eq!(
+            legacy_settings_from_native(&app, &Value::Object(updated.settings), json!({}), "test")
+                .unwrap()["apiKey"],
+            "new-key"
+        );
+    }
+
+    #[test]
+    fn legacy_bindings_use_native_settings_for_protocol_permissions() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let cases = [
+            (
+                AppType::Claude,
+                json!({
+                    "apiFormat": "openai_chat",
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://example.com",
+                        "ANTHROPIC_API_KEY": "secret"
+                    }
+                }),
+            ),
+            (
+                AppType::Codex,
+                json!({
+                    "auth": {"OPENAI_API_KEY": "secret"},
+                    "config": r#"model_provider = "custom"
+model = "model"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://example.com/v1"
+wire_api = "chat"
+requires_openai_auth = true
+"#
+                }),
+            ),
+        ];
+
+        for (app, native_settings) in cases {
+            let descriptor = crate::provider::built_in_adapters()
+                .into_iter()
+                .find(|adapter| adapter.app_id == app.as_str())
+                .unwrap();
+            let created = store
+                .create_resolved_from(app.as_str(), false, || {
+                    Ok::<_, StoreError>((
+                        ProviderDraft {
+                            app_id: app.as_str().to_owned(),
+                            adapter: descriptor.reference.clone(),
+                            name: "Legacy".to_owned(),
+                            settings: Map::from_iter([
+                                (
+                                    "baseUrl".to_owned(),
+                                    Value::String("https://example.com/v1".to_owned()),
+                                ),
+                                ("apiKey".to_owned(), Value::String("secret".to_owned())),
+                                ("model".to_owned(), Value::String("model".to_owned())),
+                            ]),
+                        },
+                        descriptor,
+                    ))
+                })
+                .unwrap()
+                .unwrap();
+            store
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE providers SET settings_config = ?1
+                     WHERE id = ?2 AND app_type = ?3",
+                    params![
+                        serde_json::to_string(&native_settings).unwrap(),
+                        created.id,
+                        app.as_str(),
+                    ],
+                )
+                .unwrap();
+            let provider = store.list(app.as_str()).unwrap().pop().unwrap();
+
+            assert_eq!(provider.extensions["liteConfigWritable"], false);
+            assert_eq!(provider.extensions["liteSimpleEditable"], false);
+            let projection_called = std::cell::Cell::new(false);
+            assert!(matches!(
+                store.update_simple_from(
+                    app.as_str(),
+                    &provider.id,
+                    provider.revision,
+                    "Blocked",
+                    |_, existing| {
+                        projection_called.set(true);
+                        Ok::<_, SimpleProviderError>(existing.clone())
+                    },
+                ),
+                Err(StoreError::InvalidProvider(_))
+            ));
+            assert!(!projection_called.get());
+        }
     }
 
     #[test]
@@ -2210,6 +2643,96 @@ mod tests {
     }
 
     #[test]
+    fn editing_an_additive_live_provider_requires_reapply_without_losing_ownership() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let app = AppType::Pi;
+        let values =
+            SimpleProviderValues::new("https://old.example.com/v1", "old-key", "old-model");
+        let settings = builtin_app_adapter(&app)
+            .project_simple_provider_settings("Pi", &values, None)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        let provider = store
+            .create_native(ProviderDraft {
+                app_id: app.as_str().to_owned(),
+                adapter: native_adapter_reference(&app),
+                name: "Pi".to_owned(),
+                settings,
+            })
+            .unwrap();
+        store
+            .switch_with_provider(
+                app.as_str(),
+                &provider.id,
+                provider.revision,
+                |_, _| Ok::<_, &str>(()),
+                |_| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+        let active = store.list(app.as_str()).unwrap().pop().unwrap();
+        let replacement =
+            SimpleProviderValues::new("https://new.example.com/v1", "new-key", "new-model");
+        let updated = store
+            .update_simple_from(
+                app.as_str(),
+                &active.id,
+                active.revision,
+                "Pi updated",
+                |stored_app, existing| {
+                    builtin_app_adapter(stored_app).project_simple_provider_settings(
+                        "Pi updated",
+                        &replacement,
+                        Some(existing),
+                    )
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let live_ids = HashSet::from([updated.id.clone()]);
+
+        assert_eq!(updated.metadata["liveConfigManaged"], true);
+        assert_eq!(updated.metadata["liveConfigStale"], true);
+        assert!(store
+            .current_with_native_live_ids(app.as_str(), &live_ids)
+            .unwrap()
+            .is_empty());
+
+        store
+            .switch_with_provider(
+                app.as_str(),
+                &updated.id,
+                updated.revision,
+                |provider, _| {
+                    assert_eq!(
+                        builtin_app_adapter(&app)
+                            .extract_simple_provider_values(&Value::Object(
+                                provider.settings.clone()
+                            ))
+                            .unwrap(),
+                        replacement
+                    );
+                    Ok::<_, &str>(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+        let reapplied = store.list(app.as_str()).unwrap().pop().unwrap();
+        assert!(reapplied.metadata.get("liveConfigStale").is_none());
+        assert_eq!(
+            store
+                .current_with_native_live_ids(app.as_str(), &live_ids)
+                .unwrap()[0]
+                .id,
+            updated.id
+        );
+    }
+
+    #[test]
     fn additive_live_removal_keeps_the_provider_and_updates_current_state() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
@@ -2457,7 +2980,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(created.adapter, expected);
-        assert!(created.extensions.is_empty());
+        assert_eq!(created.extensions["liteConfigWritable"], false);
+        assert_eq!(created.extensions["liteSimpleEditable"], false);
         store
             .connect()
             .unwrap()
@@ -2513,7 +3037,8 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "UPDATE providers SET category = 'aggregator'
+                "UPDATE providers SET category = 'aggregator',
+                                      meta = '{\"apiFormat\":\"openai_responses\"}'
                  WHERE id = ?1 AND app_type = 'claude'",
                 [&aggregator.id],
             )

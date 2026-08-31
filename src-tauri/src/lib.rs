@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 
-use cc_switch_core::{builtin_app_registry, AppCapability, AppDescriptor};
+use cc_switch_core::{
+    builtin_app_adapter, builtin_app_registry, builtin_simple_provider_forms, AppCapability,
+    AppDescriptor, SimpleProviderFormDescriptor,
+};
 
 mod live;
 mod native_live;
@@ -10,9 +13,9 @@ mod store;
 
 use live::{LiveConfig, LiveError};
 use provider::{
-    adapter_for_reference, built_in_adapters, is_lite_writable, native_adapter_reference,
-    native_adapters, validate_settings, AdapterDescriptor, CurrentProvider, ProviderDraft,
-    ProviderRecord, ProviderUpdate,
+    built_in_adapters, is_lite_simple_editable, is_lite_writable, native_adapter_reference,
+    native_adapters, validate_simple_provider_values, AdapterDescriptor, CurrentProvider,
+    ProviderDraft, ProviderRecord, SimpleProviderDraft, SimpleProviderUpdate,
 };
 use serde::Serialize;
 use store::{ProviderStore, StoreError};
@@ -21,6 +24,11 @@ use tauri::{Manager, State};
 #[tauri::command]
 fn supported_apps() -> Vec<AppDescriptor> {
     builtin_app_registry().descriptors().cloned().collect()
+}
+
+#[tauri::command]
+fn list_simple_provider_forms() -> Vec<SimpleProviderFormDescriptor> {
+    builtin_simple_provider_forms().cloned().collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +96,27 @@ fn require_provider_visibility(app_id: &str) -> CommandResult<()> {
     )
 }
 
+fn decorate_provider(provider: &mut ProviderRecord) {
+    let writable = provider
+        .extensions
+        .get("liteConfigWritable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| is_lite_writable(provider));
+    let simple_editable = provider
+        .extensions
+        .get("liteSimpleEditable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| is_lite_simple_editable(provider));
+    provider.extensions.insert(
+        "liteConfigWritable".to_owned(),
+        serde_json::Value::Bool(writable),
+    );
+    provider.extensions.insert(
+        "liteSimpleEditable".to_owned(),
+        serde_json::Value::Bool(simple_editable),
+    );
+}
+
 #[tauri::command]
 fn list_provider_adapters() -> Vec<AdapterDescriptor> {
     let mut adapters = native_adapters();
@@ -103,57 +132,86 @@ fn list_providers(
     require_provider_visibility(&app_id)?;
     let mut providers = store.list(&app_id)?;
     for provider in &mut providers {
-        provider.extensions.insert(
-            "liteConfigWritable".to_owned(),
-            serde_json::Value::Bool(is_lite_writable(provider)),
-        );
+        decorate_provider(provider);
     }
     Ok(providers)
 }
 
 #[tauri::command]
-fn create_provider(
+fn create_simple_provider(
     store: State<'_, ProviderStore>,
-    provider: ProviderDraft,
+    provider: SimpleProviderDraft,
 ) -> CommandResult<ProviderRecord> {
-    let app_id = provider.app_id.clone();
     require_capability(
-        &app_id,
+        &provider.app_id,
         AppCapability::ProviderManagement,
         "provider management",
     )?;
-    if let Ok(app) = app_id.parse::<cc_switch_core::AppType>() {
-        if provider
-            .adapter
-            .same_identity(&native_adapter_reference(&app))
-        {
-            return store.create_native(provider).map_err(Into::into);
-        }
-    }
-
-    Ok(store.create_resolved_from(&app_id, false, || {
-        let descriptor =
-            adapter_for_reference(&app_id, &provider.adapter).ok_or_else(unavailable_adapter)?;
-        validate_settings(&descriptor, &provider.settings).map_err(StoreError::InvalidProvider)?;
-        Ok::<_, StoreError>((provider, descriptor))
-    })??)
+    let app = provider
+        .app_id
+        .parse::<cc_switch_core::AppType>()
+        .map_err(|_| {
+            CommandError::from(StoreError::InvalidProvider(format!(
+                "application '{}' is not supported",
+                provider.app_id
+            )))
+        })?;
+    let adapter = builtin_app_adapter(&app);
+    validate_simple_provider_values(adapter.simple_provider_form(), &provider.values)
+        .map_err(StoreError::InvalidProvider)?;
+    let settings = adapter
+        .project_simple_provider_settings(&provider.name, &provider.values, None)
+        .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
+    let settings = settings.as_object().cloned().ok_or_else(|| {
+        StoreError::InvalidProvider(
+            "simple provider projection must produce native object settings".to_owned(),
+        )
+    })?;
+    let mut created = store
+        .create_native(ProviderDraft {
+            app_id: provider.app_id,
+            adapter: native_adapter_reference(&app),
+            name: provider.name,
+            settings,
+        })
+        .map_err(CommandError::from)?;
+    decorate_provider(&mut created);
+    Ok(created)
 }
 
 #[tauri::command]
-fn update_provider(
+fn update_simple_provider(
     store: State<'_, ProviderStore>,
     app_id: String,
     id: String,
-    provider: ProviderUpdate,
+    provider: SimpleProviderUpdate,
 ) -> CommandResult<ProviderRecord> {
     require_capability(
         &app_id,
         AppCapability::ProviderManagement,
         "provider management",
     )?;
-    Ok(store.update_from(&app_id, &id, provider, |current, _| {
-        adapter_for_reference(&current.app_id, &current.adapter).ok_or_else(unavailable_adapter)
-    })??)
+    let app = app_id.parse::<cc_switch_core::AppType>().map_err(|_| {
+        CommandError::from(StoreError::InvalidProvider(format!(
+            "application '{app_id}' is not supported"
+        )))
+    })?;
+    let adapter = builtin_app_adapter(&app);
+    validate_simple_provider_values(adapter.simple_provider_form(), &provider.values)
+        .map_err(StoreError::InvalidProvider)?;
+    let mut updated = store.update_simple_from(
+        &app_id,
+        &id,
+        provider.expected_revision,
+        &provider.name,
+        |stored_app, existing| {
+            builtin_app_adapter(stored_app)
+                .project_simple_provider_settings(&provider.name, &provider.values, Some(existing))
+                .map_err(|error| StoreError::InvalidProvider(error.to_string()))
+        },
+    )??;
+    decorate_provider(&mut updated);
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -380,10 +438,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             supported_apps,
+            list_simple_provider_forms,
             list_provider_adapters,
             list_providers,
-            create_provider,
-            update_provider,
+            create_simple_provider,
+            update_simple_provider,
             delete_provider,
             import_live_providers,
             switch_provider,
@@ -422,6 +481,33 @@ mod tests {
             .collect();
 
         assert_eq!(app_ids, ["claude", "codex"]);
+    }
+
+    #[test]
+    fn provider_decoration_exposes_only_writable_simple_records() {
+        let app = cc_switch_core::AppType::Claude;
+        let mut provider = ProviderRecord {
+            id: "provider".to_owned(),
+            revision: 1,
+            app_id: app.as_str().to_owned(),
+            adapter: native_adapter_reference(&app),
+            name: "Provider".to_owned(),
+            settings: Map::new(),
+            category: None,
+            metadata: json!({}),
+            extensions: Map::from_iter([("simpleValues".to_owned(), json!({}))]),
+        };
+
+        decorate_provider(&mut provider);
+        assert_eq!(provider.extensions["liteConfigWritable"], true);
+        assert_eq!(provider.extensions["liteSimpleEditable"], true);
+
+        provider.category = Some("official".to_owned());
+        provider.extensions.remove("liteConfigWritable");
+        provider.extensions.remove("liteSimpleEditable");
+        decorate_provider(&mut provider);
+        assert_eq!(provider.extensions["liteConfigWritable"], true);
+        assert_eq!(provider.extensions["liteSimpleEditable"], false);
     }
 
     #[test]
