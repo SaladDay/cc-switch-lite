@@ -194,8 +194,9 @@ impl SkillStore {
     }
 
     fn initialize(&self) -> Result<(), SkillError> {
-        let connection = self.connect()?;
-        connection.execute_batch(
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS skills (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -216,16 +217,18 @@ impl SkillStore {
                 updated_at INTEGER NOT NULL DEFAULT 0
             );",
         )?;
-        let mut columns = skill_columns(&connection)?;
+        let mut columns = skill_columns(&transaction)?;
+        verify_base_columns(&columns)?;
         for binding in catalog_bindings()? {
             if columns.insert(binding.column.to_owned()) {
-                connection.execute_batch(&format!(
+                transaction.execute_batch(&format!(
                     "ALTER TABLE skills ADD COLUMN {} BOOLEAN NOT NULL DEFAULT 0",
                     binding.column
                 ))?;
             }
         }
-        verify_schema(&connection)
+        verify_schema(&transaction)?;
+        transaction.commit().map_err(Into::into)
     }
 
     fn connect(&self) -> Result<Connection, SkillError> {
@@ -378,6 +381,19 @@ fn skill_columns(connection: &Connection) -> Result<HashSet<String>, SkillError>
 
 fn verify_schema(connection: &Connection) -> Result<(), SkillError> {
     let columns = skill_columns(connection)?;
+    verify_base_columns(&columns)?;
+    for binding in catalog_bindings()? {
+        if !columns.contains(binding.column) {
+            return Err(SkillError::InvalidStore(format!(
+                "skills is missing required column '{}'",
+                binding.column
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_base_columns(columns: &HashSet<String>) -> Result<(), SkillError> {
     for required in [
         "id",
         "name",
@@ -389,14 +405,6 @@ fn verify_schema(connection: &Connection) -> Result<(), SkillError> {
         if !columns.contains(required) {
             return Err(SkillError::InvalidStore(format!(
                 "skills is missing required column '{required}'"
-            )));
-        }
-    }
-    for binding in catalog_bindings()? {
-        if !columns.contains(binding.column) {
-            return Err(SkillError::InvalidStore(format!(
-                "skills is missing required column '{}'",
-                binding.column
             )));
         }
     }
@@ -449,6 +457,24 @@ mod tests {
             )
             .unwrap();
         (directory, path, store)
+    }
+
+    #[test]
+    fn incompatible_skill_schema_is_rejected_without_partial_migration() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cc-switch.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE skills (directory TEXT NOT NULL);")
+            .unwrap();
+
+        assert!(matches!(
+            SkillStore::open(path.clone()),
+            Err(SkillError::InvalidStore(_))
+        ));
+        let connection = Connection::open(path).unwrap();
+        let columns = skill_columns(&connection).unwrap();
+        assert_eq!(columns, HashSet::from(["directory".to_owned()]));
     }
 
     #[test]
