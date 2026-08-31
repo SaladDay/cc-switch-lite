@@ -326,13 +326,12 @@ fn resolve_config_dirs(home: &Path) -> Result<ResolvedConfigDirs, LiveError> {
             &home.join(".config/opencode"),
             "OpenCode config directory",
         )?,
-        hermes: configured_root(
+        hermes: hermes_root(
             home,
             settings.hermes_config_dir.as_deref(),
             hermes_env.as_deref(),
             &crate::native_live::default_hermes_dir(home),
-            "Hermes config directory",
-        )?,
+        ),
         pi: configured_root(
             home,
             None,
@@ -370,6 +369,23 @@ fn configured_root(
         .map(PathBuf::from);
     let configured = setting.or(environment);
     config_root(configured.as_deref().map(Path::as_os_str), default, label)
+}
+
+fn hermes_root(
+    home: &Path,
+    setting: Option<&str>,
+    environment: Option<&OsStr>,
+    default: &Path,
+) -> PathBuf {
+    if let Some(setting) = setting {
+        return resolve_shared_path(home, setting);
+    }
+    environment
+        .map(|value| value.to_string_lossy())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default.to_owned())
 }
 
 fn resolve_shared_path(home: &Path, raw: &str) -> PathBuf {
@@ -602,6 +618,35 @@ mod tests {
     }
 
     #[test]
+    fn hermes_home_matches_the_full_application_resolution() {
+        let home = Path::new("/home/tester");
+        let default = home.join(".hermes");
+
+        assert_eq!(
+            hermes_root(
+                home,
+                None,
+                Some(OsStr::new("  relative/hermes  ")),
+                &default
+            ),
+            PathBuf::from("relative/hermes")
+        );
+        assert_eq!(
+            hermes_root(home, None, Some(OsStr::new("   ")), &default),
+            default
+        );
+        assert_eq!(
+            hermes_root(
+                home,
+                Some("~/custom-hermes"),
+                Some(OsStr::new("ignored")),
+                &home.join(".hermes"),
+            ),
+            home.join("custom-hermes")
+        );
+    }
+
+    #[test]
     fn mcp_receipt_holds_the_shared_lock_until_the_database_outcome() {
         let directory = tempfile::tempdir().expect("temporary directory");
         fs::create_dir(directory.path().join(".claude")).unwrap();
@@ -611,6 +656,7 @@ mod tests {
             .apply_mcp_recoverable(&[McpLiveChange::Upsert {
                 app: cc_switch_core::AppType::Claude,
                 id: "server".to_owned(),
+                previous: None,
                 server: json!({"command":"npx"}),
             }])
             .unwrap();

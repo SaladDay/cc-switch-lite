@@ -137,18 +137,41 @@ pub enum McpLiveChange {
     Upsert {
         app: AppType,
         id: String,
+        previous: Option<Value>,
         server: Value,
+    },
+    Disable {
+        app: AppType,
+        id: String,
+        previous: Value,
+        server: Value,
+        strict: bool,
     },
     Remove {
         app: AppType,
         id: String,
+        server: Value,
+        strict: bool,
     },
 }
 
 impl McpLiveChange {
     pub fn app(&self) -> &AppType {
         match self {
-            Self::Upsert { app, .. } | Self::Remove { app, .. } => app,
+            Self::Upsert { app, .. } | Self::Disable { app, .. } | Self::Remove { app, .. } => app,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Upsert { id, .. } | Self::Disable { id, .. } | Self::Remove { id, .. } => id,
+        }
+    }
+
+    pub fn is_strict(&self) -> bool {
+        match self {
+            Self::Upsert { .. } => true,
+            Self::Disable { strict, .. } | Self::Remove { strict, .. } => *strict,
         }
     }
 }
@@ -396,7 +419,7 @@ fn merge_imports(
         };
         for import in imports {
             if let Some(mut current) = get_server(transaction, &import.id, revision_key)? {
-                if !mcp_servers_equivalent(&current.server, &import.server) {
+                if !mcp_servers_equivalent(&app, &current.server, &import.server) {
                     report.failed_apps.push(format!(
                         "{}: server '{}' conflicts with the shared catalog",
                         app.as_str(),
@@ -626,20 +649,34 @@ fn live_changes(before: Option<&McpServer>, after: Option<&McpServer>) -> Vec<Mc
         .filter_map(|app| {
             let was_enabled = before.is_some_and(|server| server.apps.enabled(&app));
             let is_enabled = after.is_some_and(|server| server.apps.enabled(&app));
-            match (was_enabled, is_enabled, after) {
-                (_, true, Some(server))
+            match (before, after, was_enabled, is_enabled) {
+                (previous, Some(server), _, true)
                     if !was_enabled
-                        || before.is_none_or(|current| current.server != server.server) =>
+                        || previous.is_none_or(|current| current.server != server.server) =>
                 {
                     Some(McpLiveChange::Upsert {
                         app,
                         id: server.id.clone(),
+                        previous: previous.map(|server| server.server.clone()),
                         server: server.server.clone(),
                     })
                 }
-                (true, false, _) => Some(McpLiveChange::Remove {
+                (Some(previous), Some(server), _, false)
+                    if was_enabled || previous.server != server.server =>
+                {
+                    Some(McpLiveChange::Disable {
+                        app,
+                        id: server.id.clone(),
+                        previous: previous.server.clone(),
+                        server: server.server.clone(),
+                        strict: was_enabled,
+                    })
+                }
+                (Some(previous), None, _, _) => Some(McpLiveChange::Remove {
                     app,
-                    id: before.expect("enabled prior server").id.clone(),
+                    id: previous.id.clone(),
+                    server: previous.server.clone(),
+                    strict: was_enabled,
                 }),
                 _ => None,
             }
@@ -944,6 +981,30 @@ mod tests {
                 "enabled_hermes"
             ]
         );
+    }
+
+    #[test]
+    fn live_changes_keep_disabled_native_entries_current_and_delete_all_links() {
+        let mut previous = server();
+        previous.apps = McpApps::default();
+        let mut updated = previous.clone();
+        updated.server = json!({"type":"stdio","command":"uvx"});
+        let app_count = builtin_app_registry()
+            .descriptors()
+            .filter(|descriptor| descriptor.supports(AppCapability::Mcp))
+            .count();
+
+        let disabled_updates = live_changes(Some(&previous), Some(&updated));
+        assert_eq!(disabled_updates.len(), app_count);
+        assert!(disabled_updates
+            .iter()
+            .all(|change| matches!(change, McpLiveChange::Disable { strict: false, .. })));
+
+        let removals = live_changes(Some(&previous), None);
+        assert_eq!(removals.len(), app_count);
+        assert!(removals
+            .iter()
+            .all(|change| matches!(change, McpLiveChange::Remove { .. })));
     }
 
     #[test]

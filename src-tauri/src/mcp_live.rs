@@ -1,8 +1,8 @@
 use std::{fs, path::PathBuf};
 
 use cc_switch_core::{
-    builtin_app_adapter, builtin_app_registry, fs::atomic_write, AppCapability, AppType,
-    McpConfigTarget,
+    builtin_app_adapter, builtin_app_registry, fs::atomic_write, mcp_servers_equivalent,
+    AppCapability, AppType, McpConfigTarget, McpServerProjection,
 };
 
 use crate::{
@@ -161,12 +161,67 @@ impl McpLiveConfig {
         }
         let path = resolve_write_path(&configured.path)?;
         let before = read_optional(&path)?;
-        let (id, server) = match change {
-            McpLiveChange::Upsert { id, server, .. } => (id.as_str(), Some(server)),
-            McpLiveChange::Remove { id, .. } => (id.as_str(), None),
+        let adapter = builtin_app_adapter(change.app());
+        let imports = match adapter.import_mcp_servers(before.as_deref()) {
+            Ok(imports) => imports,
+            Err(_) if !change.is_strict() => return Ok(()),
+            Err(error) => return Err(LiveError::InvalidConfig(error.to_string())),
         };
-        let Some(projected) = builtin_app_adapter(change.app())
-            .project_mcp_server(before.as_deref(), id, server)
+        let current = imports.iter().find(|entry| entry.id == change.id());
+        let (id, projection) = match change {
+            McpLiveChange::Upsert {
+                id,
+                previous,
+                server,
+                ..
+            } => {
+                if current.is_some_and(|current| {
+                    !mcp_servers_equivalent(change.app(), &current.server, server)
+                        && previous.as_ref().is_none_or(|previous| {
+                            !mcp_servers_equivalent(change.app(), &current.server, previous)
+                        })
+                }) {
+                    return Err(OperationError::Conflict.into());
+                }
+                (id.as_str(), McpServerProjection::Enable(server))
+            }
+            McpLiveChange::Disable {
+                id,
+                previous,
+                server,
+                strict,
+                ..
+            } => {
+                let Some(current) = current else {
+                    return Ok(());
+                };
+                if !mcp_servers_equivalent(change.app(), &current.server, previous)
+                    && !mcp_servers_equivalent(change.app(), &current.server, server)
+                {
+                    if *strict {
+                        return Err(OperationError::Conflict.into());
+                    }
+                    return Ok(());
+                }
+                (id.as_str(), McpServerProjection::Disable(server))
+            }
+            McpLiveChange::Remove {
+                id, server, strict, ..
+            } => {
+                let Some(current) = current else {
+                    return Ok(());
+                };
+                if !mcp_servers_equivalent(change.app(), &current.server, server) {
+                    if *strict {
+                        return Err(OperationError::Conflict.into());
+                    }
+                    return Ok(());
+                }
+                (id.as_str(), McpServerProjection::Remove)
+            }
+        };
+        let Some(projected) = adapter
+            .project_mcp_server(before.as_deref(), id, projection)
             .map_err(|error| LiveError::InvalidConfig(error.to_string()))?
         else {
             return Ok(());
@@ -272,11 +327,13 @@ mod tests {
             McpLiveChange::Upsert {
                 app: AppType::Claude,
                 id: "server".to_owned(),
+                previous: None,
                 server: json!({"type":"stdio","command":"npx"}),
             },
             McpLiveChange::Upsert {
                 app: AppType::Codex,
                 id: "server".to_owned(),
+                previous: None,
                 server: json!({"type":"stdio","command":"npx"}),
             },
         ];
@@ -310,11 +367,89 @@ mod tests {
             .apply(&[McpLiveChange::Upsert {
                 app: AppType::Gemini,
                 id: "server".to_owned(),
+                previous: None,
                 server: json!({"type":"stdio","command":"npx"}),
             }])
             .unwrap();
         assert!(receipt.writes.is_empty());
         assert!(!directory.path().join(".gemini/settings.json").exists());
+    }
+
+    #[test]
+    fn native_disable_keeps_application_owned_fields() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join(".config/opencode");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("opencode.json");
+        fs::write(
+            &path,
+            r#"{"mcp":{"server":{"type":"local","command":["old"],"timeout":30}}}"#,
+        )
+        .unwrap();
+        let live = config(directory.path());
+        let previous = json!({"type":"stdio","command":"old"});
+        let updated = json!({"type":"stdio","command":"new"});
+
+        live.apply(&[McpLiveChange::Disable {
+            app: AppType::OpenCode,
+            id: "server".to_owned(),
+            previous,
+            server: updated.clone(),
+            strict: true,
+        }])
+        .unwrap();
+        let disabled: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disabled["mcp"]["server"]["command"], json!(["new"]));
+        assert_eq!(disabled["mcp"]["server"]["timeout"], 30);
+        assert_eq!(disabled["mcp"]["server"]["enabled"], false);
+
+        live.apply(&[McpLiveChange::Upsert {
+            app: AppType::OpenCode,
+            id: "server".to_owned(),
+            previous: Some(updated.clone()),
+            server: updated,
+        }])
+        .unwrap();
+        let enabled: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(enabled["mcp"]["server"]["timeout"], 30);
+        assert_eq!(enabled["mcp"]["server"]["enabled"], true);
+    }
+
+    #[test]
+    fn catalog_delete_does_not_remove_a_conflicting_native_entry() {
+        let directory = tempdir().unwrap();
+        fs::create_dir_all(directory.path().join(".claude")).unwrap();
+        let path = directory.path().join(".claude.json");
+        let original = r#"{"mcpServers":{"server":{"command":"external"}}}"#;
+        fs::write(&path, original).unwrap();
+
+        let receipt = config(directory.path())
+            .apply(&[McpLiveChange::Remove {
+                app: AppType::Claude,
+                id: "server".to_owned(),
+                server: json!({"type":"stdio","command":"shared"}),
+                strict: false,
+            }])
+            .unwrap();
+
+        assert!(receipt.writes.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+        let result = config(directory.path()).apply(&[McpLiveChange::Remove {
+            app: AppType::Claude,
+            id: "server".to_owned(),
+            server: json!({"type":"stdio","command":"shared"}),
+            strict: true,
+        }]);
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("an enabled link must not silently diverge"),
+        };
+        assert!(matches!(
+            error,
+            LiveError::Operation(OperationError::Conflict)
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 
     #[test]
