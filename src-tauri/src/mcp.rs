@@ -313,7 +313,7 @@ impl McpStore {
             }
         };
         let finalize = (|| -> Result<(), McpError> {
-            persist_native_links(&transaction, &changes)?;
+            transaction.execute("DELETE FROM mcp_native_links WHERE server_id = ?1", [id])?;
             let changed = transaction.execute("DELETE FROM mcp_servers WHERE id = ?1", [id])?;
             if changed != 1 {
                 return Err(McpError::NotFound(id.to_owned()));
@@ -456,15 +456,12 @@ fn merge_imports(
                         report.disabled_apps += 1;
                     }
                 }
-                if import.enabled {
-                    upsert_native_link(transaction, &import.id, &app, None, false)?;
-                }
             } else {
                 let mut apps = McpApps::default();
                 apps.set(&app, import.enabled)?;
                 let server = McpServer {
                     id: import.id.clone(),
-                    name: import.id,
+                    name: import.id.clone(),
                     server: import.server,
                     apps,
                     description: None,
@@ -475,11 +472,15 @@ fn merge_imports(
                 };
                 validate_server(&server)?;
                 save_server(transaction, &server)?;
-                if import.enabled {
-                    upsert_native_link(transaction, &server.id, &app, None, false)?;
-                }
                 report.new_servers += 1;
             }
+            upsert_native_link(
+                transaction,
+                &import.id,
+                &app,
+                import.native_snapshot.as_ref(),
+                true,
+            )?;
         }
     }
     Ok(report)
@@ -669,11 +670,15 @@ fn live_changes(
     after: Option<&McpServer>,
 ) -> Result<Vec<McpLiveChange>, McpError> {
     let mut changes = Vec::new();
-    for app in AppType::all().filter(|app| {
-        builtin_app_registry()
-            .for_app(app)
-            .supports(AppCapability::Mcp)
-    }) {
+    for descriptor in builtin_app_registry()
+        .descriptors()
+        .filter(|descriptor| descriptor.supports(AppCapability::Mcp))
+    {
+        let app = descriptor.app().clone();
+        let preserves_disabled_entry = descriptor
+            .mcp_contract()
+            .expect("MCP capability has a native contract")
+            .preserves_disabled_entry();
         let id = after
             .or(before)
             .expect("a live change has a server")
@@ -704,7 +709,8 @@ fn live_changes(
             }
             (Some(previous), Some(server), _, false)
                 if was_enabled
-                    || (link_state == McpNativeLinkState::Owned
+                    || (preserves_disabled_entry
+                        && link_state == McpNativeLinkState::Owned
                         && previous.server != server.server) =>
             {
                 changes.push(McpLiveChange::Disable {
@@ -717,7 +723,8 @@ fn live_changes(
                 });
             }
             (Some(previous), None, _, _)
-                if was_enabled || link_state == McpNativeLinkState::Owned =>
+                if was_enabled
+                    || (preserves_disabled_entry && link_state == McpNativeLinkState::Owned) =>
             {
                 changes.push(McpLiveChange::Remove {
                     app,
@@ -775,12 +782,7 @@ fn persist_native_links(
                 upsert_native_link(connection, id, app, native_snapshot.as_ref(), true)?;
             }
             McpLiveChange::Disable { .. } => {}
-            McpLiveChange::Remove { app, id, .. } => {
-                connection.execute(
-                    "DELETE FROM mcp_native_links WHERE server_id = ?1 AND app_id = ?2",
-                    params![id, app.as_str()],
-                )?;
-            }
+            McpLiveChange::Remove { .. } => {}
         }
     }
     Ok(())
@@ -1091,6 +1093,10 @@ mod tests {
         };
         import_observed(&store, import(false), true).unwrap();
         assert!(!store.list().unwrap().remove(0).apps.opencode);
+        let connection = store.connect().unwrap();
+        assert!(get_native_link(&connection, "local", &AppType::OpenCode)
+            .unwrap()
+            .is_some());
 
         let report = import_observed(&store, import(true), true).unwrap();
         assert_eq!(report.enabled_apps, 1);
@@ -1139,15 +1145,63 @@ mod tests {
             .is_empty());
 
         upsert_native_link(&transaction, &previous.id, &AppType::Claude, None, false).unwrap();
+        assert!(live_changes(&transaction, Some(&previous), Some(&updated))
+            .unwrap()
+            .is_empty());
+        assert!(live_changes(&transaction, Some(&previous), None)
+            .unwrap()
+            .is_empty());
+
+        upsert_native_link(&transaction, &previous.id, &AppType::OpenCode, None, false).unwrap();
         let removals = live_changes(&transaction, Some(&previous), None).unwrap();
         assert_eq!(removals.len(), 1);
         assert!(matches!(
             &removals[0],
             McpLiveChange::Remove {
-                app: AppType::Claude,
+                app: AppType::OpenCode,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn deleting_a_disabled_removable_link_forgets_ownership_without_live_removal() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cc-switch.db");
+        let store = McpStore::open(path.clone()).unwrap();
+        let mut record = server();
+        record.apps = McpApps::default();
+        store
+            .upsert_with_live(record, |_| Ok::<_, ()>(()), |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        upsert_native_link(&connection, "context7", &AppType::Gemini, None, false).unwrap();
+        let current = store.list().unwrap().remove(0);
+
+        store
+            .delete_with_live(
+                &current.id,
+                current.revision,
+                |changes| {
+                    assert!(changes.is_empty());
+                    Ok::<_, ()>(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM mcp_native_links WHERE server_id='context7'",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
