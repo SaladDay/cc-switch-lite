@@ -36,11 +36,12 @@ write configuration from CC Switch and Lite at the same time.
 The Skills page only switches already-installed Skills between supported
 applications. Installation, discovery, updates, backups, and a marketplace are
 outside Lite. A switch may remove only a link to the selected shared Skill or an
-exact verified copy; an unrelated same-name directory is left intact
-and reported as a conflict.
-Applications that discover `~/.agents/skills` directly are reported as active
-and read-only whenever the selected Skill is present there, independently of
-which shared source CC Switch currently uses.
+exact, verified copy; an unrelated same-name directory is left intact and
+reported as a conflict.
+For applications that discover `~/.agents/skills` directly, Lite uses a native
+per-Skill control only when Core declares a safe one. Gemini and Grok use their
+native disabled lists. Other directly discovered copies are shown as externally
+managed instead of guessing whether the application has enabled them.
 
 Import reads only the API-provider fields that Lite can reproduce. Switching
 uses the shared Core executor with logical configuration targets. Lite updates its

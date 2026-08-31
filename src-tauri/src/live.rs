@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     path::{Component, Path, PathBuf},
@@ -6,8 +7,9 @@ use std::{
 };
 
 use cc_switch_core::{
-    fs::shared_live_config_lock_path, AppType, SkillDeploymentReceipt, SkillSyncMethod,
-    MAX_OPERATION_CONTENT_BYTES,
+    builtin_app_registry, fs::shared_live_config_lock_path, project_skill_config_enabled, AppType,
+    ContentExpectation, PlannedWrite, SkillConfigTarget, SkillDeploymentReceipt, SkillSyncMethod,
+    UnifiedSkillControl, MAX_OPERATION_CONTENT_BYTES, OPERATION_CONTRACT_MAJOR,
 };
 use fs4::{FileExt, TryLockError};
 use serde::Deserialize;
@@ -17,10 +19,13 @@ use crate::{
     mcp::{McpImportsByApp, McpLiveChange},
     mcp_live::{McpImportSnapshot, McpLiveConfig, McpLiveReceipt},
     native_live::NativeLiveConfig,
-    operation::{LivePaths, OperationError, OperationExecutor, OperationPlan, OperationReceipt},
+    operation::{
+        read_optional_no_follow, LivePaths, OperationError, OperationExecutor, OperationPlan,
+        OperationReceipt,
+    },
     provider::{NativeImport, ProviderRecord},
     skill::RecoverableSkillChange,
-    skill_live::{SkillLiveConfig, SkillLiveError, SkillObservation},
+    skill_live::{SkillConfigDocuments, SkillLiveConfig, SkillLiveError, SkillObservation},
 };
 
 #[derive(Debug, Error)]
@@ -79,7 +84,34 @@ pub(crate) struct LockedLiveReceipt<'a, T> {
 pub(crate) type LiveWriteReceipt<'a> = LockedLiveReceipt<'a, OperationReceipt>;
 pub(crate) type McpWriteReceipt<'a> = LockedLiveReceipt<'a, McpLiveReceipt>;
 pub(crate) type McpImportObservation<'a> = LockedLiveReceipt<'a, McpImportSnapshot>;
-pub(crate) type SkillWriteReceipt<'a> = LockedLiveReceipt<'a, SkillDeploymentReceipt>;
+pub(crate) type SkillWriteReceipt<'a> = LockedLiveReceipt<'a, SkillChangeReceipt>;
+
+pub(crate) struct SkillChangeReceipt {
+    configuration: Option<SkillConfigurationReceipt>,
+    deployment: Option<SkillDeploymentReceipt>,
+}
+
+struct SkillConfigurationReceipt {
+    operation: OperationReceipt,
+    path: PathBuf,
+    contents: Vec<u8>,
+}
+
+impl SkillConfigurationReceipt {
+    fn verify(&self) -> Result<(), LiveError> {
+        if read_optional_no_follow(&self.path, MAX_OPERATION_CONTENT_BYTES)?.as_deref()
+            == Some(self.contents.as_slice())
+        {
+            Ok(())
+        } else {
+            Err(OperationError::Conflict.into())
+        }
+    }
+
+    fn rollback(self) -> Result<(), OperationError> {
+        self.operation.rollback()
+    }
+}
 
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -162,22 +194,96 @@ impl LiveConfig {
 
     pub(crate) fn apply_skill_recoverable(
         &self,
+        name: &str,
         directory: &str,
         app: &AppType,
         enabled: bool,
     ) -> Result<SkillWriteReceipt<'_>, LiveError> {
         self.lock_result(|| {
-            self.skill
-                .apply(directory, app, enabled)
-                .map_err(Into::into)
+            let route = self.skill.route(directory, app)?;
+            let configuration = if let Some(target) = route.config_target {
+                let logical_target = target.logical_target();
+                let (paths, current) = self.native.observe_target(logical_target)?;
+                if let Some(contents) =
+                    project_skill_config_enabled(target, current.as_deref(), name, enabled)
+                        .map_err(SkillLiveError::from)?
+                {
+                    let receipt = SkillConfigurationReceipt {
+                        path: paths.path_for(logical_target).to_owned(),
+                        contents: contents.as_bytes().to_vec(),
+                        operation: OperationExecutor::new(&paths).execute_recoverable(
+                            &OperationPlan {
+                        contract_major: OPERATION_CONTRACT_MAJOR,
+                        app_id: app.as_str().to_owned(),
+                        writes: vec![PlannedWrite {
+                            target: logical_target,
+                            expected: ContentExpectation::for_contents(current.as_deref()),
+                            contents: Some(contents),
+                        }],
+                            },
+                        )?,
+                    };
+                    Some(receipt)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let deployment = if route.deploy_native {
+                match self.skill.apply_deployment(directory, app, enabled) {
+                    Ok(receipt) => Some(receipt),
+                    Err(error) => {
+                        if let Some(receipt) = configuration {
+                            if let Err(rollback) = receipt.rollback() {
+                                return Err(LiveError::Recovery(format!(
+                                    "Skill deployment failed: {error}; configuration rollback: {rollback}"
+                                )));
+                            }
+                        }
+                        return Err(error.into());
+                    }
+                }
+            } else {
+                None
+            };
+            Ok(SkillChangeReceipt {
+                configuration,
+                deployment,
+            })
         })
     }
 
     pub(crate) fn observe_skills(
         &self,
-        skills: &[(String, String)],
+        skills: &[(String, String, String)],
     ) -> Result<Vec<SkillObservation>, LiveError> {
-        self.with_lock(|| Ok(self.skill.observe(skills)))
+        self.with_lock(|| {
+            let configs = self.observe_skill_configs();
+            Ok(self.skill.observe(skills, &configs))
+        })
+    }
+
+    fn observe_skill_configs(&self) -> SkillConfigDocuments {
+        let targets = builtin_app_registry()
+            .descriptors()
+            .filter_map(|descriptor| descriptor.skill_contract())
+            .filter_map(|contract| match contract.unified_control() {
+                Some(UnifiedSkillControl::DisabledNameList(target)) => Some(target),
+                Some(UnifiedSkillControl::ReadOnly) | None => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        targets
+            .into_iter()
+            .map(|target| {
+                let contents = self
+                    .native
+                    .observe_target(target.logical_target())
+                    .map(|(_, contents)| contents)
+                    .map_err(|error| error.to_string());
+                (target, contents)
+            })
+            .collect::<HashMap<SkillConfigTarget, _>>()
     }
 
     pub fn rollback_mcp(&self, receipt: McpWriteReceipt<'_>) -> Result<(), LiveError> {
@@ -345,9 +451,15 @@ impl RecoverableSkillChange for SkillWriteReceipt<'_> {
     type Error = LiveError;
 
     fn verify(&self) -> Result<(), Self::Error> {
-        self.value
-            .verify()
-            .map_err(|error| LiveError::Skill(error.into()))
+        if let Some(configuration) = &self.value.configuration {
+            configuration.verify()?;
+        }
+        if let Some(deployment) = &self.value.deployment {
+            deployment
+                .verify()
+                .map_err(|error| LiveError::Skill(error.into()))?;
+        }
+        Ok(())
     }
 
     fn commit(self) -> Result<(), Self::Error> {
@@ -357,7 +469,10 @@ impl RecoverableSkillChange for SkillWriteReceipt<'_> {
             file_lock,
         } = self;
         let result = value
-            .commit()
+            .deployment
+            .map(SkillDeploymentReceipt::commit)
+            .transpose()
+            .map(|_| ())
             .map_err(|error| LiveError::Skill(error.into()));
         drop(file_lock);
         drop(gate);
@@ -370,9 +485,28 @@ impl RecoverableSkillChange for SkillWriteReceipt<'_> {
             gate,
             file_lock,
         } = self;
-        let result = value
-            .rollback()
+        let deployment = value
+            .deployment
+            .map(SkillDeploymentReceipt::rollback)
+            .transpose()
             .map_err(|error| LiveError::Skill(error.into()));
+        let configuration = value
+            .configuration
+            .map(SkillConfigurationReceipt::rollback)
+            .transpose();
+        let result = match (deployment, configuration) {
+            (Ok(_), Ok(_)) => Ok(()),
+            (deployment, configuration) => Err(LiveError::Recovery(
+                [
+                    deployment.err().map(|error| error.to_string()),
+                    configuration.err().map(|error| error.to_string()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; "),
+            )),
+        };
         drop(file_lock);
         drop(gate);
         result

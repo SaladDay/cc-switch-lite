@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use cc_switch_core::{builtin_app_registry, skill_directory_key, AppType, SkillActivationSource};
+use cc_switch_core::{builtin_app_registry, skill_directory_key, AppType};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior};
 use serde::Serialize;
 use thiserror::Error;
@@ -51,11 +51,27 @@ pub struct SkillRecord {
     pub repo_owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_name: Option<String>,
-    pub apps: BTreeMap<String, bool>,
+    pub apps: BTreeMap<String, SkillAppState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue: Option<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub app_issues: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillAppState {
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingSkillChange {
+    pub(crate) skill_id: String,
+    pub(crate) name: String,
+    pub(crate) directory: String,
+    pub(crate) app: AppType,
+    pub(crate) enabled: bool,
+    previous_enabled: Option<bool>,
 }
 
 pub(crate) trait RecoverableSkillChange: Sized {
@@ -79,7 +95,7 @@ impl SkillStore {
 
     pub fn list(&self) -> Result<Vec<SkillRecord>, SkillError> {
         let connection = self.connect()?;
-        let bindings = catalog_bindings()?;
+        let bindings = catalog_bindings();
         let columns = bindings
             .iter()
             .map(|binding| binding.column)
@@ -121,11 +137,82 @@ impl SkillStore {
         id: &str,
         app: AppType,
         enabled: bool,
-        apply: impl FnOnce(&str, &AppType, bool) -> Result<C, C::Error>,
+        apply: impl FnOnce(&PendingSkillChange) -> Result<C, C::Error>,
     ) -> Result<Result<(), C::Error>, SkillError>
     where
         C: RecoverableSkillChange,
     {
+        let pending = self.begin_toggle(id, app, enabled)?;
+        let receipt = match apply(&pending) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.cancel_pending(&pending)?;
+                return Ok(Err(error));
+            }
+        };
+        if let Err(error) = receipt.verify() {
+            return match receipt.rollback() {
+                Ok(()) => match self.cancel_pending(&pending) {
+                    Ok(()) => Ok(Err(error)),
+                    Err(database) => Err(SkillError::Recovery(format_recovery(
+                        "live verification",
+                        &error,
+                        Some(database),
+                        None::<C::Error>,
+                    ))),
+                },
+                Err(live) => Err(SkillError::Recovery(format_recovery(
+                    "live verification",
+                    &error,
+                    None,
+                    Some(live),
+                ))),
+            };
+        }
+        if let Err(error) = receipt.commit() {
+            return Ok(Err(error));
+        }
+        self.complete_pending(&pending)?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn recover_pending_with_live<C>(
+        &self,
+        mut apply: impl FnMut(&PendingSkillChange) -> Result<C, C::Error>,
+    ) -> Result<Result<(), C::Error>, SkillError>
+    where
+        C: RecoverableSkillChange,
+    {
+        for pending in self.pending_changes()? {
+            let receipt = match apply(&pending) {
+                Ok(receipt) => receipt,
+                Err(error) => return Ok(Err(error)),
+            };
+            if let Err(error) = receipt.verify() {
+                return match receipt.rollback() {
+                    Ok(()) => Ok(Err(error)),
+                    Err(rollback) => Err(SkillError::Recovery(format_recovery(
+                        "pending live verification",
+                        &error,
+                        None,
+                        Some(rollback),
+                    ))),
+                };
+            }
+            if let Err(error) = receipt.commit() {
+                return Ok(Err(error));
+            }
+            self.complete_pending(&pending)?;
+        }
+        Ok(Ok(()))
+    }
+
+    fn begin_toggle(
+        &self,
+        id: &str,
+        app: AppType,
+        enabled: bool,
+    ) -> Result<PendingSkillChange, SkillError> {
         let descriptor = builtin_app_registry().for_app(&app);
         let contract = descriptor.skill_contract().ok_or_else(|| {
             SkillError::InvalidSkill(format!(
@@ -136,61 +223,175 @@ impl SkillStore {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let column = contract.catalog_column();
-        let directory = get_skill_directory(&transaction, id)?
+        let query = column.map_or_else(
+            || "SELECT name, directory, NULL FROM skills WHERE id = ?1".to_owned(),
+            |column| format!("SELECT name, directory, {column} FROM skills WHERE id = ?1"),
+        );
+        let row = transaction
+            .query_row(&query, [id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<bool>>(2)?,
+                ))
+            })
+            .optional()?
             .ok_or_else(|| SkillError::NotFound(id.to_owned()))?;
-        let directory_key = skill_directory_key(&directory)
-            .map_err(|error| SkillError::InvalidSkill(error.to_string()))?;
-        let count = count_directory_key(&transaction, &directory_key)?;
-        if count != 1 {
-            return Err(SkillError::InvalidSkill(format!(
-                "directory '{directory}' is not unique in the shared catalog"
-            )));
-        }
-        let receipt = match apply(&directory, &app, enabled) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                transaction.rollback()?;
-                return Ok(Err(error));
-            }
+        validate_unique_directory(&transaction, &row.1)?;
+        let pending = PendingSkillChange {
+            skill_id: id.to_owned(),
+            name: row.0,
+            directory: row.1,
+            app,
+            enabled,
+            previous_enabled: row.2,
         };
+        transaction
+            .execute(
+                "INSERT INTO skill_operation_journal
+                 (skill_id, app_id, skill_name, directory, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    pending.skill_id,
+                    pending.app.as_str(),
+                    pending.name,
+                    pending.directory,
+                    pending.enabled
+                ],
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::SqliteFailure(ref failure, _)
+                    if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    SkillError::Recovery(format!(
+                        "a pending Skill change already exists for '{}' and '{}'",
+                        pending.skill_id,
+                        pending.app.as_str()
+                    ))
+                }
+                error => SkillError::Database(error),
+            })?;
         if let Some(column) = column {
-            let update = transaction.execute(
+            let updated = transaction.execute(
                 &format!("UPDATE skills SET {column} = ?1 WHERE id = ?2"),
                 params![enabled, id],
-            );
-            match update {
-                Ok(1) => {}
-                Ok(_) => {
-                    let error = SkillError::NotFound(id.to_owned());
-                    let database_rollback = transaction.rollback();
-                    return recover_database_failure(error, database_rollback, receipt);
-                }
-                Err(error) => {
-                    let error = SkillError::Database(error);
-                    let database_rollback = transaction.rollback();
-                    return recover_database_failure(error, database_rollback, receipt);
-                }
+            )?;
+            if updated != 1 {
+                return Err(SkillError::NotFound(id.to_owned()));
             }
         }
+        transaction.commit()?;
+        Ok(pending)
+    }
 
-        if let Err(error) = receipt.verify() {
-            let database_rollback = transaction.rollback();
-            return recover_live_failure(error, database_rollback, receipt);
+    fn pending_changes(&self) -> Result<Vec<PendingSkillChange>, SkillError> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT skill_id, app_id, skill_name, directory, enabled
+             FROM skill_operation_journal ORDER BY skill_id, app_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })?;
+        let mut pending = Vec::new();
+        for row in rows {
+            let (skill_id, app_id, name, directory, enabled) = row?;
+            let app = app_id.parse::<AppType>().map_err(|_| {
+                SkillError::InvalidStore(format!(
+                    "pending Skill change uses unknown application '{app_id}'"
+                ))
+            })?;
+            let contract = builtin_app_registry()
+                .for_app(&app)
+                .skill_contract()
+                .ok_or_else(|| {
+                    SkillError::InvalidStore(format!(
+                        "pending Skill change uses application '{app_id}' without Skills"
+                    ))
+                })?;
+            let current = connection
+                .query_row(
+                    "SELECT name, directory FROM skills WHERE id = ?1",
+                    [&skill_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    SkillError::InvalidStore(format!(
+                        "pending Skill change references missing Skill '{skill_id}'"
+                    ))
+                })?;
+            if current != (name.clone(), directory.clone()) {
+                return Err(SkillError::InvalidStore(format!(
+                    "Skill '{skill_id}' changed while a pending operation was recorded"
+                )));
+            }
+            validate_unique_directory(&connection, &directory)?;
+            if let Some(column) = contract.catalog_column() {
+                let desired = connection.query_row(
+                    &format!("SELECT {column} FROM skills WHERE id = ?1"),
+                    [&skill_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if desired != enabled {
+                    return Err(SkillError::InvalidStore(format!(
+                        "pending Skill change for '{skill_id}' does not match the catalog"
+                    )));
+                }
+            }
+            pending.push(PendingSkillChange {
+                skill_id,
+                name,
+                directory,
+                app,
+                enabled,
+                previous_enabled: None,
+            });
         }
+        Ok(pending)
+    }
 
-        if let Err(error) = transaction.execute_batch("COMMIT") {
-            let database_rollback = transaction.rollback();
-            return recover_database_failure(
-                SkillError::Database(error),
-                database_rollback,
-                receipt,
-            );
+    fn cancel_pending(&self, pending: &PendingSkillChange) -> Result<(), SkillError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(previous) = pending.previous_enabled {
+            let column = builtin_app_registry()
+                .for_app(&pending.app)
+                .skill_contract()
+                .and_then(|contract| contract.catalog_column())
+                .ok_or_else(|| {
+                    SkillError::Recovery(format!(
+                        "missing catalog binding for '{}'",
+                        pending.app.as_str()
+                    ))
+                })?;
+            let updated = transaction.execute(
+                &format!(
+                    "UPDATE skills SET {column} = ?1
+                     WHERE id = ?2 AND {column} = ?3"
+                ),
+                params![previous, pending.skill_id, pending.enabled],
+            )?;
+            if updated != 1 {
+                return Err(SkillError::Recovery(format!(
+                    "catalog changed while rolling back Skill '{}'",
+                    pending.skill_id
+                )));
+            }
         }
-        drop(transaction);
-        match receipt.commit() {
-            Ok(()) => Ok(Ok(())),
-            Err(error) => Ok(Err(error)),
-        }
+        delete_pending(&transaction, pending)?;
+        transaction.commit().map_err(Into::into)
+    }
+
+    fn complete_pending(&self, pending: &PendingSkillChange) -> Result<(), SkillError> {
+        let connection = self.connect()?;
+        delete_pending(&connection, pending)
     }
 
     fn initialize(&self) -> Result<(), SkillError> {
@@ -206,20 +407,23 @@ impl SkillStore {
                 repo_name TEXT,
                 repo_branch TEXT DEFAULT 'main',
                 readme_url TEXT,
-                enabled_claude BOOLEAN NOT NULL DEFAULT 0,
-                enabled_codex BOOLEAN NOT NULL DEFAULT 0,
-                enabled_gemini BOOLEAN NOT NULL DEFAULT 0,
-                enabled_grokbuild BOOLEAN NOT NULL DEFAULT 0,
-                enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
-                enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
                 installed_at INTEGER NOT NULL DEFAULT 0,
                 content_hash TEXT,
                 updated_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS skill_operation_journal (
+                skill_id TEXT NOT NULL,
+                app_id TEXT NOT NULL,
+                skill_name TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL,
+                PRIMARY KEY (skill_id, app_id)
             );",
         )?;
         let mut columns = skill_columns(&transaction)?;
         verify_base_columns(&columns)?;
-        for binding in catalog_bindings()? {
+        verify_journal_schema(&transaction)?;
+        for binding in catalog_bindings() {
             if columns.insert(binding.column.to_owned()) {
                 transaction.execute_batch(&format!(
                     "ALTER TABLE skills ADD COLUMN {} BOOLEAN NOT NULL DEFAULT 0",
@@ -249,22 +453,15 @@ struct CatalogBinding {
     column: &'static str,
 }
 
-fn catalog_bindings() -> Result<Vec<CatalogBinding>, SkillError> {
+fn catalog_bindings() -> Vec<CatalogBinding> {
     builtin_app_registry()
         .descriptors()
         .filter_map(|descriptor| {
             let contract = descriptor.skill_contract()?;
-            (contract.activation_source() == SkillActivationSource::CatalogFlag)
-                .then_some((descriptor.id(), contract.catalog_column()))
-        })
-        .map(|(app_id, column)| {
-            column
-                .map(|column| CatalogBinding { app_id, column })
-                .ok_or_else(|| {
-                    SkillError::InvalidStore(format!(
-                        "catalog-backed application '{app_id}' has no Skill column"
-                    ))
-                })
+            contract.catalog_column().map(|column| CatalogBinding {
+                app_id: descriptor.id(),
+                column,
+            })
         })
         .collect()
 }
@@ -272,11 +469,26 @@ fn catalog_bindings() -> Result<Vec<CatalogBinding>, SkillError> {
 fn row_to_skill(row: &Row<'_>, bindings: &[CatalogBinding]) -> rusqlite::Result<SkillRecord> {
     let mut apps = builtin_app_registry()
         .descriptors()
-        .filter(|descriptor| descriptor.skill_contract().is_some())
-        .map(|descriptor| (descriptor.id().to_owned(), false))
+        .filter_map(|descriptor| Some((descriptor, descriptor.skill_contract()?)))
+        .map(|(descriptor, contract)| {
+            let enabled = contract.catalog_column().map(|_| false);
+            (
+                descriptor.id().to_owned(),
+                SkillAppState {
+                    enabled,
+                    issue: None,
+                },
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     for (index, binding) in bindings.iter().enumerate() {
-        apps.insert(binding.app_id.to_owned(), row.get(6 + index)?);
+        apps.insert(
+            binding.app_id.to_owned(),
+            SkillAppState {
+                enabled: Some(row.get(6 + index)?),
+                issue: None,
+            },
+        );
     }
     Ok(SkillRecord {
         id: row.get(0)?,
@@ -287,7 +499,6 @@ fn row_to_skill(row: &Row<'_>, bindings: &[CatalogBinding]) -> rusqlite::Result<
         repo_name: row.get(5)?,
         apps,
         issue: None,
-        app_issues: BTreeMap::new(),
     })
 }
 
@@ -312,53 +523,44 @@ fn count_directory_key(connection: &Connection, expected: &str) -> Result<usize,
     Ok(count)
 }
 
-fn get_skill_directory(connection: &Connection, id: &str) -> Result<Option<String>, SkillError> {
-    connection
-        .query_row("SELECT directory FROM skills WHERE id = ?1", [id], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map_err(Into::into)
+fn validate_unique_directory(connection: &Connection, directory: &str) -> Result<(), SkillError> {
+    let directory_key = skill_directory_key(directory)
+        .map_err(|error| SkillError::InvalidSkill(error.to_string()))?;
+    if count_directory_key(connection, &directory_key)? != 1 {
+        return Err(SkillError::InvalidSkill(format!(
+            "directory '{directory}' is not unique in the shared catalog"
+        )));
+    }
+    Ok(())
 }
 
-fn recover_live_failure<C: RecoverableSkillChange>(
-    error: C::Error,
-    database_rollback: rusqlite::Result<()>,
-    receipt: C,
-) -> Result<Result<(), C::Error>, SkillError> {
-    let live_rollback = receipt.rollback();
-    match (database_rollback, live_rollback) {
-        (Ok(()), Ok(())) => Ok(Err(error)),
-        (database, live) => Err(SkillError::Recovery(format_recovery(
-            "live verification",
-            &error,
-            database.err(),
-            live.err(),
-        ))),
+fn delete_pending(connection: &Connection, pending: &PendingSkillChange) -> Result<(), SkillError> {
+    let deleted = connection.execute(
+        "DELETE FROM skill_operation_journal
+         WHERE skill_id = ?1 AND app_id = ?2 AND skill_name = ?3
+           AND directory = ?4 AND enabled = ?5",
+        params![
+            pending.skill_id,
+            pending.app.as_str(),
+            pending.name,
+            pending.directory,
+            pending.enabled
+        ],
+    )?;
+    if deleted != 1 {
+        return Err(SkillError::Recovery(format!(
+            "pending Skill change disappeared for '{}' and '{}'",
+            pending.skill_id,
+            pending.app.as_str()
+        )));
     }
-}
-
-fn recover_database_failure<C: RecoverableSkillChange>(
-    error: SkillError,
-    database_rollback: rusqlite::Result<()>,
-    receipt: C,
-) -> Result<Result<(), C::Error>, SkillError> {
-    let live_rollback = receipt.rollback();
-    if database_rollback.is_ok() && live_rollback.is_ok() {
-        return Err(error);
-    }
-    Err(SkillError::Recovery(format_recovery(
-        "database update",
-        &error,
-        database_rollback.err(),
-        live_rollback.err(),
-    )))
+    Ok(())
 }
 
 fn format_recovery(
     context: &str,
     cause: &impl Display,
-    database: Option<rusqlite::Error>,
+    database: Option<SkillError>,
     live: Option<impl Display>,
 ) -> String {
     let mut message = format!("{context} failed: {cause}");
@@ -382,13 +584,44 @@ fn skill_columns(connection: &Connection) -> Result<HashSet<String>, SkillError>
 fn verify_schema(connection: &Connection) -> Result<(), SkillError> {
     let columns = skill_columns(connection)?;
     verify_base_columns(&columns)?;
-    for binding in catalog_bindings()? {
+    for binding in catalog_bindings() {
         if !columns.contains(binding.column) {
             return Err(SkillError::InvalidStore(format!(
                 "skills is missing required column '{}'",
                 binding.column
             )));
         }
+    }
+    Ok(())
+}
+
+fn verify_journal_schema(connection: &Connection) -> Result<(), SkillError> {
+    let mut statement = connection.prepare("PRAGMA table_info(skill_operation_journal)")?;
+    let info = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, usize>(5)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let columns = info
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<HashSet<_>>();
+    for required in ["skill_id", "app_id", "skill_name", "directory", "enabled"] {
+        if !columns.contains(required) {
+            return Err(SkillError::InvalidStore(format!(
+                "skill_operation_journal is missing required column '{required}'"
+            )));
+        }
+    }
+    let primary_key = info
+        .iter()
+        .filter(|(_, position)| *position > 0)
+        .map(|(name, position)| (name.as_str(), *position))
+        .collect::<Vec<_>>();
+    if primary_key != [("skill_id", 1), ("app_id", 2)] {
+        return Err(SkillError::InvalidStore(
+            "skill_operation_journal has an incompatible primary key".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -478,6 +711,32 @@ mod tests {
     }
 
     #[test]
+    fn incompatible_journal_key_is_rejected() {
+        let (_directory, path, store) = seed_store();
+        drop(store);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE skill_operation_journal;
+                 CREATE TABLE skill_operation_journal (
+                    skill_id TEXT NOT NULL,
+                    app_id TEXT NOT NULL,
+                    skill_name TEXT NOT NULL,
+                    directory TEXT NOT NULL,
+                    enabled BOOLEAN NOT NULL,
+                    generation INTEGER,
+                    PRIMARY KEY (skill_id, app_id, generation)
+                 );",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            SkillStore::open(path),
+            Err(SkillError::InvalidStore(_))
+        ));
+    }
+
+    #[test]
     fn shared_schema_lists_catalog_apps_and_preserves_future_columns() {
         let (_directory, path, store) = seed_store();
         let connection = Connection::open(path).unwrap();
@@ -490,8 +749,8 @@ mod tests {
 
         let skills = store.list().unwrap();
         assert_eq!(skills.len(), 1);
-        assert!(skills[0].apps["claude"]);
-        assert!(!skills[0].apps["pi"]);
+        assert_eq!(skills[0].apps["claude"].enabled, Some(true));
+        assert_eq!(skills[0].apps["pi"].enabled, None);
         assert_eq!(skills[0].issue, None);
         assert_eq!(
             connection
@@ -508,10 +767,11 @@ mod tests {
         let committed = Rc::new(Cell::new(false));
         let rolled_back = Rc::new(Cell::new(false));
         store
-            .toggle_with_live("docs", AppType::Claude, true, |directory, app, enabled| {
-                assert_eq!(directory, "docs");
-                assert_eq!(app, &AppType::Claude);
-                assert!(enabled);
+            .toggle_with_live("docs", AppType::Claude, true, |pending| {
+                assert_eq!(pending.directory, "docs");
+                assert_eq!(pending.name, "Docs");
+                assert_eq!(pending.app, AppType::Claude);
+                assert!(pending.enabled);
                 Ok(FakeReceipt {
                     verified: true,
                     committed: committed.clone(),
@@ -531,11 +791,52 @@ mod tests {
     }
 
     #[test]
+    fn durable_intent_is_replayed_after_an_interrupted_toggle() {
+        let (_directory, path, store) = seed_store();
+        let pending = store.begin_toggle("docs", AppType::Claude, true).unwrap();
+        assert!(pending.enabled);
+        assert_eq!(
+            Connection::open(&path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            1
+        );
+
+        let committed = Rc::new(Cell::new(false));
+        store
+            .recover_pending_with_live(|pending| {
+                assert_eq!(pending.skill_id, "docs");
+                assert_eq!(pending.app, AppType::Claude);
+                assert!(pending.enabled);
+                Ok(FakeReceipt {
+                    verified: true,
+                    committed: committed.clone(),
+                    rolled_back: Rc::new(Cell::new(false)),
+                })
+            })
+            .unwrap()
+            .unwrap();
+        assert!(committed.get());
+        assert_eq!(
+            Connection::open(path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn failed_live_verification_rolls_back_the_catalog() {
         let (_directory, path, store) = seed_store();
         let rolled_back = Rc::new(Cell::new(false));
         let result = store
-            .toggle_with_live("docs", AppType::Codex, true, |_, _, _| {
+            .toggle_with_live("docs", AppType::Codex, true, |_| {
                 Ok(FakeReceipt {
                     verified: false,
                     committed: Rc::new(Cell::new(false)),
@@ -573,10 +874,9 @@ mod tests {
         assert!(skills.iter().all(|skill| skill.issue.is_some()));
 
         for id in ["docs", "unsafe"] {
-            let result =
-                store.toggle_with_live::<FakeReceipt>(id, AppType::Claude, true, |_, _, _| {
-                    panic!("invalid catalog rows must not reach live changes")
-                });
+            let result = store.toggle_with_live::<FakeReceipt>(id, AppType::Claude, true, |_| {
+                panic!("invalid catalog rows must not reach live changes")
+            });
             assert!(matches!(result, Err(SkillError::InvalidSkill(_))));
         }
     }
@@ -604,12 +904,9 @@ mod tests {
             .filter(|skill| skill.id.starts_with("accent-"))
             .all(|skill| skill.issue.is_some()));
         assert!(matches!(
-            store.toggle_with_live::<FakeReceipt>(
-                "accent-a",
-                AppType::Claude,
-                true,
-                |_, _, _| panic!("aliased catalog rows must not reach live changes")
-            ),
+            store.toggle_with_live::<FakeReceipt>("accent-a", AppType::Claude, true, |_| panic!(
+                "aliased catalog rows must not reach live changes"
+            )),
             Err(SkillError::InvalidSkill(_))
         ));
     }
@@ -647,8 +944,13 @@ mod tests {
         fs::create_dir_all(&residual).unwrap();
         fs::write(residual.join("SKILL.md"), "# Docs").unwrap();
         store
-            .toggle_with_live("docs", AppType::Claude, false, |directory, app, enabled| {
-                live.apply_skill_recoverable(directory, app, enabled)
+            .toggle_with_live("docs", AppType::Claude, false, |pending| {
+                live.apply_skill_recoverable(
+                    &pending.name,
+                    &pending.directory,
+                    &pending.app,
+                    pending.enabled,
+                )
             })
             .unwrap()
             .unwrap();
@@ -656,12 +958,14 @@ mod tests {
 
         for enabled in [true, false] {
             store
-                .toggle_with_live(
-                    "docs",
-                    AppType::Claude,
-                    enabled,
-                    |directory, app, enabled| live.apply_skill_recoverable(directory, app, enabled),
-                )
+                .toggle_with_live("docs", AppType::Claude, enabled, |pending| {
+                    live.apply_skill_recoverable(
+                        &pending.name,
+                        &pending.directory,
+                        &pending.app,
+                        pending.enabled,
+                    )
+                })
                 .unwrap()
                 .unwrap();
             assert_eq!(
@@ -676,5 +980,62 @@ mod tests {
             assert_eq!(claude.join("skills/docs").exists(), enabled);
         }
         assert!(source.join("SKILL.md").exists());
+        assert_eq!(
+            Connection::open(path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn unified_gemini_skill_uses_its_native_disabled_list() {
+        let directory = tempdir().unwrap();
+        let shared = directory.path().join(".cc-switch");
+        let source = shared.join("skills/docs");
+        let unified = directory.path().join(".agents/skills/docs");
+        let gemini = directory.path().join(".gemini");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&unified).unwrap();
+        fs::create_dir_all(&gemini).unwrap();
+        fs::write(source.join("SKILL.md"), "# Docs").unwrap();
+        fs::write(unified.join("SKILL.md"), "# Docs").unwrap();
+        fs::write(
+            gemini.join("settings.json"),
+            r#"{"theme":"dark","skills":{"disabled":["Docs"]}}"#,
+        )
+        .unwrap();
+        let path = shared.join("cc-switch.db");
+        let store = SkillStore::open(path.clone()).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO skills (id, name, directory) VALUES ('docs', 'Docs', 'docs')",
+                [],
+            )
+            .unwrap();
+        let live = LiveConfig::from_home(directory.path()).unwrap();
+
+        for enabled in [true, false] {
+            store
+                .toggle_with_live("docs", AppType::Gemini, enabled, |pending| {
+                    live.apply_skill_recoverable(
+                        &pending.name,
+                        &pending.directory,
+                        &pending.app,
+                        pending.enabled,
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            let settings: serde_json::Value =
+                serde_json::from_slice(&fs::read(gemini.join("settings.json")).unwrap()).unwrap();
+            let disabled = settings["skills"]["disabled"].as_array().unwrap();
+            assert_eq!(disabled.iter().any(|name| name == "Docs"), !enabled);
+            assert!(!gemini.join("skills/docs").exists());
+        }
     }
 }

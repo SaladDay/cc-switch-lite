@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, LoaderCircle, Search, Sparkles, X } from "lucide-react";
+import {
+  AlertTriangle,
+  LoaderCircle,
+  LockKeyhole,
+  Search,
+  Sparkles,
+  X,
+} from "lucide-react";
 
 import { appDefinition } from "../../lib/apps";
 import type { AppId, CoreAppDescriptor } from "../../lib/provider-types";
@@ -63,7 +70,11 @@ export function SkillsPanel({
       Object.fromEntries(
         apps.map((app) => [
           app.id,
-          skills.filter((skill) => Boolean(skill.apps[app.id])).length,
+          skills.filter(
+            (skill) =>
+              skill.apps[app.id]?.enabled === true &&
+              !skill.apps[app.id]?.issue,
+          ).length,
         ]),
       ),
     [apps, skills],
@@ -96,7 +107,13 @@ export function SkillsPanel({
       setSkills((current) =>
         current.map((item) =>
           item.id === skill.id
-            ? { ...item, apps: { ...item.apps, [appId]: enabled } }
+            ? {
+                ...item,
+                apps: {
+                  ...item.apps,
+                  [appId]: { enabled },
+                },
+              }
             : item,
         ),
       );
@@ -232,11 +249,35 @@ export function SkillsPanel({
                   <div className="flex shrink-0 items-center gap-1.5">
                     {apps.map((app) => {
                       const definition = appDefinition(app.id, [app]);
-                      const enabled = Boolean(skill.apps[app.id]);
+                      const appState = skill.apps[app.id] ?? {
+                        enabled: false,
+                      };
+                      const enabled = appState.enabled === true;
                       const key = `${skill.id}:${app.id}`;
-                      const appIssue = skill.appIssues?.[app.id];
-                      const disabled =
-                        pending !== null || Boolean(skill.issue || appIssue);
+                      const appIssue = appState.issue;
+                      if (appIssue) {
+                        return (
+                          <span
+                            key={app.id}
+                            role="status"
+                            tabIndex={0}
+                            aria-label={`${definition.label}: read-only. ${appIssue}`}
+                            title={appIssue}
+                            className="relative flex h-7 w-7 items-center justify-center rounded-lg bg-muted text-muted-foreground opacity-70"
+                          >
+                            <ProviderIcon
+                              icon={definition.icon}
+                              name={definition.label}
+                              size={17}
+                            />
+                            <LockKeyhole
+                              aria-hidden="true"
+                              className="absolute -bottom-1 -right-1 h-3 w-3 rounded-full bg-background p-0.5 text-amber-500"
+                            />
+                          </span>
+                        );
+                      }
+                      const disabled = pending !== null || Boolean(skill.issue);
                       return (
                         <button
                           key={app.id}
@@ -246,7 +287,7 @@ export function SkillsPanel({
                           aria-label={`${enabled ? "Disable" : "Enable"} ${skill.name || skill.directory} for ${definition.label}`}
                           aria-pressed={enabled}
                           aria-busy={pending === key}
-                          title={appIssue || definition.label}
+                          title={definition.label}
                           className={`flex h-7 w-7 items-center justify-center rounded-lg transition-all disabled:cursor-not-allowed ${
                             enabled
                               ? "bg-emerald-500/15 opacity-100"

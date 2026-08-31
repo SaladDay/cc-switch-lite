@@ -91,6 +91,15 @@ impl NativeLiveConfig {
         Ok(Self { paths })
     }
 
+    pub(crate) fn observe_target(
+        &self,
+        target: LogicalTarget,
+    ) -> Result<(LivePaths, Option<Vec<u8>>), LiveError> {
+        let paths = self.paths.resolved_for_write(target)?;
+        let contents = read_optional(paths.path_for(target))?;
+        Ok((paths, contents))
+    }
+
     pub fn import_drafts(&self, app: AppType) -> Result<Vec<NativeImport>, LiveError> {
         if app == AppType::ClaudeDesktop {
             ensure_claude_desktop_supported()?;

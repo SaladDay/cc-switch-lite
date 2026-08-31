@@ -554,7 +554,13 @@ fn list_installed_skills(
     let mut skills = store.list()?;
     let requests = skills
         .iter()
-        .map(|skill| (skill.id.clone(), skill.directory.clone()))
+        .map(|skill| {
+            (
+                skill.id.clone(),
+                skill.name.clone(),
+                skill.directory.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     let observations = live.observe_skills(&requests)?;
     let indexes = skills
@@ -573,14 +579,7 @@ fn list_installed_skills(
             skill.issue = observation.source_issue;
         }
         for (app_id, state) in observation.app_overrides {
-            if let Some(enabled) = state.enabled {
-                skill.apps.insert(app_id.clone(), enabled);
-            }
-            if let Some(issue) = state.issue {
-                skill.app_issues.insert(app_id, issue);
-            } else {
-                skill.app_issues.remove(&app_id);
-            }
+            skill.apps.insert(app_id, state);
         }
     }
     Ok(skills)
@@ -600,8 +599,13 @@ fn toggle_skill_app(
         )))
     })?;
     match store
-        .toggle_with_live(&skill_id, app, enabled, |directory, app, enabled| {
-            live.apply_skill_recoverable(directory, app, enabled)
+        .toggle_with_live(&skill_id, app, enabled, |pending| {
+            live.apply_skill_recoverable(
+                &pending.name,
+                &pending.directory,
+                &pending.app,
+                pending.enabled,
+            )
         })
         .map_err(CommandError::from)?
     {
@@ -618,11 +622,22 @@ pub fn run() {
             let store = ProviderStore::from_home(&home_dir)?;
             let mcp_store = McpStore::open(store::database_path(&home_dir))?;
             let skill_store = SkillStore::open(store::database_path(&home_dir))?;
+            let live = LiveConfig::from_home(&home_dir)?;
+            if let Err(error) = skill_store.recover_pending_with_live(|pending| {
+                live.apply_skill_recoverable(
+                    &pending.name,
+                    &pending.directory,
+                    &pending.app,
+                    pending.enabled,
+                )
+            })? {
+                return Err(error.into());
+            }
             // The shared database is authoritative; startup never imports old Lite files.
             app.manage(store);
             app.manage(mcp_store);
             app.manage(skill_store);
-            app.manage(LiveConfig::from_home(&home_dir)?);
+            app.manage(live);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

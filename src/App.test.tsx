@@ -146,13 +146,13 @@ const docsSkill: SkillRecord = {
   repoOwner: "owner",
   repoName: "repo",
   apps: {
-    claude: true,
-    codex: false,
-    gemini: false,
-    grokbuild: false,
-    opencode: false,
-    hermes: false,
-    pi: false,
+    claude: { enabled: true },
+    codex: { enabled: false },
+    gemini: { enabled: false },
+    grokbuild: { enabled: false },
+    opencode: { enabled: false },
+    hermes: { enabled: false },
+    pi: { enabled: false },
   },
 };
 
@@ -345,11 +345,12 @@ describe("App", () => {
 
   it("switches installed Skills through the shared application catalog", async () => {
     const user = userEvent.setup();
-    skillApi.list
-      .mockResolvedValueOnce([docsSkill])
-      .mockResolvedValueOnce([
-        { ...docsSkill, apps: { ...docsSkill.apps, codex: true } },
-      ]);
+    skillApi.list.mockResolvedValueOnce([docsSkill]).mockResolvedValueOnce([
+      {
+        ...docsSkill,
+        apps: { ...docsSkill.apps, codex: { enabled: true } },
+      },
+    ]);
     render(<App />);
 
     await screen.findByRole("heading", {
@@ -391,6 +392,37 @@ describe("App", () => {
       screen.getByRole("button", { name: "Enable Docs for Codex" }),
     ).toBeDisabled();
     expect(skillApi.toggle).not.toHaveBeenCalled();
+  });
+
+  it("shows application-specific read-only state without a disabled button", async () => {
+    const user = userEvent.setup();
+    skillApi.list.mockResolvedValue([
+      {
+        ...docsSkill,
+        apps: {
+          ...docsSkill.apps,
+          codex: {
+            enabled: null,
+            issue: "Codex Skill state is managed outside Lite",
+          },
+        },
+      },
+    ]);
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Add your first Claude Code provider",
+    });
+    await user.click(screen.getByRole("button", { name: "Manage Skills" }));
+
+    expect(
+      await screen.findByRole("status", {
+        name: /Codex: read-only\. Codex Skill state is managed outside Lite/,
+      }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: /Docs for Codex/ }),
+    ).not.toBeInTheDocument();
   });
 
   it("blocks MCP actions until the initial catalog has loaded", async () => {
