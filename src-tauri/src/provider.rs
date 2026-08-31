@@ -1,4 +1,6 @@
-use cc_switch_core::AppType;
+use cc_switch_core::{
+    AppType, SimpleProviderField, SimpleProviderFormDescriptor, SimpleProviderValues,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use url::{Host, Url};
@@ -82,12 +84,29 @@ pub(crate) struct NativeImport {
     pub metadata: Value,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderUpdate {
     pub expected_revision: u64,
     pub name: String,
     pub settings: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SimpleProviderDraft {
+    pub app_id: String,
+    pub name: String,
+    pub values: SimpleProviderValues,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SimpleProviderUpdate {
+    pub expected_revision: u64,
+    pub name: String,
+    pub values: SimpleProviderValues,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +187,9 @@ pub fn is_lite_writable(provider: &ProviderRecord) -> bool {
     let Ok(app) = provider.app_id.parse::<AppType>() else {
         return false;
     };
+    if !uses_direct_native_protocol(&app, provider) {
+        return false;
+    }
     let managed_provider = matches!(
         provider
             .metadata
@@ -191,7 +213,7 @@ pub fn is_lite_writable(provider: &ProviderRecord) -> bool {
                 endpoint.contains("githubcopilot.com")
                     || endpoint.contains("chatgpt.com/backend-api/codex")
             });
-    if managed_provider || provider.category.as_deref() == Some("aggregator") {
+    if managed_provider {
         return false;
     }
     if !provider
@@ -218,6 +240,97 @@ pub fn is_lite_writable(provider: &ProviderRecord) -> bool {
             provider.settings.get("_cc_source").and_then(Value::as_str) != Some("providers_dict")
         }
         _ => true,
+    }
+}
+
+/// Whether the simple editor can safely round-trip this stored provider.
+pub fn is_lite_simple_editable(provider: &ProviderRecord) -> bool {
+    is_lite_writable(provider)
+        && provider.category.as_deref() != Some("official")
+        && provider.extensions.contains_key("simpleValues")
+}
+
+fn uses_direct_native_protocol(app: &AppType, provider: &ProviderRecord) -> bool {
+    if !matches!(app, AppType::Claude | AppType::Codex | AppType::GrokBuild) {
+        return true;
+    }
+    if provider.metadata.get("isFullUrl").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    let format = provider
+        .metadata
+        .get("apiFormat")
+        .or_else(|| provider.settings.get("apiFormat"))
+        .or_else(|| provider.settings.get("api_format"));
+    let format_is_direct = match (app, format) {
+        (_, None | Some(Value::Null)) => true,
+        (AppType::Claude, Some(Value::String(format))) => matches!(
+            format.trim(),
+            "anthropic" | "anthropic_messages" | "anthropic-messages"
+        ),
+        (AppType::Codex | AppType::GrokBuild, Some(Value::String(format))) => {
+            is_responses_protocol(format)
+        }
+        _ => false,
+    };
+    if !format_is_direct {
+        return false;
+    }
+    if *app == AppType::Claude {
+        return !provider
+            .settings
+            .get("openrouterCompatMode")
+            .or_else(|| provider.settings.get("openrouter_compat_mode"))
+            .is_some_and(compatibility_flag_enabled);
+    }
+    config_uses_responses(app, &provider.settings)
+}
+
+fn config_uses_responses(app: &AppType, settings: &Map<String, Value>) -> bool {
+    let Some(config) = settings.get("config").and_then(Value::as_str) else {
+        return true;
+    };
+    let Ok(document) = config.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    let protocol = if *app == AppType::GrokBuild {
+        document
+            .get("models")
+            .and_then(|models| models.get("default"))
+            .and_then(toml_edit::Item::as_str)
+            .and_then(|selected| document.get("model")?.get(selected))
+            .and_then(|model| model.get("api_backend"))
+            .and_then(toml_edit::Item::as_str)
+    } else {
+        None
+    }
+    .or_else(|| {
+        document
+            .get("model_provider")
+            .and_then(toml_edit::Item::as_str)
+            .and_then(|selected| document.get("model_providers")?.get(selected))
+            .and_then(|provider| provider.get("wire_api"))
+            .and_then(toml_edit::Item::as_str)
+    });
+    protocol.is_none_or(is_responses_protocol)
+}
+
+fn is_responses_protocol(protocol: &str) -> bool {
+    matches!(
+        protocol.trim(),
+        "responses" | "openai_responses" | "openai-responses"
+    )
+}
+
+fn compatibility_flag_enabled(value: &Value) -> bool {
+    match value {
+        Value::Bool(enabled) => *enabled,
+        Value::Number(number) => number.as_i64().is_some_and(|number| number != 0),
+        Value::String(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        ),
+        _ => false,
     }
 }
 
@@ -339,6 +452,7 @@ pub fn validate_name(name: &str) -> Result<String, String> {
     Ok(normalized.to_owned())
 }
 
+#[cfg(test)]
 pub fn validate_settings(
     descriptor: &AdapterDescriptor,
     settings: &Map<String, Value>,
@@ -368,6 +482,32 @@ pub fn validate_settings(
             .is_some_and(|value| !value.trim().is_empty());
         if !present {
             return Err(format!("Setting '{}' is required", field.label));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_simple_provider_values(
+    descriptor: &SimpleProviderFormDescriptor,
+    values: &SimpleProviderValues,
+) -> Result<(), String> {
+    for field in descriptor.fields {
+        let (label, value) = match field.key {
+            SimpleProviderField::BaseUrl => ("Base URL", values.base_url.as_str()),
+            SimpleProviderField::ApiKey => ("API key", values.api_key.as_str()),
+            SimpleProviderField::Model => ("Model", values.model.as_str()),
+        };
+        if value.len() > MAX_VALUE_BYTES {
+            return Err(format!("{label} is too large"));
+        }
+        if field.key == SimpleProviderField::BaseUrl
+            && !value.trim().is_empty()
+            && !is_safe_http_url(value.trim())
+        {
+            return Err(
+                "Base URL must be HTTPS (or loopback HTTP) without credentials, query, or fragment"
+                    .to_owned(),
+            );
         }
     }
     Ok(())
@@ -439,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn lite_keeps_full_version_native_categories_read_only() {
+    fn lite_rejects_full_version_only_provider_modes() {
         let native_provider = |app: AppType| ProviderRecord {
             id: "provider".to_owned(),
             revision: 1,
@@ -468,7 +608,8 @@ mod tests {
 
         let mut aggregator = native_provider(AppType::Claude);
         aggregator.category = Some("aggregator".to_owned());
-        assert!(!is_lite_writable(&aggregator));
+        aggregator.metadata = json!({"apiFormat": "anthropic"});
+        assert!(is_lite_writable(&aggregator));
 
         for provider_type in ["github_copilot", "codex_oauth", "xai_oauth"] {
             let mut managed = native_provider(AppType::Claude);
@@ -496,6 +637,59 @@ mod tests {
             .settings
             .insert("baseUrl".to_owned(), json!("https://api.githubcopilot.com"));
         assert!(!is_lite_writable(&legacy_form_managed));
+
+        for metadata in [
+            json!({"apiFormat": "openai_chat"}),
+            json!({"apiFormat": "openai_responses"}),
+            json!({"apiFormat": "gemini_native"}),
+            json!({"isFullUrl": true}),
+        ] {
+            let mut routed = native_provider(AppType::Claude);
+            routed.metadata = metadata;
+            assert!(!is_lite_writable(&routed));
+        }
+        let mut legacy_routed = native_provider(AppType::Claude);
+        legacy_routed
+            .settings
+            .insert("openrouter_compat_mode".to_owned(), json!(true));
+        assert!(!is_lite_writable(&legacy_routed));
+
+        let mut direct = native_provider(AppType::Claude);
+        direct.metadata = json!({"apiFormat": "anthropic"});
+        assert!(is_lite_writable(&direct));
+
+        for app in [AppType::Codex, AppType::GrokBuild] {
+            let mut routed = native_provider(app.clone());
+            routed.metadata = json!({"apiFormat": "openai_chat"});
+            assert!(!is_lite_writable(&routed));
+
+            let mut direct = native_provider(app);
+            direct.metadata = json!({"apiFormat": "openai_responses"});
+            assert!(is_lite_writable(&direct));
+        }
+        let mut codex_chat = native_provider(AppType::Codex);
+        codex_chat.settings.insert(
+            "config".to_owned(),
+            json!(
+                r#"model_provider = "custom"
+[model_providers.custom]
+wire_api = "chat"
+"#
+            ),
+        );
+        assert!(!is_lite_writable(&codex_chat));
+        let mut grok_chat = native_provider(AppType::GrokBuild);
+        grok_chat.settings.insert(
+            "config".to_owned(),
+            json!(
+                r#"[models]
+default = "custom"
+[model.custom]
+api_backend = "anthropic"
+"#
+            ),
+        );
+        assert!(!is_lite_writable(&grok_chat));
 
         assert!(is_lite_writable(&native_provider(AppType::Pi)));
     }
@@ -572,6 +766,28 @@ mod tests {
                 "apiKey": "secret",
                 "baseUrl": "https://user:password@proxy.example.com"
             }))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn simple_validation_accepts_only_safe_bounded_endpoints() {
+        let descriptor = cc_switch_core::simple_provider_form(&AppType::Claude);
+        let values = |base_url: &str| SimpleProviderValues::new(base_url, "secret", "");
+
+        assert!(
+            validate_simple_provider_values(descriptor, &values("https://example.com/v1")).is_ok()
+        );
+        assert!(
+            validate_simple_provider_values(descriptor, &values("http://localhost:8080/v1"))
+                .is_ok()
+        );
+        assert!(
+            validate_simple_provider_values(descriptor, &values("http://example.com/v1")).is_err()
+        );
+        assert!(validate_simple_provider_values(
+            descriptor,
+            &SimpleProviderValues::new("", "x".repeat(MAX_VALUE_BYTES + 1), ""),
         )
         .is_err());
     }

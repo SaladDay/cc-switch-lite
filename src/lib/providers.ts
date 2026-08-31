@@ -4,20 +4,27 @@ import type {
   CurrentProvider,
   AdapterDescriptor,
   CommandError,
-  ProviderDraft,
   ProviderRecord,
-  ProviderUpdate,
+  SimpleProviderDraft,
+  SimpleProviderFormDescriptor,
+  SimpleProviderUpdate,
 } from "./provider-types";
 
 export const providersApi = {
   supportedApps: () => invoke<unknown>("supported_apps"),
+  listSimpleForms: () =>
+    invoke<SimpleProviderFormDescriptor[]>("list_simple_provider_forms"),
   listAdapters: () => invoke<AdapterDescriptor[]>("list_provider_adapters"),
   list: (appId: string) =>
     invoke<ProviderRecord[]>("list_providers", { appId }),
-  create: (provider: ProviderDraft) =>
-    invoke<ProviderRecord>("create_provider", { provider }),
-  update: (appId: string, id: string, provider: ProviderUpdate) =>
-    invoke<ProviderRecord>("update_provider", { appId, id, provider }),
+  createSimple: (provider: SimpleProviderDraft) =>
+    invoke<ProviderRecord>("create_simple_provider", { provider }),
+  updateSimple: (appId: string, id: string, provider: SimpleProviderUpdate) =>
+    invoke<ProviderRecord>("update_simple_provider", {
+      appId,
+      id,
+      provider,
+    }),
   delete: (appId: string, id: string, expectedRevision: number) =>
     invoke<void>("delete_provider", { appId, id, expectedRevision }),
   importNative: (appId: string) =>

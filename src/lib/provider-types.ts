@@ -28,6 +28,8 @@ export interface ProviderRecord {
   name: string;
   settings: Record<string, JsonValue>;
   liteConfigWritable?: boolean;
+  liteSimpleEditable?: boolean;
+  simpleValues?: SimpleProviderValues;
 }
 
 export interface CurrentProvider {
@@ -53,23 +55,58 @@ export interface AdapterDescriptor {
   fields: FormField[];
 }
 
-export interface ProviderDraft {
-  appId: string;
-  adapter: AdapterReference;
+export type SimpleProviderField = "baseUrl" | "apiKey" | "model";
+
+export interface SimpleProviderFieldDescriptor {
+  key: SimpleProviderField;
+  required: boolean;
+}
+
+export type SimpleProviderProtocol =
+  | "anthropic-messages"
+  | "openai-responses"
+  | "google-generative-ai"
+  | "openai-completions"
+  | "openai-chat-completions";
+
+export interface SimpleProviderPreset {
+  id: string;
   name: string;
-  settings: Record<string, JsonValue>;
+  websiteUrl: string;
+  brandKey: string;
+  baseUrl: string;
+  model: string;
+}
+
+export interface SimpleProviderFormDescriptor {
+  appId: string;
+  defaultProtocol: SimpleProviderProtocol;
+  protocolLocked: boolean;
+  fields: SimpleProviderFieldDescriptor[];
+  presets: SimpleProviderPreset[];
+}
+
+export interface SimpleProviderValues {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
 }
 
 export interface ProviderChanges {
   name: string;
-  settings: Record<string, JsonValue>;
-  adapter?: AdapterReference;
+  values: SimpleProviderValues;
 }
 
-export interface ProviderUpdate {
+export interface SimpleProviderDraft {
+  appId: string;
+  name: string;
+  values: SimpleProviderValues;
+}
+
+export interface SimpleProviderUpdate {
   expectedRevision: number;
   name: string;
-  settings: Record<string, JsonValue>;
+  values: SimpleProviderValues;
 }
 
 export function isNativeAdapter(reference: AdapterReference): boolean {

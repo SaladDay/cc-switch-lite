@@ -2,20 +2,19 @@ import { useState, type FormEvent } from "react";
 import { LoaderCircle, Plus, Save } from "lucide-react";
 
 import type {
-  AdapterDescriptor,
-  JsonValue,
   ProviderChanges,
   ProviderRecord,
+  SimpleProviderField,
+  SimpleProviderFormDescriptor,
+  SimpleProviderValues,
 } from "../lib/provider-types";
-import { isNativeAdapter } from "../lib/provider-types";
-import { nativeSettingsTemplate } from "../lib/apps";
 import { FullScreenPanel } from "./FullScreenPanel";
+import { SimpleProviderPresetSelector } from "./providers/SimpleProviderPresetSelector";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
-import { Textarea } from "./ui/textarea";
 
 interface ProviderDialogProps {
-  adapters: AdapterDescriptor[];
+  form: SimpleProviderFormDescriptor;
   provider?: ProviderRecord;
   busy: boolean;
   error: string | null;
@@ -23,70 +22,58 @@ interface ProviderDialogProps {
   onSave: (provider: ProviderChanges) => void;
 }
 
-function initialSettings(
-  adapter: AdapterDescriptor,
-  provider?: ProviderRecord,
-): ProviderChanges["settings"] {
-  const settings = { ...(provider?.settings ?? {}) };
-  for (const field of adapter.fields) {
-    if (typeof settings[field.key] !== "string") settings[field.key] = "";
-  }
-  return settings;
+const EMPTY_VALUES: SimpleProviderValues = {
+  baseUrl: "",
+  apiKey: "",
+  model: "",
+};
+
+const FIELD_COPY: Record<
+  SimpleProviderField,
+  { label: string; placeholder: string; help: string; type: string }
+> = {
+  baseUrl: {
+    label: "Base URL",
+    placeholder: "https://api.example.com/v1",
+    help: "The provider endpoint used by this application.",
+    type: "url",
+  },
+  apiKey: {
+    label: "API key",
+    placeholder: "sk-…",
+    help: "Stored in the shared CC Switch database and written only when activated.",
+    type: "password",
+  },
+  model: {
+    label: "Model",
+    placeholder: "Model ID",
+    help: "The model ID sent to the provider.",
+    type: "text",
+  },
+};
+
+function initialValues(provider?: ProviderRecord): SimpleProviderValues {
+  return provider?.simpleValues
+    ? { ...provider.simpleValues }
+    : { ...EMPTY_VALUES };
 }
 
 export function ProviderDialog({
-  adapters,
+  form,
   provider,
   busy,
   error,
   onCancel,
   onSave,
 }: ProviderDialogProps) {
-  const [selectedIndex, setSelectedIndex] = useState(0);
-  const adapter = adapters[selectedIndex];
   const [name, setName] = useState(provider?.name ?? "");
-  const [settings, setSettings] = useState(() =>
-    initialSettings(adapter, provider),
-  );
-  const [nativeSettings, setNativeSettings] = useState(() =>
-    JSON.stringify(
-      provider?.settings ?? nativeSettingsTemplate(adapter.appId),
-      null,
-      2,
-    ),
-  );
-  const [nativeSettingsError, setNativeSettingsError] = useState<string | null>(
-    null,
-  );
+  const [values, setValues] = useState(() => initialValues(provider));
+  const [selectedPresetId, setSelectedPresetId] = useState("custom");
   const title = provider ? "Edit provider" : "Add provider";
-  const native = isNativeAdapter(adapter.reference);
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    let nextSettings = settings;
-    if (native) {
-      try {
-        const parsed: JsonValue = JSON.parse(nativeSettings);
-        if (
-          typeof parsed !== "object" ||
-          parsed === null ||
-          Array.isArray(parsed)
-        ) {
-          setNativeSettingsError("Configuration must be a JSON object.");
-          return;
-        }
-        nextSettings = parsed;
-        setNativeSettingsError(null);
-      } catch {
-        setNativeSettingsError("Configuration must be valid JSON.");
-        return;
-      }
-    }
-    onSave({
-      name,
-      settings: nextSettings,
-      adapter: provider ? undefined : adapter.reference,
-    });
+    onSave({ name, values });
   };
 
   return (
@@ -94,9 +81,9 @@ export function ProviderDialog({
       title={title}
       titleId="provider-dialog-title"
       description={
-        native
-          ? "Edit the same provider configuration object used by full CC Switch."
-          : `${adapter.displayName}. Credentials remain in CC Switch Lite until this provider is activated.`
+        form.protocolLocked
+          ? "Simple direct configuration · Anthropic Messages"
+          : "Simple direct provider configuration"
       }
       closeLabel="Close provider dialog"
       busy={busy}
@@ -130,37 +117,20 @@ export function ProviderDialog({
         onSubmit={submit}
         className="glass space-y-6 rounded-xl border border-white/10 p-6"
       >
-        {!provider && adapters.length > 1 && (
-          <label className="block space-y-2 text-sm font-medium">
-            <span>Adapter</span>
-            <select
-              value={selectedIndex}
-              onChange={(event) => {
-                const index = Number(event.target.value);
-                setSelectedIndex(index);
-                setSettings(initialSettings(adapters[index]));
-                setNativeSettings(
-                  JSON.stringify(
-                    nativeSettingsTemplate(adapters[index].appId),
-                    null,
-                    2,
-                  ),
-                );
-                setNativeSettingsError(null);
-              }}
-              className="flex h-9 w-full rounded-md border border-border-default bg-background px-3 py-1 text-sm text-foreground shadow-sm outline-none transition-colors focus:ring-2 focus:ring-blue-500/20 dark:focus:ring-blue-400/20"
-            >
-              {adapters.map((candidate, index) => (
-                <option
-                  key={`${candidate.reference.pluginId}:${candidate.reference.pluginVersion}:${candidate.reference.adapterId}`}
-                  value={index}
-                >
-                  {candidate.displayName}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
+        <SimpleProviderPresetSelector
+          presets={form.presets}
+          selectedId={selectedPresetId}
+          onSelect={(preset) => {
+            setSelectedPresetId(preset?.id ?? "custom");
+            if (!preset) return;
+            setName(preset.name);
+            setValues((current) => ({
+              baseUrl: preset.baseUrl,
+              apiKey: current.apiKey,
+              model: preset.model,
+            }));
+          }}
+        />
 
         <label className="block space-y-2 text-sm font-medium">
           <span>Provider name</span>
@@ -174,15 +144,22 @@ export function ProviderDialog({
           />
         </label>
 
-        {adapter.fields.map((field) => {
+        {form.fields.map((field) => {
+          const copy = FIELD_COPY[field.key];
           const inputId = `provider-setting-${field.key}`;
           const helpId = `${inputId}-help`;
-          const fieldValue = settings[field.key];
+          const keepsExistingEnvironmentCredential =
+            provider !== undefined &&
+            form.appId === "grokbuild" &&
+            field.key === "apiKey" &&
+            provider.simpleValues?.apiKey.trim() === "";
+          const required =
+            field.required && !keepsExistingEnvironmentCredential;
           return (
             <div key={field.key} className="space-y-2">
               <label htmlFor={inputId} className="block text-sm font-medium">
-                {field.label}
-                {!field.required && (
+                {copy.label}
+                {!required && (
                   <span className="ml-1 font-normal text-muted-foreground">
                     Optional
                   </span>
@@ -191,70 +168,28 @@ export function ProviderDialog({
               <Input
                 id={inputId}
                 aria-describedby={helpId}
-                required={field.required}
-                type={
-                  field.kind === "secret"
-                    ? "password"
-                    : field.kind === "url"
-                      ? "url"
-                      : "text"
-                }
-                value={typeof fieldValue === "string" ? fieldValue : ""}
+                required={required}
+                type={copy.type}
+                value={values[field.key]}
                 onChange={(event) =>
-                  setSettings((current) => ({
+                  setValues((current) => ({
                     ...current,
                     [field.key]: event.target.value,
                   }))
                 }
-                placeholder={field.placeholder}
+                placeholder={copy.placeholder}
               />
               <p
                 id={helpId}
                 className="text-xs font-normal leading-5 text-muted-foreground"
               >
-                {field.help}
+                {keepsExistingEnvironmentCredential
+                  ? "Leave blank to keep the existing environment credential."
+                  : copy.help}
               </p>
             </div>
           );
         })}
-
-        {native && (
-          <div className="space-y-2">
-            <label
-              htmlFor="native-settings"
-              className="block text-sm font-medium"
-            >
-              Configuration JSON
-            </label>
-            <Textarea
-              id="native-settings"
-              required
-              value={nativeSettings}
-              onChange={(event) => {
-                setNativeSettings(event.target.value);
-                setNativeSettingsError(null);
-              }}
-              className="min-h-64 font-mono text-xs leading-5"
-              aria-describedby="native-settings-help"
-              aria-invalid={nativeSettingsError !== null}
-            />
-            <p
-              id="native-settings-help"
-              className="text-xs font-normal leading-5 text-muted-foreground"
-            >
-              This is the provider fragment written by the selected application.
-              Unknown keys are preserved.
-            </p>
-            {nativeSettingsError && (
-              <p
-                role="alert"
-                className="text-sm text-red-600 dark:text-red-300"
-              >
-                {nativeSettingsError}
-              </p>
-            )}
-          </div>
-        )}
 
         {error && (
           <p

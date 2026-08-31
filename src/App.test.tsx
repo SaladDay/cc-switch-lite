@@ -1,10 +1,4 @@
-import {
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-  within,
-} from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -15,14 +9,16 @@ import type {
   CoreAppDescriptor,
   CurrentProvider,
   ProviderRecord,
+  SimpleProviderFormDescriptor,
 } from "./lib/provider-types";
 
 const api = vi.hoisted(() => ({
   supportedApps: vi.fn(),
   listAdapters: vi.fn(),
+  listSimpleForms: vi.fn(),
   list: vi.fn(),
-  create: vi.fn(),
-  update: vi.fn(),
+  createSimple: vi.fn(),
+  updateSimple: vi.fn(),
   delete: vi.fn(),
   importNative: vi.fn(),
   switch: vi.fn(),
@@ -95,6 +91,13 @@ const workProvider: ProviderRecord = {
   adapter: adapters[0].reference,
   name: "Work",
   settings: { apiKey: "secret", baseUrl: "https://proxy.example.com" },
+  simpleValues: {
+    apiKey: "secret",
+    baseUrl: "https://proxy.example.com",
+    model: "",
+  },
+  liteConfigWritable: true,
+  liteSimpleEditable: true,
 };
 
 function deferred<T>() {
@@ -157,25 +160,68 @@ function coreApps(appIds: AppId[]): CoreAppDescriptor[] {
   });
 }
 
+function simpleForms(appIds: AppId[]): SimpleProviderFormDescriptor[] {
+  return appIds.map((appId) => ({
+    appId,
+    defaultProtocol:
+      appId === "claude" || appId === "claude-desktop"
+        ? "anthropic-messages"
+        : "openai-completions",
+    protocolLocked: appId === "claude",
+    fields: [
+      { key: "baseUrl", required: appId !== "claude" },
+      { key: "apiKey", required: true },
+      ...(appId === "claude-desktop"
+        ? []
+        : [{ key: "model" as const, required: false }]),
+    ],
+    presets:
+      appId === "claude"
+        ? [
+            {
+              id: "kimi",
+              name: "Kimi",
+              websiteUrl: "https://platform.moonshot.cn",
+              brandKey: "kimi",
+              baseUrl: "https://api.moonshot.cn/anthropic",
+              model: "kimi-k2.5",
+            },
+          ]
+        : [
+            {
+              id: "example",
+              name: "Example",
+              websiteUrl: "https://example.com",
+              brandKey: "example",
+              baseUrl: "https://api.example.com",
+              model: "example-model",
+            },
+          ],
+  }));
+}
+
 describe("App", () => {
   beforeEach(() => {
     window.localStorage.clear();
     document.documentElement.className = "";
     for (const mock of Object.values(api)) mock.mockReset();
-    api.listAdapters.mockResolvedValue(adapters);
-    api.supportedApps.mockResolvedValue(
-      coreApps([
-        "claude",
-        "claude-desktop",
-        "codex",
-        "gemini",
-        "grokbuild",
-        "opencode",
-        "openclaw",
-        "hermes",
-        "pi",
-      ]),
-    );
+    const appIds = [
+      "claude",
+      "claude-desktop",
+      "codex",
+      "gemini",
+      "grokbuild",
+      "opencode",
+      "openclaw",
+      "hermes",
+      "pi",
+    ];
+    api.listAdapters.mockResolvedValue([
+      ...appIds.map(nativeAdapter),
+      ...adapters,
+    ]);
+    api.listSimpleForms.mockResolvedValue(simpleForms(appIds));
+    api.supportedApps.mockResolvedValue(coreApps(appIds));
     api.list.mockResolvedValue([]);
     api.delete.mockResolvedValue(undefined);
     api.importNative.mockResolvedValue([]);
@@ -535,9 +581,9 @@ describe("App", () => {
     expect(screen.queryByRole("heading", { name: "Work" })).toBeNull();
   });
 
-  it("creates a provider from the adapter-driven form", async () => {
+  it("creates a provider from the core-backed simple form", async () => {
     const user = userEvent.setup();
-    api.create.mockResolvedValue(workProvider);
+    api.createSimple.mockResolvedValue(workProvider);
     render(<App />);
 
     await user.click(
@@ -551,17 +597,16 @@ describe("App", () => {
     );
 
     await waitFor(() =>
-      expect(api.create).toHaveBeenCalledWith({
+      expect(api.createSimple).toHaveBeenCalledWith({
         appId: "claude",
-        adapter: adapters[0].reference,
         name: "Work",
-        settings: { apiKey: "secret", baseUrl: "" },
+        values: { apiKey: "secret", baseUrl: "", model: "" },
       }),
     );
     expect(screen.getByRole("heading", { name: "Work" })).toBeVisible();
   });
 
-  it("offers full native configuration alongside the Claude simple form", async () => {
+  it("keeps Claude on one simple Anthropic Messages form", async () => {
     const user = userEvent.setup();
     const native = nativeAdapter("claude");
     api.listAdapters.mockResolvedValue([native, ...adapters]);
@@ -570,18 +615,85 @@ describe("App", () => {
     await user.click(
       await screen.findByRole("button", { name: "Add Claude Code provider" }),
     );
-    const adapterSelect = screen.getByLabelText("Adapter");
-    expect(adapterSelect).toHaveValue("0");
-    expect(screen.getByLabelText("Configuration JSON")).toBeVisible();
-
-    await user.selectOptions(adapterSelect, "1");
+    expect(screen.getByText("Provider preset")).toBeVisible();
     expect(screen.getByLabelText("API key")).toBeVisible();
+    expect(screen.getByText(/Anthropic Messages/)).toBeVisible();
+    expect(screen.queryByLabelText("Adapter")).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Configuration JSON"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("fills public preset values without replacing an entered API key", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Add Claude Code provider" }),
+    );
+    const dialog = screen.getByRole("dialog", { name: "Add provider" });
+    await user.type(within(dialog).getByLabelText("API key"), "private-key");
+    await user.click(within(dialog).getByRole("button", { name: "Kimi" }));
+
+    expect(within(dialog).getByLabelText("Provider name")).toHaveValue("Kimi");
+    expect(within(dialog).getByLabelText(/Base URL/)).toHaveValue(
+      "https://api.moonshot.cn/anthropic",
+    );
+    expect(within(dialog).getByLabelText("API key")).toHaveValue("private-key");
+    expect(within(dialog).queryByLabelText(/Protocol/)).not.toBeInTheDocument();
+  });
+
+  it("keeps an existing Grok environment credential when the API key is empty", async () => {
+    const user = userEvent.setup();
+    const native = nativeAdapter("grokbuild");
+    const provider: ProviderRecord = {
+      ...workProvider,
+      id: "grok-env",
+      appId: "grokbuild",
+      adapter: native.reference,
+      name: "Grok environment",
+      settings: { config: 'env_key = "XAI_API_KEY"' },
+      simpleValues: {
+        baseUrl: "https://api.x.ai/v1",
+        apiKey: "",
+        model: "grok-4",
+      },
+    };
+    api.supportedApps.mockResolvedValue(coreApps(["grokbuild"]));
+    api.listAdapters.mockResolvedValue([native]);
+    api.list.mockResolvedValue([provider]);
+    api.updateSimple.mockResolvedValue({ ...provider, revision: 2 });
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Edit Grok environment" }),
+    );
+    const dialog = screen.getByRole("dialog", { name: "Edit provider" });
+    expect(within(dialog).getByLabelText(/^API key/)).not.toBeRequired();
+    expect(
+      within(dialog).getByText(/keep the existing environment credential/i),
+    ).toBeVisible();
+    await user.click(
+      within(dialog).getByRole("button", { name: "Save provider" }),
+    );
+
+    await waitFor(() =>
+      expect(api.updateSimple).toHaveBeenCalledWith("grokbuild", "grok-env", {
+        expectedRevision: 1,
+        name: "Grok environment",
+        values: {
+          baseUrl: "https://api.x.ai/v1",
+          apiKey: "",
+          model: "grok-4",
+        },
+      }),
+    );
   });
 
   it("edits and deletes a stored provider without switching live config", async () => {
     const user = userEvent.setup();
     api.list.mockResolvedValue([workProvider]);
-    api.update.mockResolvedValue({
+    api.updateSimple.mockResolvedValue({
       ...workProvider,
       revision: 2,
       name: "Primary",
@@ -602,12 +714,13 @@ describe("App", () => {
     expect(
       await screen.findByRole("heading", { name: "Primary" }),
     ).toBeVisible();
-    expect(api.update).toHaveBeenCalledWith("claude", "provider-1", {
+    expect(api.updateSimple).toHaveBeenCalledWith("claude", "provider-1", {
       expectedRevision: 1,
       name: "Primary",
-      settings: {
+      values: {
         apiKey: "secret",
         baseUrl: "https://proxy.example.com",
+        model: "",
       },
     });
 
@@ -637,6 +750,41 @@ describe("App", () => {
         screen.getByRole("button", { name: "Add Claude Code provider" }),
       ).toHaveFocus(),
     );
+  });
+
+  it("offers reactivation after editing the current provider", async () => {
+    const user = userEvent.setup();
+    let active = true;
+    api.list.mockResolvedValue([workProvider]);
+    api.currentProviders.mockImplementation(() =>
+      Promise.resolve(active ? [current(workProvider)] : []),
+    );
+    api.updateSimple.mockImplementation(() => {
+      active = false;
+      return Promise.resolve({
+        ...workProvider,
+        revision: 2,
+        name: "Primary",
+      });
+    });
+    render(<App />);
+
+    expect(
+      await screen.findByRole("button", {
+        name: "Work is the Claude Code user default",
+      }),
+    ).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Edit Work" }));
+    const dialog = screen.getByRole("dialog", { name: "Edit provider" });
+    await user.clear(within(dialog).getByLabelText("Provider name"));
+    await user.type(within(dialog).getByLabelText("Provider name"), "Primary");
+    await user.click(
+      within(dialog).getByRole("button", { name: "Save provider" }),
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "Switch to Primary" }),
+    ).toBeEnabled();
   });
 
   it("imports the current live provider through the host", async () => {
@@ -820,8 +968,14 @@ describe("App", () => {
     const native = nativeAdapter("gemini");
     api.supportedApps.mockResolvedValue(coreApps(["gemini"]));
     api.listAdapters.mockResolvedValue([native]);
-    api.create.mockImplementation((draft) =>
-      Promise.resolve({ ...draft, id: "gemini-new", revision: 1 }),
+    api.createSimple.mockImplementation((draft) =>
+      Promise.resolve({
+        ...workProvider,
+        id: "gemini-new",
+        appId: draft.appId,
+        name: draft.name,
+        simpleValues: draft.values,
+      }),
     );
     render(<App />);
 
@@ -829,24 +983,22 @@ describe("App", () => {
       await screen.findByRole("button", { name: "Add Gemini CLI provider" }),
     );
     await user.type(screen.getByLabelText("Provider name"), "Gemini Work");
-    fireEvent.change(screen.getByLabelText("Configuration JSON"), {
-      target: {
-        value: JSON.stringify({
-          env: { GEMINI_API_KEY: "secret" },
-          config: { model: { name: "gemini-test" } },
-        }),
-      },
-    });
+    await user.type(
+      screen.getByLabelText("Base URL"),
+      "https://gemini.example.com",
+    );
+    await user.type(screen.getByLabelText("API key"), "secret");
+    await user.type(screen.getByLabelText(/Model/), "gemini-test");
     await user.click(screen.getByRole("button", { name: "Save provider" }));
 
     await waitFor(() =>
-      expect(api.create).toHaveBeenCalledWith({
+      expect(api.createSimple).toHaveBeenCalledWith({
         appId: "gemini",
-        adapter: native.reference,
         name: "Gemini Work",
-        settings: {
-          env: { GEMINI_API_KEY: "secret" },
-          config: { model: { name: "gemini-test" } },
+        values: {
+          baseUrl: "https://gemini.example.com",
+          apiKey: "secret",
+          model: "gemini-test",
         },
       }),
     );
@@ -973,7 +1125,7 @@ describe("App", () => {
     });
     expect(providerDialog).toHaveAttribute("aria-modal", "true");
     expect(providerDialog).toHaveAccessibleDescription(
-      /Claude API\. Credentials remain in CC Switch Lite/,
+      /Simple direct configuration · Anthropic Messages/,
     );
     expect(document.querySelector("header")).toHaveAttribute("inert");
     expect(document.querySelector("main")).toHaveAttribute(

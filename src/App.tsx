@@ -36,6 +36,7 @@ import type {
   JsonValue,
   ProviderChanges,
   ProviderRecord,
+  SimpleProviderFormDescriptor,
 } from "./lib/provider-types";
 import { isNativeAdapter, sameAdapterIdentity } from "./lib/provider-types";
 import { errorMessage, providersApi } from "./lib/providers";
@@ -138,10 +139,14 @@ export default function App() {
   const [appCatalog, setAppCatalog] = useState<CoreAppDescriptor[]>([]);
   const [catalogReady, setCatalogReady] = useState(false);
   const [adapters, setAdapters] = useState<AdapterDescriptor[]>([]);
+  const [simpleForms, setSimpleForms] = useState<
+    SimpleProviderFormDescriptor[]
+  >([]);
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [adapterError, setAdapterError] = useState<string | null>(null);
+  const [simpleFormError, setSimpleFormError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [currentError, setCurrentError] = useState<string | null>(null);
   const [editing, setEditing] = useState<ProviderRecord | "new" | null>(null);
@@ -182,14 +187,8 @@ export default function App() {
   const nativeLiveAdapter = activeAdapters.find((item) =>
     isNativeAdapter(item.reference),
   );
-  const nativeCreationAdapters = activeAdapters.filter((item) =>
-    isNativeAdapter(item.reference),
-  );
-  const formCreationAdapters = activeAdapters.filter(
-    (item) => !isNativeAdapter(item.reference),
-  );
-  const creationAdapters = [...nativeCreationAdapters, ...formCreationAdapters];
-  const adapter = creationAdapters[0];
+  const adapter = nativeLiveAdapter;
+  const simpleForm = simpleForms.find((form) => form.appId === activeApp);
   const supportsMcp = supportsFeature(appCatalog, activeApp, "mcp");
   const supportsSkills = supportsFeature(appCatalog, activeApp, "skills");
   const editingAdapter =
@@ -197,6 +196,12 @@ export default function App() {
       ? adapter
       : editing
         ? adapters.find((item) => adapterMatchesProvider(item, editing))
+        : undefined;
+  const editingForm =
+    editing === "new"
+      ? simpleForm
+      : editing
+        ? simpleForms.find((form) => form.appId === editing.appId)
         : undefined;
   const contentTopOffset = DRAG_BAR_HEIGHT + HEADER_HEIGHT;
   const addActionButtonClass =
@@ -285,6 +290,17 @@ export default function App() {
       })
       .catch((error: unknown) => {
         if (!ignore) setAdapterError(errorMessage(error));
+      });
+    providersApi
+      .listSimpleForms()
+      .then((items) => {
+        if (!ignore) {
+          setSimpleForms(items);
+          setSimpleFormError(null);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!ignore) setSimpleFormError(errorMessage(error));
       });
     return () => {
       ignore = true;
@@ -405,20 +421,17 @@ export default function App() {
     setMutationError(null);
     try {
       if (editing === "new") {
-        const selectedAdapter = update.adapter ?? adapter?.reference;
-        if (!selectedAdapter) return;
-        const created = await providersApi.create({
+        const created = await providersApi.createSimple({
           appId: activeApp,
-          adapter: selectedAdapter,
           name: update.name,
-          settings: update.settings,
+          values: update.values,
         });
         setProviders((current) => [...current, created]);
       } else {
-        const updated = await providersApi.update(activeApp, editing.id, {
+        const updated = await providersApi.updateSimple(activeApp, editing.id, {
           expectedRevision: editing.revision,
           name: update.name,
-          settings: update.settings,
+          values: update.values,
         });
         setProviders((current) =>
           current.map((provider) =>
@@ -551,7 +564,10 @@ export default function App() {
       provider,
       adapterAvailable: providerAdapter !== undefined,
       canEdit:
-        providerActionsReady && providerAdapter !== undefined && !readOnly,
+        providerActionsReady &&
+        providerAdapter !== undefined &&
+        !readOnly &&
+        provider.liteSimpleEditable === true,
       canSwitch:
         liveActionsReady &&
         providerAdapter !== undefined &&
@@ -690,6 +706,7 @@ export default function App() {
                       disabled={
                         !providerActionsReady ||
                         !adapter ||
+                        !simpleForm ||
                         loading ||
                         mutationBusy ||
                         liveBusy !== null
@@ -715,6 +732,7 @@ export default function App() {
               <div className="space-y-4">
                 {(catalogError ||
                   adapterError ||
+                  simpleFormError ||
                   liveError ||
                   loadError ||
                   currentError) && (
@@ -724,6 +742,7 @@ export default function App() {
                   >
                     {catalogError ||
                       adapterError ||
+                      simpleFormError ||
                       liveError ||
                       loadError ||
                       currentError}
@@ -752,6 +771,7 @@ export default function App() {
                   disabled={
                     !providerActionsReady ||
                     !adapter ||
+                    !simpleForm ||
                     mutationBusy ||
                     liveBusy !== null
                   }
@@ -803,10 +823,10 @@ export default function App() {
         )}
       </main>
 
-      {editing && editingAdapter && (
+      {editing && editingAdapter && editingForm && (
         <ProviderDialog
           key={editing === "new" ? `${activeApp}-new` : editing.id}
-          adapters={editing === "new" ? creationAdapters : [editingAdapter]}
+          form={editingForm}
           provider={editing === "new" ? undefined : editing}
           busy={mutationBusy}
           error={mutationError}
