@@ -97,10 +97,6 @@ impl NativeLiveConfig {
         }
     }
 
-    pub fn paths(&self) -> LivePaths {
-        self.paths.clone()
-    }
-
     fn resolved_for_targets(&self, targets: &[LogicalTarget]) -> Result<Self, LiveError> {
         let mut paths = self.paths.clone();
         for target in targets {

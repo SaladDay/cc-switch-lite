@@ -2,21 +2,31 @@ import type { CSSProperties } from "react";
 import { Monitor, Terminal } from "lucide-react";
 
 import { appDefinition } from "../lib/apps";
-import type { AppId } from "../lib/provider-types";
+import type { AppId, CoreAppDescriptor } from "../lib/provider-types";
 import { cn } from "../lib/utils";
 import { ProviderIcon } from "./ProviderIcon";
 
 interface AppSwitcherProps {
   activeApp: AppId;
-  apps: AppId[];
+  apps: CoreAppDescriptor[];
   disabled?: boolean;
   onSwitch: (app: AppId) => void;
 }
 
-function AppGlyph({ app, isActive }: { app: AppId; isActive: boolean }) {
-  const definition = appDefinition(app);
+function AppGlyph({
+  app,
+  isActive,
+}: {
+  app: CoreAppDescriptor;
+  isActive: boolean;
+}) {
+  const definition = appDefinition(app.id, [app]);
   const BadgeIcon =
-    app === "claude" ? Terminal : app === "claude-desktop" ? Monitor : null;
+    app.id === "claude"
+      ? Terminal
+      : app.id === "claude-desktop"
+        ? Monitor
+        : null;
   return (
     <span className="relative inline-flex shrink-0">
       <ProviderIcon icon={definition.icon} name={definition.label} size={20} />
@@ -51,15 +61,15 @@ export function AppSwitcher({
       style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
     >
       {apps.map((app) => {
-        const isActive = activeApp === app;
-        const label = appDefinition(app).label;
+        const isActive = activeApp === app.id;
+        const label = appDefinition(app.id, [app]).label;
         return (
           <button
-            key={app}
+            key={app.id}
             type="button"
             disabled={disabled}
             onClick={() => {
-              if (!isActive) onSwitch(app);
+              if (!isActive) onSwitch(app.id);
             }}
             title={label}
             aria-label={label}

@@ -15,18 +15,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.4.0", features = [] }
 
 [dependencies]
-base64 = "0.22"
-cc-switch-core = { git = "https://github.com/SaladDay/cc-switch-core", rev = "696199516081d85a09831c93115a23738f2d6ff4" }
-ed25519-dalek = { version = "2.2", default-features = false, features = ["fast", "std", "zeroize"] }
+cc-switch-core = { git = "https://github.com/SaladDay/cc-switch-core", rev = "1eaf8ebdaa57806af0017718abb110d48b2d8cf9" }
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
-futures-util = "0.3"
 hmac = "0.12"
 json5 = "0.4"
-json-five = "0.3.1"
 libc = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
-semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 serde_yaml = "0.9"
@@ -36,8 +30,6 @@ thiserror = "2.0"
 toml_edit = "0.25"
 url = "2.5"
 uuid = { version = "1.18", features = ["v4"] }
-wasmtime = { version = "=36.0.14", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
-zip = { version = "=4.6.1", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
 tempfile = "3.21"

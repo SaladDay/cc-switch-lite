@@ -1,42 +1,35 @@
 import {
   useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
   type CSSProperties,
 } from "react";
 import {
+  ArrowLeft,
   Check,
   Download,
   LoaderCircle,
   Plus,
-  Settings,
-  Store,
+  Wrench,
 } from "lucide-react";
 
 import { DeleteProviderDialog } from "./components/DeleteProviderDialog";
-import { ImportProviderDialog } from "./components/ImportProviderDialog";
-import { MarketplaceDialog } from "./components/MarketplaceDialog";
+import { McpIcon } from "./components/McpIcon";
 import { ProviderDialog } from "./components/ProviderDialog";
-import { SettingsPage } from "./components/SettingsPage";
 import { AppSwitcher } from "./components/AppSwitcher";
 import {
   ProviderList,
   type ProviderListItem,
 } from "./components/providers/ProviderList";
 import { Button } from "./components/ui/button";
-import { APPS, appDefinition, parseCoreAppCatalog } from "./lib/apps";
 import {
-  initialTheme,
-  initialVisibleApps,
-  THEME_STORAGE_KEY,
-  VISIBLE_APPS_STORAGE_KEY,
-  type Theme,
-} from "./lib/preferences";
+  appDefinition,
+  parseCoreAppCatalog,
+  supportsFeature,
+} from "./lib/apps";
 import type {
   AdapterDescriptor,
-  AdapterReference,
   AppId,
   CoreAppDescriptor,
   CurrentProvider,
@@ -48,12 +41,19 @@ import { isNativeAdapter, sameAdapterIdentity } from "./lib/provider-types";
 import { errorMessage, providersApi } from "./lib/providers";
 
 const APP_STORAGE_KEY = "cc-switch-lite:last-app";
+const VIEW_STORAGE_KEY = "cc-switch-lite:last-view";
 const DRAG_BAR_HEIGHT = 28;
 const HEADER_HEIGHT = 64;
+type View = "providers" | "mcp" | "skills";
 
 function initialApp(): AppId {
   const stored = window.localStorage.getItem(APP_STORAGE_KEY);
-  return APPS.some((app) => app.id === stored) ? (stored as AppId) : "claude";
+  return stored?.trim() || "claude";
+}
+
+function initialView(): View {
+  const stored = window.localStorage.getItem(VIEW_STORAGE_KEY);
+  return stored === "mcp" || stored === "skills" ? stored : "providers";
 }
 
 export function sameJsonValue(left: JsonValue, right: JsonValue): boolean {
@@ -134,10 +134,9 @@ function adapterMatchesProvider(
 
 export default function App() {
   const [activeApp, setActiveApp] = useState<AppId>(initialApp);
+  const [currentView, setCurrentView] = useState<View>(initialView);
   const [appCatalog, setAppCatalog] = useState<CoreAppDescriptor[]>([]);
   const [catalogReady, setCatalogReady] = useState(false);
-  const [theme, setTheme] = useState<Theme>(initialTheme);
-  const [visibleApps, setVisibleApps] = useState(initialVisibleApps);
   const [adapters, setAdapters] = useState<AdapterDescriptor[]>([]);
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -146,9 +145,6 @@ export default function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [currentError, setCurrentError] = useState<string | null>(null);
   const [editing, setEditing] = useState<ProviderRecord | "new" | null>(null);
-  const [marketplaceOpen, setMarketplaceOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [deleting, setDeleting] = useState<ProviderRecord | null>(null);
   const [mutationBusy, setMutationBusy] = useState(false);
   const [mutationError, setMutationError] = useState<string | null>(null);
@@ -163,17 +159,21 @@ export default function App() {
   activeAppRef.current = activeApp;
   const addProviderButtonRef = useRef<HTMLButtonElement>(null);
   const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
-  const definition = appDefinition(activeApp);
+  const definition = appDefinition(activeApp, appCatalog);
   const isClaude = activeApp === "claude";
-  const supportedApps = useMemo(
-    () => appCatalog.map((app) => app.id),
-    [appCatalog],
-  );
   const additive =
     appCatalog.find((app) => app.id === activeApp)?.configurationMode ===
     "additive";
   const providerActionsReady =
-    catalogReady && appCatalog.some((app) => app.id === activeApp);
+    catalogReady && supportsFeature(appCatalog, activeApp, "providers");
+  const liveActionsReady =
+    catalogReady && supportsFeature(appCatalog, activeApp, "liveConfiguration");
+  const providerListReady = providerActionsReady || liveActionsReady;
+  const currentStateReady = liveActionsReady || providerActionsReady;
+  const catalogReadyRef = useRef(catalogReady);
+  const providerListReadyRef = useRef(providerListReady);
+  catalogReadyRef.current = catalogReady;
+  providerListReadyRef.current = providerListReady;
   const currentLabel = "In Use";
   const importLabel = isClaude
     ? "Import Claude Code user configuration"
@@ -182,30 +182,16 @@ export default function App() {
   const nativeLiveAdapter = activeAdapters.find((item) =>
     isNativeAdapter(item.reference),
   );
-  const pluginLiveAdapters = activeAdapters.filter(
-    (item) => item.reference.pluginId !== "org.cc-switch.builtin",
-  );
-  const liveAdapters = nativeLiveAdapter
-    ? [nativeLiveAdapter, ...pluginLiveAdapters]
-    : activeAdapters;
   const nativeCreationAdapters = activeAdapters.filter((item) =>
     isNativeAdapter(item.reference),
   );
   const formCreationAdapters = activeAdapters.filter(
     (item) => !isNativeAdapter(item.reference),
   );
-  const creationAdapters =
-    activeApp === "claude" || activeApp === "codex"
-      ? [...formCreationAdapters, ...nativeCreationAdapters]
-      : [...nativeCreationAdapters, ...formCreationAdapters];
+  const creationAdapters = [...nativeCreationAdapters, ...formCreationAdapters];
   const adapter = creationAdapters[0];
-  const selectedVisibleApps = supportedApps.filter(
-    (appId) => visibleApps[appId],
-  );
-  const visibleSupportedApps =
-    selectedVisibleApps.length > 0
-      ? selectedVisibleApps
-      : supportedApps.slice(0, 1);
+  const supportsMcp = supportsFeature(appCatalog, activeApp, "mcp");
+  const supportsSkills = supportsFeature(appCatalog, activeApp, "skills");
   const editingAdapter =
     editing === "new"
       ? adapter
@@ -215,15 +201,6 @@ export default function App() {
   const contentTopOffset = DRAG_BAR_HEIGHT + HEADER_HEIGHT;
   const addActionButtonClass =
     "bg-orange-500 hover:bg-orange-600 dark:bg-orange-500 dark:hover:bg-orange-600 text-white shadow-lg shadow-orange-500/30 dark:shadow-orange-500/40 rounded-full w-8 h-8";
-
-  const reloadAdapters = useCallback(async () => {
-    try {
-      setAdapters(await providersApi.listAdapters());
-      setAdapterError(null);
-    } catch (error) {
-      setAdapterError(errorMessage(error));
-    }
-  }, []);
 
   const refreshCurrent = useCallback(
     async (app: AppId, showError = true): Promise<boolean> => {
@@ -255,27 +232,27 @@ export default function App() {
   useEffect(() => {
     const media = globalThis.matchMedia?.("(prefers-color-scheme: dark)");
     const apply = () => {
-      const dark = theme === "dark" || (theme === "system" && media?.matches);
-      document.documentElement.classList.toggle("dark", Boolean(dark));
+      document.documentElement.classList.toggle(
+        "dark",
+        Boolean(media?.matches),
+      );
     };
     apply();
-    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
-    if (theme !== "system" || !media) return;
+    if (!media) return;
     media.addEventListener("change", apply);
     return () => media.removeEventListener("change", apply);
-  }, [theme]);
+  }, []);
 
   useEffect(() => {
-    window.localStorage.setItem(
-      VISIBLE_APPS_STORAGE_KEY,
-      JSON.stringify(visibleApps),
-    );
-    if (supportedApps.length === 0 || visibleApps[activeApp]) return;
-    const next = supportedApps.find((appId) => visibleApps[appId]);
-    if (!next) return;
-    setActiveApp(next);
-    window.localStorage.setItem(APP_STORAGE_KEY, next);
-  }, [activeApp, supportedApps, visibleApps]);
+    window.localStorage.setItem(VIEW_STORAGE_KEY, currentView);
+  }, [currentView]);
+
+  useEffect(() => {
+    if (!catalogReady || currentView === "providers") return;
+    if (!supportsFeature(appCatalog, activeApp, currentView)) {
+      setCurrentView("providers");
+    }
+  }, [activeApp, appCatalog, catalogReady, currentView]);
 
   useEffect(() => {
     let ignore = false;
@@ -295,6 +272,7 @@ export default function App() {
         if (!ignore) {
           setCatalogReady(false);
           setCatalogError(errorMessage(error));
+          setCurrentView("providers");
         }
       });
     providersApi
@@ -316,41 +294,82 @@ export default function App() {
   useEffect(() => {
     let ignore = false;
     const app = activeApp;
-    const currentGeneration = ++currentRequestGeneration.current;
     setLoading(true);
     setProviders([]);
-    setCurrentProviders([]);
     setLoadError(null);
-    setCurrentError(null);
-    Promise.allSettled([
-      providersApi.list(app),
-      providersApi.currentProviders(app),
-    ]).then(([providerResult, currentResult]) => {
-      if (ignore || activeAppRef.current !== app) return;
-      if (providerResult.status === "fulfilled") {
-        setProviders(providerResult.value);
-      } else {
-        setProviders([]);
-        setLoadError(errorMessage(providerResult.reason));
-      }
-      if (currentGeneration === currentRequestGeneration.current) {
-        if (currentResult.status === "fulfilled") {
-          setCurrentProviders(currentResult.value);
-          setCurrentError(null);
+    providersApi
+      .list(app)
+      .then((items) => {
+        if (ignore || activeAppRef.current !== app) return;
+        if (catalogReadyRef.current && !providerListReadyRef.current) {
+          setProviders([]);
         } else {
-          setCurrentError(errorMessage(currentResult.reason));
+          setProviders(items);
         }
-      }
-      setLoading(false);
-    });
+        setLoadError(null);
+      })
+      .catch((error: unknown) => {
+        if (ignore || activeAppRef.current !== app) return;
+        if (catalogReadyRef.current && !providerListReadyRef.current) {
+          setLoadError(null);
+        } else {
+          setLoadError(errorMessage(error));
+        }
+        setProviders([]);
+      })
+      .finally(() => {
+        if (ignore || activeAppRef.current !== app) return;
+        setLoading(false);
+      });
     return () => {
       ignore = true;
     };
   }, [activeApp]);
 
   useEffect(() => {
+    if (!catalogReady || providerListReady) return;
+    setProviders([]);
+    setLoadError(null);
+    setLoading(false);
+  }, [catalogReady, providerListReady]);
+
+  useEffect(() => {
+    const generation = ++currentRequestGeneration.current;
+    setCurrentProviders([]);
+    setCurrentError(null);
+    if (!catalogReady || !currentStateReady) return;
+
+    let ignore = false;
+    const app = activeApp;
+    providersApi
+      .currentProviders(app)
+      .then((items) => {
+        if (
+          !ignore &&
+          generation === currentRequestGeneration.current &&
+          activeAppRef.current === app
+        ) {
+          setCurrentProviders(items);
+          setCurrentError(null);
+        }
+      })
+      .catch((error: unknown) => {
+        if (
+          !ignore &&
+          generation === currentRequestGeneration.current &&
+          activeAppRef.current === app
+        ) {
+          setCurrentError(errorMessage(error));
+        }
+      });
+    return () => {
+      ignore = true;
+    };
+  }, [activeApp, catalogReady, currentStateReady]);
+
+  useEffect(() => {
     const refreshWhenVisible = () => {
-      if (document.visibilityState === "visible") {
+      if (currentStateReady && document.visibilityState === "visible") {
         void refreshCurrent(activeApp);
       }
     };
@@ -360,24 +379,12 @@ export default function App() {
       window.removeEventListener("focus", refreshWhenVisible);
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
-  }, [activeApp, refreshCurrent]);
-
-  useEffect(() => {
-    const openSettingsShortcut = (event: KeyboardEvent) => {
-      if (event.metaKey && event.key === ",") {
-        event.preventDefault();
-        if (!mutationBusy && liveBusy === null) setSettingsOpen(true);
-      }
-    };
-    window.addEventListener("keydown", openSettingsShortcut);
-    return () => window.removeEventListener("keydown", openSettingsShortcut);
-  }, [liveBusy, mutationBusy]);
+  }, [activeApp, currentStateReady, refreshCurrent]);
 
   const selectApp = (app: AppId) => {
     setActiveApp(app);
     setEditing(null);
     setDeleting(null);
-    setImportDialogOpen(false);
     setMutationError(null);
     setLiveError(null);
     setCurrentError(null);
@@ -421,7 +428,7 @@ export default function App() {
       }
       setEditing(null);
       setNotice(editing === "new" ? "Provider added." : "Provider updated.");
-      await refreshCurrent(activeApp);
+      if (currentStateReady) await refreshCurrent(activeApp);
     } catch (error) {
       setMutationError(errorMessage(error));
     } finally {
@@ -445,7 +452,7 @@ export default function App() {
         remaining[Math.min(Math.max(deletedIndex, 0), remaining.length - 1)];
       setProviders(remaining);
       setDeleting(null);
-      await refreshCurrent(activeApp);
+      if (currentStateReady) await refreshCurrent(activeApp);
       window.setTimeout(() => {
         const target = nextProvider
           ? deleteButtonRefs.current.get(nextProvider.id)
@@ -459,27 +466,22 @@ export default function App() {
     }
   };
 
-  const importLiveProvider = async (selectedAdapter?: AdapterReference) => {
-    if (!providerActionsReady) return;
+  const importNativeProviders = async () => {
+    if (!liveActionsReady) return;
     setLiveBusy("import");
     setLiveError(null);
     setNotice(null);
     try {
-      if (selectedAdapter && isNativeAdapter(selectedAdapter)) {
-        await providersApi.importNative(activeApp);
-      } else if (selectedAdapter) {
-        await providersApi.importLive(activeApp, selectedAdapter);
-      } else {
-        await providersApi.importLive(activeApp);
+      await providersApi.importNative(activeApp);
+      if (providerListReady) {
+        setProviders(await providersApi.list(activeApp));
       }
-      setProviders(await providersApi.list(activeApp));
       await refreshCurrent(activeApp);
       setNotice(
         isClaude
           ? "Imported the Claude Code user configuration."
           : `Imported the current ${definition.label} configuration.`,
       );
-      setImportDialogOpen(false);
     } catch (error) {
       setLiveError(errorMessage(error));
     } finally {
@@ -488,21 +490,14 @@ export default function App() {
   };
 
   const beginImport = () => {
-    if (!providerActionsReady) return;
+    if (!liveActionsReady) return;
     setLiveError(null);
-    if (liveAdapters.length > 1) {
-      setImportDialogOpen(true);
-      return;
-    }
-    if (liveAdapters.length === 0) return;
-    const onlyAdapter = liveAdapters[0].reference;
-    void importLiveProvider(
-      isNativeAdapter(onlyAdapter) ? onlyAdapter : undefined,
-    );
+    if (!nativeLiveAdapter) return;
+    void importNativeProviders();
   };
 
   const switchProvider = async (provider: ProviderRecord) => {
-    if (!providerActionsReady) return;
+    if (!liveActionsReady) return;
     setLiveBusy(provider.id);
     setLiveError(null);
     setNotice(null);
@@ -523,7 +518,7 @@ export default function App() {
   };
 
   const removeProviderFromLive = async (provider: ProviderRecord) => {
-    if (!providerActionsReady) return;
+    if (!liveActionsReady) return;
     setLiveBusy(provider.id);
     setLiveError(null);
     setNotice(null);
@@ -547,10 +542,7 @@ export default function App() {
     const providerAdapter = adapters.find((item) =>
       adapterMatchesProvider(item, provider),
     );
-    const hermesManaged =
-      activeApp === "hermes" &&
-      provider.settings._cc_source === "providers_dict";
-    const readOnly = hermesManaged || provider.liteConfigWritable === false;
+    const readOnly = provider.liteConfigWritable === false;
     const isCurrent = currentProviders.some(
       (current) =>
         current.id === provider.id && current.revision === provider.revision,
@@ -561,12 +553,12 @@ export default function App() {
       canEdit:
         providerActionsReady && providerAdapter !== undefined && !readOnly,
       canSwitch:
-        providerActionsReady &&
+        liveActionsReady &&
         providerAdapter !== undefined &&
         !readOnly &&
         currentError === null,
       canRemove:
-        providerActionsReady &&
+        liveActionsReady &&
         providerAdapter !== undefined &&
         isNativeAdapter(providerAdapter.reference) &&
         additive &&
@@ -579,11 +571,12 @@ export default function App() {
         (additive || !isCurrent),
       isAdditive: additive,
       isReadOnly: readOnly,
-      readOnlyLabel: hermesManaged ? "Hermes managed" : "Not supported in Lite",
+      readOnlyLabel: "Not supported in Lite",
       endpoint: providerAdapter ? visibleEndpoint(provider) : "",
       isCurrent,
     };
   });
+  const viewTitle = currentView === "mcp" ? "MCP Servers" : "Skills";
 
   return (
     <div
@@ -608,81 +601,107 @@ export default function App() {
             className="flex items-center gap-1"
             style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
           >
-            <Button
-              variant="ghost"
-              size="icon"
-              disabled={mutationBusy || liveBusy !== null}
-              onClick={() => setMarketplaceOpen(true)}
-              title="Plugin marketplace"
-              aria-label="Open plugin marketplace"
-              className="hover:bg-black/5 dark:hover:bg-white/5"
-            >
-              <Store className="h-4 w-4" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              disabled={mutationBusy || liveBusy !== null}
-              onClick={() => setSettingsOpen(true)}
-              title="Settings"
-              aria-label="Open settings"
-              className="hover:bg-black/5 dark:hover:bg-white/5"
-            >
-              <Settings className="h-4 w-4" />
-            </Button>
+            {currentView !== "providers" && (
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="icon"
+                  onClick={() => setCurrentView("providers")}
+                  className="mr-2 rounded-lg"
+                  aria-label="Back to providers"
+                >
+                  <ArrowLeft className="h-4 w-4" />
+                </Button>
+                <h1 className="text-lg font-semibold">{viewTitle}</h1>
+              </div>
+            )}
           </div>
 
           <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5">
             <div className="flex min-w-0 flex-1 items-center justify-end overflow-hidden py-4">
-              <AppSwitcher
-                activeApp={activeApp}
-                apps={visibleSupportedApps}
-                disabled={mutationBusy || liveBusy !== null}
-                onSwitch={selectApp}
-              />
+              {currentView === "providers" && (
+                <AppSwitcher
+                  activeApp={activeApp}
+                  apps={appCatalog}
+                  disabled={mutationBusy || liveBusy !== null}
+                  onSwitch={selectApp}
+                />
+              )}
             </div>
             <div className="flex shrink-0 items-center py-4">
               <div
                 className="flex shrink-0 items-center gap-1.5"
                 style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
               >
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={
-                    !providerActionsReady ||
-                    liveAdapters.length === 0 ||
-                    loading ||
-                    mutationBusy ||
-                    liveBusy !== null
-                  }
-                  onClick={beginImport}
-                  className="hover:bg-black/5 dark:hover:bg-white/5"
-                  aria-label={importLabel}
-                >
-                  {liveBusy === "import" ? (
-                    <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
-                  ) : (
-                    <Download className="mr-2 h-4 w-4" />
-                  )}
-                  Import
-                </Button>
-                <Button
-                  ref={addProviderButtonRef}
-                  size="icon"
-                  disabled={
-                    !providerActionsReady ||
-                    !adapter ||
-                    loading ||
-                    mutationBusy ||
-                    liveBusy !== null
-                  }
-                  onClick={() => openEditor("new")}
-                  className={`ml-2 ${addActionButtonClass}`}
-                  aria-label={`Add ${definition.label} provider`}
-                >
-                  <Plus className="h-5 w-5" />
-                </Button>
+                {currentView === "providers" && (
+                  <>
+                    {(supportsSkills || supportsMcp) && (
+                      <div className="flex items-center gap-1 rounded-xl bg-muted p-1">
+                        {supportsSkills && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setCurrentView("skills")}
+                            className="w-8 px-2 text-muted-foreground hover:bg-black/5 hover:text-foreground dark:hover:bg-white/5"
+                            title="Manage Skills"
+                            aria-label="Manage Skills"
+                          >
+                            <Wrench className="h-4 w-4" />
+                          </Button>
+                        )}
+                        {supportsMcp && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setCurrentView("mcp")}
+                            className="w-8 px-2 text-muted-foreground hover:bg-black/5 hover:text-foreground dark:hover:bg-white/5"
+                            title="Manage MCP servers"
+                            aria-label="Manage MCP servers"
+                          >
+                            <McpIcon size={16} />
+                          </Button>
+                        )}
+                      </div>
+                    )}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={
+                        !liveActionsReady ||
+                        !nativeLiveAdapter ||
+                        loading ||
+                        mutationBusy ||
+                        liveBusy !== null
+                      }
+                      onClick={beginImport}
+                      className="hover:bg-black/5 dark:hover:bg-white/5"
+                      aria-label={importLabel}
+                    >
+                      {liveBusy === "import" ? (
+                        <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+                      ) : (
+                        <Download className="mr-2 h-4 w-4" />
+                      )}
+                      Import
+                    </Button>
+                    <Button
+                      ref={addProviderButtonRef}
+                      size="icon"
+                      disabled={
+                        !providerActionsReady ||
+                        !adapter ||
+                        loading ||
+                        mutationBusy ||
+                        liveBusy !== null
+                      }
+                      onClick={() => openEditor("new")}
+                      className={`ml-2 ${addActionButtonClass}`}
+                      aria-label={`Add ${definition.label} provider`}
+                    >
+                      <Plus className="h-5 w-5" />
+                    </Button>
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -690,78 +709,98 @@ export default function App() {
       </header>
 
       <main className="flex min-h-0 flex-1 flex-col overflow-y-auto animate-fade-in">
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-6">
-          <div className="flex-1 overflow-y-auto overflow-x-hidden px-1 pb-12">
-            <div className="space-y-4">
-              {(catalogError ||
-                adapterError ||
-                liveError ||
-                loadError ||
-                currentError) && (
-                <div
-                  role="alert"
-                  className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-600 dark:text-red-300"
-                >
-                  {catalogError ||
-                    adapterError ||
-                    liveError ||
-                    loadError ||
-                    currentError}
-                </div>
-              )}
+        {currentView === "providers" ? (
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-6">
+            <div className="flex-1 overflow-y-auto overflow-x-hidden px-1 pb-12">
+              <div className="space-y-4">
+                {(catalogError ||
+                  adapterError ||
+                  liveError ||
+                  loadError ||
+                  currentError) && (
+                  <div
+                    role="alert"
+                    className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-600 dark:text-red-300"
+                  >
+                    {catalogError ||
+                      adapterError ||
+                      liveError ||
+                      loadError ||
+                      currentError}
+                  </div>
+                )}
 
-              {notice && (
-                <div
-                  role="status"
-                  className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300"
-                >
-                  <Check className="size-4" aria-hidden="true" />
-                  {notice}
-                </div>
-              )}
+                {notice && (
+                  <div
+                    role="status"
+                    className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300"
+                  >
+                    <Check className="size-4" aria-hidden="true" />
+                    {notice}
+                  </div>
+                )}
 
-              <ProviderList
-                appId={activeApp}
-                items={providerItems}
-                isLoading={loading}
-                emptyTitle={definition.emptyTitle}
-                currentLabel={currentLabel}
-                importLabel={
-                  isClaude ? "Import user default" : "Import current"
-                }
-                disabled={
-                  !providerActionsReady ||
-                  !adapter ||
-                  mutationBusy ||
-                  liveBusy !== null
-                }
-                importDisabled={
-                  !providerActionsReady ||
-                  liveAdapters.length === 0 ||
-                  mutationBusy ||
-                  liveBusy !== null
-                }
-                busy={mutationBusy || liveBusy !== null}
-                importing={liveBusy === "import"}
-                switchingId={liveBusy}
-                onCreate={() => openEditor("new")}
-                onImport={beginImport}
-                onSwitch={switchProvider}
-                onRemove={removeProviderFromLive}
-                onEdit={openEditor}
-                onDelete={(provider) => {
-                  setMutationError(null);
-                  setDeleting(provider);
-                }}
-                setDeleteButtonRef={(providerId, element) => {
-                  if (element)
-                    deleteButtonRefs.current.set(providerId, element);
-                  else deleteButtonRefs.current.delete(providerId);
-                }}
-              />
+                <ProviderList
+                  appId={activeApp}
+                  items={providerItems}
+                  isLoading={loading}
+                  emptyTitle={definition.emptyTitle}
+                  currentLabel={currentLabel}
+                  importLabel={
+                    isClaude ? "Import user default" : "Import current"
+                  }
+                  disabled={
+                    !providerActionsReady ||
+                    !adapter ||
+                    mutationBusy ||
+                    liveBusy !== null
+                  }
+                  importDisabled={
+                    !liveActionsReady ||
+                    !nativeLiveAdapter ||
+                    mutationBusy ||
+                    liveBusy !== null
+                  }
+                  busy={mutationBusy || liveBusy !== null}
+                  importing={liveBusy === "import"}
+                  switchingId={liveBusy}
+                  onCreate={() => openEditor("new")}
+                  onImport={beginImport}
+                  onSwitch={switchProvider}
+                  onRemove={removeProviderFromLive}
+                  onEdit={openEditor}
+                  onDelete={(provider) => {
+                    setMutationError(null);
+                    setDeleting(provider);
+                  }}
+                  setDeleteButtonRef={(providerId, element) => {
+                    if (element)
+                      deleteButtonRefs.current.set(providerId, element);
+                    else deleteButtonRefs.current.delete(providerId);
+                  }}
+                />
+              </div>
             </div>
           </div>
-        </div>
+        ) : (
+          <div className="flex min-h-0 flex-1 items-center justify-center px-6 pb-12">
+            <div
+              className="glass-card flex max-w-md flex-col items-center rounded-2xl px-8 py-10 text-center"
+              aria-label={`${viewTitle} placeholder`}
+            >
+              {currentView === "mcp" ? (
+                <McpIcon size={28} className="text-muted-foreground" />
+              ) : (
+                <Wrench className="h-7 w-7 text-muted-foreground" />
+              )}
+              <p className="mt-4 text-base font-semibold">{viewTitle}</p>
+              <p className="mt-2 text-sm text-muted-foreground">
+                This management view will be connected in its implementation
+                step.
+              </p>
+            </div>
+          </div>
+        )}
       </main>
 
       {editing && editingAdapter && (
@@ -773,40 +812,6 @@ export default function App() {
           error={mutationError}
           onCancel={() => setEditing(null)}
           onSave={saveProvider}
-        />
-      )}
-
-      {settingsOpen && (
-        <SettingsPage
-          theme={theme}
-          visibleApps={visibleApps}
-          supportedApps={supportedApps}
-          onThemeChange={setTheme}
-          onVisibleAppsChange={setVisibleApps}
-          onOpenMarketplace={() => {
-            setSettingsOpen(false);
-            setMarketplaceOpen(true);
-          }}
-          onClose={() => setSettingsOpen(false)}
-        />
-      )}
-
-      {marketplaceOpen && (
-        <MarketplaceDialog
-          onCancel={() => setMarketplaceOpen(false)}
-          onChanged={() => void reloadAdapters()}
-        />
-      )}
-
-      {importDialogOpen && (
-        <ImportProviderDialog
-          adapters={liveAdapters}
-          busy={liveBusy === "import"}
-          error={liveError}
-          onCancel={() => setImportDialogOpen(false)}
-          onImport={(selectedAdapter) =>
-            void importLiveProvider(selectedAdapter)
-          }
         />
       )}
 

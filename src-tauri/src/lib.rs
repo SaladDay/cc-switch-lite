@@ -1,23 +1,18 @@
 use std::collections::HashSet;
 
-use cc_switch_core::{builtin_app_registry, AppDescriptor};
+use cc_switch_core::{builtin_app_registry, AppCapability, AppDescriptor};
 
 mod live;
 mod native_live;
 mod operation;
-mod plugin;
 mod provider;
 mod store;
 
 use live::{LiveConfig, LiveError};
-use plugin::{
-    InstallSelection, InstalledPlugin, MarketplaceCatalog, PluginCapability, PluginError,
-    PluginManager, PluginRequest, PluginResponse, RegistryDraft, RegistrySource,
-};
 use provider::{
-    built_in_adapters, is_lite_writable, native_adapter_reference, AdapterDescriptor,
-    AdapterReference, CurrentProvider, ProviderDraft, ProviderRecord, ProviderUpdate,
-    BUILTIN_PLUGIN_ID, CONTRACT_MAJOR,
+    adapter_for_reference, built_in_adapters, is_lite_writable, native_adapter_reference,
+    native_adapters, validate_settings, AdapterDescriptor, CurrentProvider, ProviderDraft,
+    ProviderRecord, ProviderUpdate,
 };
 use serde::Serialize;
 use store::{ProviderStore, StoreError};
@@ -53,19 +48,51 @@ impl From<LiveError> for CommandError {
     }
 }
 
-impl From<PluginError> for CommandError {
-    fn from(error: PluginError) -> Self {
-        Self {
-            code: error.code(),
-            message: error.to_string(),
-        }
-    }
+type CommandResult<T> = Result<T, CommandError>;
+
+fn unavailable_adapter() -> StoreError {
+    StoreError::InvalidProvider("provider adapter is not available in Lite".to_owned())
 }
 
-type CommandResult<T> = Result<T, CommandError>;
+fn require_capability(
+    app_id: &str,
+    capability: AppCapability,
+    operation: &str,
+) -> CommandResult<()> {
+    if supports_capability(app_id, capability) {
+        return Ok(());
+    }
+
+    Err(StoreError::InvalidProvider(format!(
+        "application '{app_id}' does not support {operation}"
+    ))
+    .into())
+}
+
+fn supports_capability(app_id: &str, capability: AppCapability) -> bool {
+    builtin_app_registry()
+        .find(app_id)
+        .is_some_and(|descriptor| descriptor.supports(capability))
+}
+
+fn require_provider_visibility(app_id: &str) -> CommandResult<()> {
+    if supports_capability(app_id, AppCapability::ProviderManagement)
+        || supports_capability(app_id, AppCapability::LiveConfiguration)
+    {
+        return Ok(());
+    }
+
+    Err(
+        StoreError::InvalidProvider(format!("application '{app_id}' does not expose providers"))
+            .into(),
+    )
+}
+
 #[tauri::command]
-fn list_provider_adapters(plugins: State<'_, PluginManager>) -> Vec<AdapterDescriptor> {
-    plugins.adapters()
+fn list_provider_adapters() -> Vec<AdapterDescriptor> {
+    let mut adapters = native_adapters();
+    adapters.extend(built_in_adapters());
+    adapters
 }
 
 #[tauri::command]
@@ -73,6 +100,7 @@ fn list_providers(
     store: State<'_, ProviderStore>,
     app_id: String,
 ) -> CommandResult<Vec<ProviderRecord>> {
+    require_provider_visibility(&app_id)?;
     let mut providers = store.list(&app_id)?;
     for provider in &mut providers {
         provider.extensions.insert(
@@ -86,10 +114,14 @@ fn list_providers(
 #[tauri::command]
 fn create_provider(
     store: State<'_, ProviderStore>,
-    plugins: State<'_, PluginManager>,
     provider: ProviderDraft,
 ) -> CommandResult<ProviderRecord> {
     let app_id = provider.app_id.clone();
+    require_capability(
+        &app_id,
+        AppCapability::ProviderManagement,
+        "provider management",
+    )?;
     if let Ok(app) = app_id.parse::<cc_switch_core::AppType>() {
         if provider
             .adapter
@@ -98,44 +130,30 @@ fn create_provider(
             return store.create_native(provider).map_err(Into::into);
         }
     }
-    let created = store.create_resolved_from(&app_id, false, || {
-        let descriptor = plugins
-            .adapter_for_reference(&app_id, &provider.adapter)?
-            .ok_or(PluginError::NotFound)?;
-        plugins.validate_provider(&descriptor, &provider.settings)?;
-        Ok::<_, PluginError>((provider, descriptor))
-    })??;
-    Ok(created)
+
+    Ok(store.create_resolved_from(&app_id, false, || {
+        let descriptor =
+            adapter_for_reference(&app_id, &provider.adapter).ok_or_else(unavailable_adapter)?;
+        validate_settings(&descriptor, &provider.settings).map_err(StoreError::InvalidProvider)?;
+        Ok::<_, StoreError>((provider, descriptor))
+    })??)
 }
 
 #[tauri::command]
 fn update_provider(
     store: State<'_, ProviderStore>,
-    plugins: State<'_, PluginManager>,
     app_id: String,
     id: String,
     provider: ProviderUpdate,
 ) -> CommandResult<ProviderRecord> {
-    store
-        .update_from(&app_id, &id, provider, |current, update| {
-            let descriptor = plugins
-                .adapter_for_reference(&current.app_id, &current.adapter)?
-                .ok_or(PluginError::NotFound)?;
-            let declared = descriptor
-                .fields
-                .iter()
-                .filter_map(|field| {
-                    update
-                        .settings
-                        .get(&field.key)
-                        .cloned()
-                        .map(|value| (field.key.clone(), value))
-                })
-                .collect();
-            plugins.validate_provider(&descriptor, &declared)?;
-            Ok::<_, PluginError>(descriptor)
-        })?
-        .map_err(Into::into)
+    require_capability(
+        &app_id,
+        AppCapability::ProviderManagement,
+        "provider management",
+    )?;
+    Ok(store.update_from(&app_id, &id, provider, |current, _| {
+        adapter_for_reference(&current.app_id, &current.adapter).ok_or_else(unavailable_adapter)
+    })??)
 }
 
 #[tauri::command]
@@ -146,12 +164,17 @@ fn delete_provider(
     id: String,
     expected_revision: u64,
 ) -> CommandResult<()> {
+    require_capability(
+        &app_id,
+        AppCapability::ProviderManagement,
+        "provider management",
+    )?;
     let app = app_id.parse::<cc_switch_core::AppType>().map_err(|_| {
         CommandError::from(StoreError::InvalidProvider(format!(
             "application '{app_id}' is not supported"
         )))
     })?;
-    if app.is_additive_mode() {
+    if app.is_additive_mode() && supports_capability(&app_id, AppCapability::LiveConfiguration) {
         return store.delete_additive_with_provider(
             &app_id,
             &id,
@@ -201,6 +224,11 @@ fn import_live_providers(
     live: State<'_, LiveConfig>,
     app_id: String,
 ) -> CommandResult<Vec<ProviderRecord>> {
+    require_capability(
+        &app_id,
+        AppCapability::LiveConfiguration,
+        "live configuration",
+    )?;
     store.import_native_batch_from(&app_id, || {
         live.import_native_drafts(&app_id)
             .map_err(CommandError::from)
@@ -208,114 +236,39 @@ fn import_live_providers(
 }
 
 #[tauri::command]
-fn import_live_provider(
-    store: State<'_, ProviderStore>,
-    live: State<'_, LiveConfig>,
-    plugins: State<'_, PluginManager>,
-    app_id: String,
-    adapter: Option<AdapterReference>,
-) -> CommandResult<ProviderRecord> {
-    let reference = match adapter {
-        Some(reference) => reference,
-        None => built_in_adapters()
-            .into_iter()
-            .find(|candidate| candidate.app_id == app_id)
-            .map(|candidate| candidate.reference)
-            .ok_or_else(|| {
-                CommandError::from(PluginError::Invalid(
-                    "application is not available in Lite".to_owned(),
-                ))
-            })?,
-    };
-    store.create_resolved_from(&app_id, true, || {
-        let descriptor = plugins
-            .adapter_for_reference(&app_id, &reference)?
-            .ok_or(PluginError::NotFound)?;
-        let draft = if reference.plugin_id == BUILTIN_PLUGIN_ID {
-            live.import_draft(&app_id).map_err(CommandError::from)?
-        } else {
-            let capabilities = plugins.capabilities_for_reference(&app_id, &reference)?;
-            let response = live
-                .with_plugin_snapshots(&app_id, &capabilities, |snapshots| {
-                    plugins.invoke(
-                        &reference,
-                        &PluginRequest::Import {
-                            contract_major: CONTRACT_MAJOR,
-                            app_id: app_id.clone(),
-                            adapter_id: reference.adapter_id.clone(),
-                            snapshots,
-                        },
-                    )
-                })
-                .map_err(CommandError::from)??;
-            match response {
-                PluginResponse::Imported { provider } => provider,
-                _ => return Err(CommandError::from(PluginError::Runtime)),
-            }
-        };
-        if !draft.adapter.same_identity(&reference) {
-            return Err(CommandError::from(PluginError::Invalid(
-                "imported provider does not use the requested adapter".to_owned(),
-            )));
-        }
-        let mut draft = draft;
-        if reference.plugin_id != BUILTIN_PLUGIN_ID {
-            draft.name = format!("Imported {}", descriptor.display_name);
-        }
-        plugins
-            .validate_provider(&descriptor, &draft.settings)
-            .map_err(CommandError::from)?;
-        Ok::<_, CommandError>((draft, descriptor))
-    })?
-}
-
-#[tauri::command]
 fn switch_provider(
     store: State<'_, ProviderStore>,
     live: State<'_, LiveConfig>,
-    plugins: State<'_, PluginManager>,
     app_id: String,
     id: String,
     expected_revision: u64,
 ) -> CommandResult<()> {
+    require_capability(
+        &app_id,
+        AppCapability::LiveConfiguration,
+        "live configuration",
+    )?;
     store.switch_with_provider(
         &app_id,
         &id,
         expected_revision,
         |provider, common_snippet| {
-            if let Ok(app) = provider.app_id.parse::<cc_switch_core::AppType>() {
-                if provider
-                    .adapter
-                    .same_identity(&native_adapter_reference(&app))
-                {
-                    return live
-                        .switch_native_recoverable(provider, common_snippet)
-                        .map_err(CommandError::from);
-                }
+            let app = provider
+                .app_id
+                .parse::<cc_switch_core::AppType>()
+                .map_err(|_| {
+                    CommandError::from(StoreError::InvalidProvider(
+                        "application is not supported".to_owned(),
+                    ))
+                })?;
+            if !provider
+                .adapter
+                .same_identity(&native_adapter_reference(&app))
+            {
+                return Err(CommandError::from(unavailable_adapter()));
             }
-            if provider.adapter.plugin_id == BUILTIN_PLUGIN_ID {
-                return live
-                    .switch_recoverable(provider)
-                    .map_err(CommandError::from);
-            }
-            let capabilities =
-                plugins.capabilities_for_reference(&provider.app_id, &provider.adapter)?;
-            live.execute_plugin_route_recoverable(provider, &capabilities, |snapshots| {
-                let response = plugins.invoke(
-                    &provider.adapter,
-                    &PluginRequest::Plan {
-                        contract_major: CONTRACT_MAJOR,
-                        provider: Box::new(provider.clone()),
-                        snapshots,
-                    },
-                )?;
-                match response {
-                    PluginResponse::Routed { route } => Ok(route),
-                    _ => Err(PluginError::Runtime),
-                }
-            })
-            .map_err(CommandError::from)?
-            .map_err(CommandError::from)
+            live.switch_native_recoverable(provider, common_snippet)
+                .map_err(CommandError::from)
         },
         |receipt| live.rollback(receipt).map_err(|error| error.to_string()),
     )?
@@ -329,6 +282,11 @@ fn remove_provider_from_live(
     id: String,
     expected_revision: u64,
 ) -> CommandResult<()> {
+    require_capability(
+        &app_id,
+        AppCapability::LiveConfiguration,
+        "live configuration",
+    )?;
     store.remove_from_live_with_provider(
         &app_id,
         &id,
@@ -338,7 +296,7 @@ fn remove_provider_from_live(
                 .app_id
                 .parse::<cc_switch_core::AppType>()
                 .map_err(|_| {
-                    CommandError::from(PluginError::Invalid(
+                    CommandError::from(StoreError::InvalidProvider(
                         "provider application is not supported".to_owned(),
                     ))
                 })?;
@@ -346,7 +304,7 @@ fn remove_provider_from_live(
                 .adapter
                 .same_identity(&native_adapter_reference(&app))
             {
-                return Err(CommandError::from(PluginError::Invalid(
+                return Err(CommandError::from(StoreError::InvalidProvider(
                     "only native additive providers can be removed from live configuration"
                         .to_owned(),
                 )));
@@ -370,8 +328,27 @@ fn current_providers(
         )))
     })?;
     if !app.is_additive_mode() {
+        if !supports_capability(&app_id, AppCapability::ProviderManagement)
+            && !supports_capability(&app_id, AppCapability::LiveConfiguration)
+        {
+            return Err(StoreError::InvalidProvider(format!(
+                "application '{app_id}' does not expose provider state"
+            ))
+            .into());
+        }
         return store.current(&app_id).map_err(Into::into);
     }
+
+    if !supports_capability(&app_id, AppCapability::LiveConfiguration) {
+        require_capability(&app_id, AppCapability::ProviderManagement, "provider state")?;
+        return Ok(Vec::new());
+    }
+
+    require_capability(
+        &app_id,
+        AppCapability::LiveConfiguration,
+        "live configuration",
+    )?;
 
     let live_ids = match live.import_native_drafts(&app_id) {
         Ok(providers) => providers
@@ -386,70 +363,6 @@ fn current_providers(
         .map_err(Into::into)
 }
 
-#[tauri::command]
-fn list_plugin_registries(plugins: State<'_, PluginManager>) -> CommandResult<Vec<RegistrySource>> {
-    plugins.registries().map_err(Into::into)
-}
-
-#[tauri::command]
-fn save_plugin_registry(
-    plugins: State<'_, PluginManager>,
-    registry: RegistryDraft,
-) -> CommandResult<RegistrySource> {
-    plugins.save_registry(registry).map_err(Into::into)
-}
-
-#[tauri::command]
-fn remove_plugin_registry(
-    plugins: State<'_, PluginManager>,
-    id: String,
-    expected_revision: u64,
-) -> CommandResult<()> {
-    plugins
-        .remove_registry(&id, expected_revision)
-        .map_err(Into::into)
-}
-
-#[tauri::command]
-async fn refresh_plugin_marketplace(
-    plugins: State<'_, PluginManager>,
-) -> CommandResult<MarketplaceCatalog> {
-    plugins.refresh().await.map_err(Into::into)
-}
-
-#[tauri::command]
-fn list_installed_plugins(
-    plugins: State<'_, PluginManager>,
-) -> CommandResult<Vec<InstalledPlugin>> {
-    plugins.installed().map_err(Into::into)
-}
-
-#[tauri::command]
-async fn install_plugin(
-    store: State<'_, ProviderStore>,
-    plugins: State<'_, PluginManager>,
-    plugin: InstallSelection,
-    approved_capabilities: Vec<PluginCapability>,
-) -> CommandResult<InstalledPlugin> {
-    let prepared = plugins.prepare_install(&plugin).await?;
-    store
-        .with_all_providers(|providers| {
-            plugins.activate(prepared, &approved_capabilities, providers)
-        })?
-        .map_err(Into::into)
-}
-
-#[tauri::command]
-fn uninstall_plugin(
-    store: State<'_, ProviderStore>,
-    plugins: State<'_, PluginManager>,
-    plugin_id: String,
-) -> CommandResult<()> {
-    store
-        .with_all_providers(|providers| plugins.remove(&plugin_id, providers))?
-        .map_err(Into::into)
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -457,9 +370,8 @@ pub fn run() {
             let app_data_dir = app.path().app_data_dir()?;
             let home_dir = app.path().home_dir()?;
             let store = ProviderStore::from_home(&home_dir)?;
-            store.migrate_legacy(&app_data_dir.join("providers.json"))?;
+            // The shared database is authoritative; startup never imports old Lite files.
             app.manage(store);
-            app.manage(PluginManager::new(app_data_dir.join("plugins"))?);
             app.manage(LiveConfig::from_home(
                 &home_dir,
                 app_data_dir.join("live-config.lock"),
@@ -473,18 +385,10 @@ pub fn run() {
             create_provider,
             update_provider,
             delete_provider,
-            import_live_provider,
             import_live_providers,
             switch_provider,
             remove_provider_from_live,
             current_providers,
-            list_plugin_registries,
-            save_plugin_registry,
-            remove_plugin_registry,
-            refresh_plugin_marketplace,
-            list_installed_plugins,
-            install_plugin,
-            uninstall_plugin,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run CC Switch Lite");
@@ -496,26 +400,21 @@ mod tests {
     use serde_json::{json, Map};
 
     #[test]
-    fn lite_boundary_follows_every_core_application() {
-        let apps = supported_apps();
-        assert_eq!(
-            apps.iter().map(AppDescriptor::id).collect::<Vec<_>>(),
-            [
-                "claude",
-                "claude-desktop",
-                "codex",
-                "gemini",
-                "grokbuild",
-                "opencode",
-                "openclaw",
-                "hermes",
-                "pi",
-            ]
-        );
+    fn host_adapters_cover_every_core_application() {
+        let app_ids: Vec<_> = native_adapters()
+            .into_iter()
+            .map(|adapter| adapter.app_id)
+            .collect();
+        let core_ids: Vec<_> = builtin_app_registry()
+            .descriptors()
+            .map(|descriptor| descriptor.id().to_owned())
+            .collect();
+
+        assert_eq!(app_ids, core_ids);
     }
 
     #[test]
-    fn built_in_adapters_remain_explicit_live_capabilities() {
+    fn built_in_form_adapters_remain_explicit() {
         let adapters = built_in_adapters();
         let app_ids: Vec<_> = adapters
             .iter()
@@ -523,9 +422,6 @@ mod tests {
             .collect();
 
         assert_eq!(app_ids, ["claude", "codex"]);
-        assert!(adapters
-            .iter()
-            .all(|adapter| adapter.reference.plugin_id == "org.cc-switch.builtin"));
     }
 
     #[test]
@@ -550,18 +446,19 @@ mod tests {
             called.set(true);
             Ok::<_, ()>(())
         })
-        .unwrap();
+        .expect("remove decision");
         assert!(result.is_none());
         assert!(!called.get());
 
         provider.metadata = json!({"liveConfigManaged": true});
         assert_eq!(
-            remove_owned_additive_live(&provider, |_| Ok::<_, ()>(())).unwrap(),
+            remove_owned_additive_live(&provider, |_| Ok::<_, ()>(())).expect("managed provider"),
             Some(())
         );
         provider.metadata = json!({});
         assert_eq!(
-            remove_owned_additive_live(&provider, |_| Ok::<_, ()>(())).unwrap(),
+            remove_owned_additive_live(&provider, |_| Ok::<_, ()>(()))
+                .expect("legacy managed provider"),
             Some(())
         );
     }
