@@ -5,11 +5,11 @@ use std::{
 };
 
 use cc_switch_core::{
-    apply_skill_deployment, builtin_app_registry, inspect_skill_config_enabled,
+    apply_skill_deployment, builtin_app_registry, inspect_skill_config_state,
     inspect_skill_deployment, inspect_skill_discovery, inspect_skill_presence,
-    validate_skill_directory, validate_skill_source, AppType, SkillConfigError, SkillConfigTarget,
-    SkillDeploymentReceipt, SkillDeploymentState, SkillDiscoveryState, SkillSyncMethod,
-    UnifiedSkillControl,
+    validate_skill_directory, validate_skill_source, AppType, SkillConfigError, SkillConfigState,
+    SkillConfigTarget, SkillDeploymentReceipt, SkillDeploymentState, SkillDiscoveryState,
+    SkillSyncMethod, UnifiedSkillControl,
 };
 use thiserror::Error;
 
@@ -341,19 +341,29 @@ fn observe_configured_state(
                 .as_ref()
                 .map_err(Clone::clone)
                 .and_then(|contents| {
-                    inspect_skill_config_enabled(target, contents.as_deref(), name)
+                    inspect_skill_config_state(target, contents.as_deref(), name)
                         .map_err(|error| error.to_string())
                 })
         });
     match configured {
-        Ok(configured) => SkillAppState {
-            enabled: Some(if external {
-                configured
-            } else {
-                native.enabled.unwrap_or(false) && configured
-            }),
-            issue: native.issue,
-        },
+        Ok(SkillConfigState::GloballyDisabled) => append_issue(
+            SkillAppState {
+                enabled: Some(false),
+                issue: native.issue,
+            },
+            "Skills are disabled globally in the application's native settings".to_owned(),
+        ),
+        Ok(configured @ (SkillConfigState::Enabled | SkillConfigState::Disabled)) => {
+            let configured = configured == SkillConfigState::Enabled;
+            SkillAppState {
+                enabled: Some(if external {
+                    configured
+                } else {
+                    native.enabled.unwrap_or(false) && configured
+                }),
+                issue: native.issue,
+            }
+        }
         Err(issue) => append_issue(
             SkillAppState {
                 enabled: None,
@@ -526,6 +536,37 @@ mod tests {
             assert!(!route.deploy_native);
             assert!(route.config_target.is_some());
         }
+    }
+
+    #[test]
+    fn gemini_global_disable_is_reported_as_read_only() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join(".cc-switch/skills");
+        let unified = directory.path().join(".agents/skills");
+        fs::create_dir_all(source.join("docs")).unwrap();
+        fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
+        fs::create_dir_all(unified.join("docs")).unwrap();
+        fs::write(unified.join("docs/SKILL.md"), "# Docs").unwrap();
+        let roots = app_roots(directory.path());
+        for (_, root) in &roots {
+            fs::create_dir_all(root).unwrap();
+        }
+        let live = SkillLiveConfig::new(source, unified, SkillSyncMethod::Copy, roots).unwrap();
+        let configs = HashMap::from([
+            (
+                SkillConfigTarget::GeminiSettings,
+                Ok(Some(br#"{"skills":{"enabled":false}}"#.to_vec())),
+            ),
+            (SkillConfigTarget::GrokConfig, Ok(None)),
+        ]);
+
+        let observations = live.observe(&skill_request(), &configs);
+        let state = &observations[0].app_overrides["gemini"];
+        assert_eq!(state.enabled, Some(false));
+        assert!(state
+            .issue
+            .as_deref()
+            .is_some_and(|issue| issue.contains("disabled globally")));
     }
 
     #[test]
