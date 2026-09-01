@@ -5,7 +5,10 @@ use std::{
     time::Duration,
 };
 
-use cc_switch_core::{builtin_app_registry, skill_directory_key, skill_name_key, AppType};
+use cc_switch_core::{
+    builtin_app_registry, skill_directory_key, skill_name_key, AppType, SkillCopyPolicy,
+    SkillSelectionMode,
+};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior};
 use serde::Serialize;
 use thiserror::Error;
@@ -76,6 +79,13 @@ pub(crate) struct PendingSkillChange {
     pub(crate) enabled: bool,
     pub(crate) runtime_fingerprint: String,
     previous_enabled: Option<bool>,
+    copy_policy: SkillCopyPolicy,
+}
+
+impl PendingSkillChange {
+    pub(crate) fn copy_policy(&self) -> SkillCopyPolicy {
+        self.copy_policy
+    }
 }
 
 struct PendingScan {
@@ -281,7 +291,7 @@ impl SkillStore {
         })?;
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let column = contract.catalog_column();
+        let column = catalog_column(&app);
         let query = column.map_or_else(
             || "SELECT name, directory, NULL FROM skills WHERE id = ?1".to_owned(),
             |column| format!("SELECT name, directory, {column} FROM skills WHERE id = ?1"),
@@ -308,19 +318,29 @@ impl SkillStore {
             enabled,
             runtime_fingerprint,
             previous_enabled: row.2,
+            copy_policy: if contract.selection() == SkillSelectionMode::HostManaged
+                && row.2 == Some(true)
+                && !enabled
+            {
+                SkillCopyPolicy::AllowMatching
+            } else {
+                SkillCopyPolicy::ManagedOnly
+            },
         };
         transaction
             .execute(
                 "INSERT INTO skill_operation_journal
-                 (skill_id, app_id, skill_name, directory, enabled, runtime_fingerprint)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (skill_id, app_id, skill_name, directory, enabled, runtime_fingerprint,
+                  matching_copy_evidence)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     pending.skill_id,
                     pending.app.as_str(),
                     pending.name,
                     pending.directory,
                     pending.enabled,
-                    pending.runtime_fingerprint
+                    pending.runtime_fingerprint,
+                    pending.copy_policy == SkillCopyPolicy::AllowMatching
                 ],
             )
             .map_err(|error| match error {
@@ -351,7 +371,8 @@ impl SkillStore {
     fn pending_changes(&self) -> Result<PendingScan, SkillError> {
         let connection = self.connect()?;
         let mut statement = connection.prepare(
-            "SELECT skill_id, app_id, skill_name, directory, enabled, runtime_fingerprint
+            "SELECT skill_id, app_id, skill_name, directory, enabled, runtime_fingerprint,
+                    matching_copy_evidence
              FROM skill_operation_journal ORDER BY skill_id, app_id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -362,6 +383,7 @@ impl SkillStore {
                 row.get::<_, String>(3)?,
                 row.get::<_, bool>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, bool>(6)?,
             ))
         })?;
         let mut changes = Vec::new();
@@ -375,7 +397,15 @@ impl SkillStore {
                 }
             };
             let resolved = (|| {
-                let (skill_id, app_id, name, directory, enabled, runtime_fingerprint) = row;
+                let (
+                    skill_id,
+                    app_id,
+                    name,
+                    directory,
+                    enabled,
+                    runtime_fingerprint,
+                    matching_copy_evidence,
+                ) = row;
                 let runtime_fingerprint = runtime_fingerprint
                     .filter(|fingerprint| !fingerprint.is_empty())
                     .ok_or_else(|| {
@@ -417,7 +447,7 @@ impl SkillStore {
                 if contract.config_target().is_some() {
                     validate_unique_native_name(&connection, &name)?;
                 }
-                if let Some(column) = contract.catalog_column() {
+                if let Some(column) = catalog_column(&app) {
                     let desired = connection.query_row(
                         &format!("SELECT {column} FROM skills WHERE id = ?1"),
                         [&skill_id],
@@ -429,6 +459,16 @@ impl SkillStore {
                         )));
                     }
                 }
+                let copy_policy = if matching_copy_evidence {
+                    if contract.selection() != SkillSelectionMode::HostManaged || enabled {
+                        return Err(SkillError::InvalidStore(format!(
+                            "pending Skill change for '{skill_id}' has invalid copy evidence"
+                        )));
+                    }
+                    SkillCopyPolicy::AllowMatching
+                } else {
+                    SkillCopyPolicy::ManagedOnly
+                };
                 Ok(PendingSkillChange {
                     skill_id,
                     name,
@@ -437,6 +477,7 @@ impl SkillStore {
                     enabled,
                     runtime_fingerprint,
                     previous_enabled: None,
+                    copy_policy,
                 })
             })();
             match resolved {
@@ -451,16 +492,12 @@ impl SkillStore {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(previous) = pending.previous_enabled {
-            let column = builtin_app_registry()
-                .for_app(&pending.app)
-                .skill_contract()
-                .and_then(|contract| contract.catalog_column())
-                .ok_or_else(|| {
-                    SkillError::Recovery(format!(
-                        "missing catalog binding for '{}'",
-                        pending.app.as_str()
-                    ))
-                })?;
+            let column = catalog_column(&pending.app).ok_or_else(|| {
+                SkillError::Recovery(format!(
+                    "missing catalog binding for '{}'",
+                    pending.app.as_str()
+                ))
+            })?;
             let updated = transaction.execute(
                 &format!(
                     "UPDATE skills SET {column} = ?1
@@ -535,12 +572,13 @@ impl SkillStore {
                 directory TEXT NOT NULL,
                 enabled BOOLEAN NOT NULL,
                 runtime_fingerprint TEXT,
+                matching_copy_evidence BOOLEAN NOT NULL DEFAULT 0,
                 PRIMARY KEY (skill_id, app_id)
             );",
         )?;
         let mut columns = skill_columns(&transaction)?;
         verify_base_columns(&columns)?;
-        ensure_journal_runtime_fingerprint(&transaction)?;
+        ensure_journal_extensions(&transaction)?;
         verify_journal_schema(&transaction)?;
         for binding in catalog_bindings() {
             if columns.insert(binding.column.to_owned()) {
@@ -572,12 +610,23 @@ struct CatalogBinding {
     column: &'static str,
 }
 
+fn catalog_column(app: &AppType) -> Option<&'static str> {
+    match app {
+        AppType::Claude => Some("enabled_claude"),
+        AppType::Codex => Some("enabled_codex"),
+        AppType::Gemini => Some("enabled_gemini"),
+        AppType::GrokBuild => Some("enabled_grokbuild"),
+        AppType::OpenCode => Some("enabled_opencode"),
+        AppType::Hermes => Some("enabled_hermes"),
+        AppType::ClaudeDesktop | AppType::OpenClaw | AppType::Pi => None,
+    }
+}
+
 fn catalog_bindings() -> Vec<CatalogBinding> {
     builtin_app_registry()
         .descriptors()
         .filter_map(|descriptor| {
-            let contract = descriptor.skill_contract()?;
-            contract.catalog_column().map(|column| CatalogBinding {
+            catalog_column(descriptor.app()).map(|column| CatalogBinding {
                 app_id: descriptor.id(),
                 column,
             })
@@ -589,8 +638,8 @@ fn row_to_skill(row: &Row<'_>, bindings: &[CatalogBinding]) -> rusqlite::Result<
     let mut apps = builtin_app_registry()
         .descriptors()
         .filter_map(|descriptor| Some((descriptor, descriptor.skill_contract()?)))
-        .map(|(descriptor, contract)| {
-            let enabled = contract.catalog_column().map(|_| false);
+        .map(|(descriptor, _)| {
+            let enabled = catalog_column(descriptor.app()).map(|_| false);
             (
                 descriptor.id().to_owned(),
                 SkillAppState {
@@ -685,7 +734,7 @@ fn pending_matches_catalog(
                 pending.app.as_str()
             ))
         })?;
-    let query = contract.catalog_column().map_or_else(
+    let query = catalog_column(&pending.app).map_or_else(
         || "SELECT name, directory, NULL FROM skills WHERE id = ?1".to_owned(),
         |column| format!("SELECT name, directory, {column} FROM skills WHERE id = ?1"),
     );
@@ -716,23 +765,23 @@ fn pending_matches_catalog(
     {
         return Ok(false);
     }
-    Ok(contract
-        .catalog_column()
-        .is_none_or(|_| enabled == Some(pending.enabled)))
+    Ok(catalog_column(&pending.app).is_none_or(|_| enabled == Some(pending.enabled)))
 }
 
 fn delete_pending(connection: &Connection, pending: &PendingSkillChange) -> Result<(), SkillError> {
     let deleted = connection.execute(
         "DELETE FROM skill_operation_journal
          WHERE skill_id = ?1 AND app_id = ?2 AND skill_name = ?3
-           AND directory = ?4 AND enabled = ?5 AND runtime_fingerprint = ?6",
+           AND directory = ?4 AND enabled = ?5 AND runtime_fingerprint = ?6
+           AND matching_copy_evidence = ?7",
         params![
             pending.skill_id,
             pending.app.as_str(),
             pending.name,
             pending.directory,
             pending.enabled,
-            pending.runtime_fingerprint
+            pending.runtime_fingerprint,
+            pending.copy_policy == SkillCopyPolicy::AllowMatching
         ],
     )?;
     if deleted != 1 {
@@ -752,14 +801,16 @@ fn delete_pending_if_present(
     connection.execute(
         "DELETE FROM skill_operation_journal
          WHERE skill_id = ?1 AND app_id = ?2 AND skill_name = ?3
-           AND directory = ?4 AND enabled = ?5 AND runtime_fingerprint = ?6",
+           AND directory = ?4 AND enabled = ?5 AND runtime_fingerprint = ?6
+           AND matching_copy_evidence = ?7",
         params![
             pending.skill_id,
             pending.app.as_str(),
             pending.name,
             pending.directory,
             pending.enabled,
-            pending.runtime_fingerprint
+            pending.runtime_fingerprint,
+            pending.copy_policy == SkillCopyPolicy::AllowMatching
         ],
     )?;
     Ok(())
@@ -803,7 +854,7 @@ fn verify_schema(connection: &Connection) -> Result<(), SkillError> {
     Ok(())
 }
 
-fn ensure_journal_runtime_fingerprint(connection: &Connection) -> Result<(), SkillError> {
+fn ensure_journal_extensions(connection: &Connection) -> Result<(), SkillError> {
     let info = journal_schema_info(connection)?;
     verify_journal_info(&info, false)?;
     let columns = info
@@ -813,6 +864,12 @@ fn ensure_journal_runtime_fingerprint(connection: &Connection) -> Result<(), Ski
     if !columns.contains("runtime_fingerprint") {
         connection.execute_batch(
             "ALTER TABLE skill_operation_journal ADD COLUMN runtime_fingerprint TEXT",
+        )?;
+    }
+    if !columns.contains("matching_copy_evidence") {
+        connection.execute_batch(
+            "ALTER TABLE skill_operation_journal
+             ADD COLUMN matching_copy_evidence BOOLEAN NOT NULL DEFAULT 0",
         )?;
     }
     Ok(())
@@ -844,6 +901,7 @@ fn verify_journal_info(
     let mut required = vec!["skill_id", "app_id", "skill_name", "directory", "enabled"];
     if require_runtime_fingerprint {
         required.push("runtime_fingerprint");
+        required.push("matching_copy_evidence");
     }
     for required in required {
         if !columns.contains(required) {
@@ -933,6 +991,16 @@ mod tests {
             )
             .unwrap();
         (directory, path, store)
+    }
+
+    #[test]
+    fn host_catalog_mapping_covers_every_managed_selection() {
+        for descriptor in builtin_app_registry().descriptors() {
+            let managed = descriptor
+                .skill_contract()
+                .is_some_and(|contract| contract.selection() == SkillSelectionMode::HostManaged);
+            assert_eq!(catalog_column(descriptor.app()).is_some(), managed);
+        }
     }
 
     #[test]
@@ -1120,6 +1188,33 @@ mod tests {
                 })
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn matching_copy_evidence_is_explicit_and_durable() {
+        let (_directory, path, store) = seed_store();
+        let pending = store
+            .begin_toggle("docs", AppType::Claude, false, "runtime-v1".to_owned())
+            .unwrap();
+        assert_eq!(pending.copy_policy(), SkillCopyPolicy::ManagedOnly);
+        store.cancel_pending(&pending).unwrap();
+
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE skills SET enabled_claude = 1", [])
+            .unwrap();
+        let pending = store
+            .begin_toggle("docs", AppType::Claude, false, "runtime-v1".to_owned())
+            .unwrap();
+        assert_eq!(pending.copy_policy(), SkillCopyPolicy::AllowMatching);
+
+        let recovered = store.pending_changes().unwrap();
+        assert!(recovered.issues.is_empty());
+        assert_eq!(recovered.changes.len(), 1);
+        assert_eq!(
+            recovered.changes[0].copy_policy(),
+            SkillCopyPolicy::AllowMatching
         );
     }
 
@@ -1413,6 +1508,7 @@ mod tests {
                         &pending.app,
                         pending.enabled,
                         &pending.runtime_fingerprint,
+                        pending.copy_policy(),
                     )
                 },
             )
@@ -1435,6 +1531,7 @@ mod tests {
                             &pending.app,
                             pending.enabled,
                             &pending.runtime_fingerprint,
+                            pending.copy_policy(),
                         )
                     },
                 )
@@ -1515,6 +1612,7 @@ mod tests {
                     &pending.app,
                     pending.enabled,
                     &pending.runtime_fingerprint,
+                    pending.copy_policy(),
                 )
             })
             .unwrap();
@@ -1584,6 +1682,7 @@ mod tests {
                             &pending.app,
                             pending.enabled,
                             &pending.runtime_fingerprint,
+                            pending.copy_policy(),
                         )
                     },
                 )

@@ -91,6 +91,10 @@ impl NativeLiveConfig {
         Ok(Self { paths })
     }
 
+    pub(crate) fn target_path(&self, target: LogicalTarget) -> &Path {
+        self.paths.path_for(target)
+    }
+
     pub(crate) fn observe_target(
         &self,
         target: LogicalTarget,

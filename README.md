@@ -36,9 +36,9 @@ write configuration from CC Switch and Lite at the same time.
 
 The Skills page only switches already-installed Skills between supported
 applications. Installation, discovery, updates, backups, and a marketplace are
-outside Lite. A switch may remove only a link to the selected shared Skill or a
-Core-marked, verified copy; an unrelated same-name directory is left intact and
-reported as a conflict.
+outside Lite. A switch may remove only a link, a Core-marked verified copy, or
+an exact legacy copy backed by the shared catalog's prior selection. An
+unrelated same-name directory is left intact and reported as a conflict.
 For applications that discover `~/.agents/skills` directly, Lite uses a native
 per-Skill control only when Core declares a safe one. Gemini, Grok, and Hermes
 use their native disabled lists. Other directly discovered copies are shown as

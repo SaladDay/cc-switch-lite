@@ -1,16 +1,21 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+use cc_switch_core::apply_skill_deployment;
 use cc_switch_core::{
-    apply_skill_deployment, builtin_app_registry, inspect_skill_config_state,
-    inspect_skill_deployment, inspect_skill_discovery, inspect_skill_presence, skill_name_key,
+    apply_skill_deployment_with_policy, builtin_app_registry, inspect_skill_config_state,
+    inspect_skill_deployment_with_policy, inspect_skill_discovery_with_policy,
+    inspect_skill_presence, resolve_skill_effective_state, resolve_skill_route, skill_name_key,
     skill_path_identity, validate_skill_directory, validate_skill_source, AppType,
-    SkillConfigError, SkillConfigState, SkillConfigTarget, SkillDeploymentReceipt,
-    SkillDeploymentState, SkillDiscoveryMode, SkillDiscoveryState, SkillSyncMethod,
+    SkillConfigError, SkillConfigState, SkillConfigTarget, SkillControlReason, SkillCopyPolicy,
+    SkillDeploymentReceipt, SkillDeploymentState, SkillDiscoveryMode, SkillDiscoveryState,
+    SkillRoute, SkillSyncMethod,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::skill::SkillAppState;
@@ -49,17 +54,36 @@ pub(crate) struct SkillObservation {
     pub(crate) app_overrides: BTreeMap<String, SkillAppState>,
 }
 
+pub(crate) struct SkillObservationRequest {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) directory: String,
+    pub(crate) selected_apps: HashMap<AppType, bool>,
+}
+
 pub(crate) type SkillConfigDocuments = HashMap<SkillConfigTarget, Result<Option<Vec<u8>>, String>>;
 
-pub(crate) struct SkillApplyRoute {
-    pub(crate) config_target: Option<SkillConfigTarget>,
-    pub(crate) deploy_native: bool,
+pub(crate) struct SkillAppResources {
+    app: AppType,
+    install_root: PathBuf,
+    config_path: Option<PathBuf>,
+}
+
+impl SkillAppResources {
+    pub(crate) fn new(app: AppType, install_root: PathBuf, config_path: Option<PathBuf>) -> Self {
+        Self {
+            app,
+            install_root,
+            config_path,
+        }
+    }
 }
 
 struct SkillTarget {
     app: AppType,
     install_root: PathBuf,
     skills_root: PathBuf,
+    config_path: Option<PathBuf>,
     issue: Option<String>,
 }
 
@@ -75,19 +99,20 @@ impl SkillLiveConfig {
         source_root: PathBuf,
         unified_discovery_root: PathBuf,
         sync_method: SkillSyncMethod,
-        app_roots: Vec<(AppType, PathBuf)>,
+        resources: Vec<SkillAppResources>,
     ) -> Result<Self, SkillLiveError> {
-        validate_targets(&app_roots)?;
-        let mut targets = app_roots
+        validate_targets(&resources)?;
+        let mut targets = resources
             .into_iter()
-            .map(|(app, install_root)| SkillTarget {
-                skills_root: install_root.join("skills"),
-                app,
-                install_root,
+            .map(|resources| SkillTarget {
+                skills_root: resources.install_root.join("skills"),
+                app: resources.app,
+                install_root: resources.install_root,
+                config_path: resources.config_path,
                 issue: None,
             })
             .collect::<Vec<_>>();
-        mark_overlapping_targets(&mut targets, &unified_discovery_root);
+        mark_overlapping_targets(&mut targets, &source_root, &unified_discovery_root);
         Ok(Self {
             source_root,
             unified_discovery_root,
@@ -98,42 +123,43 @@ impl SkillLiveConfig {
 
     pub(crate) fn observe(
         &self,
-        skills: &[(String, String, String)],
+        skills: &[SkillObservationRequest],
         configs: &SkillConfigDocuments,
     ) -> Vec<SkillObservation> {
         let mut name_counts = HashMap::new();
-        for (_, name, _) in skills {
-            if let Ok(key) = skill_name_key(name) {
+        for skill in skills {
+            if let Ok(key) = skill_name_key(&skill.name) {
                 *name_counts.entry(key).or_insert(0_usize) += 1;
             }
         }
         skills
             .iter()
-            .map(|(id, name, directory)| {
-                let directory_issue = validate_skill_directory(directory)
+            .map(|skill| {
+                let directory_issue = validate_skill_directory(&skill.directory)
                     .err()
                     .map(|error| error.to_string());
                 let source_issue = directory_issue.clone().or_else(|| {
-                    validate_skill_source(&self.source_root.join(directory))
+                    validate_skill_source(&self.source_root.join(&skill.directory))
                         .err()
                         .map(|error| error.to_string())
                 });
                 let app_overrides = if directory_issue.is_some() {
                     unknown_app_states()
                 } else {
-                    let ambiguous_name = skill_name_key(name)
+                    let ambiguous_name = skill_name_key(&skill.name)
                         .ok()
                         .is_some_and(|key| name_counts.get(&key).copied().unwrap_or_default() > 1);
                     self.observe_app_overrides(
-                        name,
-                        directory,
+                        &skill.name,
+                        &skill.directory,
                         source_issue.is_none(),
                         ambiguous_name,
+                        &skill.selected_apps,
                         configs,
                     )
                 };
                 SkillObservation {
-                    id: id.clone(),
+                    id: skill.id.clone(),
                     source_issue,
                     app_overrides,
                 }
@@ -145,32 +171,25 @@ impl SkillLiveConfig {
         &self,
         directory: &str,
         app: &AppType,
-    ) -> Result<SkillApplyRoute, SkillLiveError> {
+        copy_policy: SkillCopyPolicy,
+    ) -> Result<SkillRoute, SkillLiveError> {
         let descriptor = builtin_app_registry().for_app(app);
         let Some(contract) = descriptor.skill_contract() else {
             return Err(SkillLiveError::Unsupported(app.as_str().to_owned()));
         };
         let discovery = match contract.discovery() {
-            SkillDiscoveryMode::Unified => {
-                inspect_skill_discovery(&self.source_root, &self.unified_discovery_root, directory)?
-            }
+            SkillDiscoveryMode::Unified => inspect_skill_discovery_with_policy(
+                &self.source_root,
+                &self.unified_discovery_root,
+                directory,
+                copy_policy,
+            )?,
             SkillDiscoveryMode::Managed => SkillDiscoveryState::Missing,
         };
-        if discovery == SkillDiscoveryState::External {
-            return Err(SkillLiveError::UnifiedConflict(
-                descriptor.display_name().to_owned(),
-            ));
-        }
-        let config_target = match (contract.discovery(), contract.config_target(), discovery) {
-            (SkillDiscoveryMode::Unified, None, SkillDiscoveryState::Selected) => {
-                return Err(SkillLiveError::UnifiedDiscovery(
-                    descriptor.display_name().to_owned(),
-                ))
-            }
-            (_, target, _) => target,
-        };
-        let deploy_native = contract.discovery() == SkillDiscoveryMode::Managed
-            || discovery == SkillDiscoveryState::Missing;
+        let route = resolve_skill_route(*contract, discovery)
+            .map_err(|reason| control_reason_error(descriptor.display_name(), reason))?;
+        let config_target = route.config_target();
+        let deploy_native = route.deploy_native();
         if config_target.is_some() || deploy_native {
             let target = self
                 .target(app)
@@ -180,10 +199,7 @@ impl SkillLiveConfig {
                 require_app_root(descriptor.display_name(), target)?;
             }
         }
-        Ok(SkillApplyRoute {
-            config_target,
-            deploy_native,
-        })
+        Ok(route)
     }
 
     pub(crate) fn apply_deployment(
@@ -191,6 +207,7 @@ impl SkillLiveConfig {
         directory: &str,
         app: &AppType,
         enabled: bool,
+        copy_policy: SkillCopyPolicy,
     ) -> Result<SkillDeploymentReceipt, SkillLiveError> {
         let descriptor = builtin_app_registry().for_app(app);
         if descriptor.skill_contract().is_none() {
@@ -203,14 +220,58 @@ impl SkillLiveConfig {
         if enabled {
             require_app_root(descriptor.display_name(), target)?;
         }
-        apply_skill_deployment(
+        apply_skill_deployment_with_policy(
             &self.source_root,
             &target.skills_root,
             directory,
             enabled,
             self.sync_method,
+            copy_policy,
         )
         .map_err(Into::into)
+    }
+
+    pub(crate) fn runtime_fingerprint(&self, app: &AppType) -> Result<String, SkillLiveError> {
+        let target = self
+            .target(app)
+            .ok_or_else(|| SkillLiveError::MissingTarget(app.as_str().to_owned()))?;
+        require_safe_target(target)?;
+        let contract = builtin_app_registry()
+            .for_app(app)
+            .skill_contract()
+            .ok_or_else(|| SkillLiveError::Unsupported(app.as_str().to_owned()))?;
+        let mut hasher = Sha256::new();
+        hash_fingerprint_field(&mut hasher, b"cc-switch-lite-skill-runtime-v1");
+        hash_fingerprint_field(&mut hasher, app.as_str().as_bytes());
+        for path in [
+            &self.source_root,
+            &self.unified_discovery_root,
+            &target.install_root,
+            &target.skills_root,
+        ] {
+            hash_fingerprint_path(&mut hasher, &skill_path_identity(path)?);
+        }
+        hash_fingerprint_field(
+            &mut hasher,
+            match self.sync_method {
+                SkillSyncMethod::Auto => b"auto",
+                SkillSyncMethod::Symlink => b"symlink",
+                SkillSyncMethod::Copy => b"copy",
+            },
+        );
+        if let Some(config_target) = contract.config_target() {
+            let label = match config_target {
+                SkillConfigTarget::GeminiSettings => b"gemini-settings".as_slice(),
+                SkillConfigTarget::GrokConfig => b"grok-config".as_slice(),
+                SkillConfigTarget::HermesConfig => b"hermes-config".as_slice(),
+            };
+            let config_path = target.config_path.as_ref().ok_or_else(|| {
+                SkillLiveError::MissingTarget(format!("{} configuration", app.as_str()))
+            })?;
+            hash_fingerprint_field(&mut hasher, label);
+            hash_fingerprint_path(&mut hasher, &skill_path_identity(config_path)?);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     fn observe_app_overrides(
@@ -219,11 +280,9 @@ impl SkillLiveConfig {
         directory: &str,
         source_valid: bool,
         ambiguous_name: bool,
+        selected_apps: &HashMap<AppType, bool>,
         configs: &SkillConfigDocuments,
     ) -> BTreeMap<String, SkillAppState> {
-        let unified_discovery =
-            inspect_skill_discovery(&self.source_root, &self.unified_discovery_root, directory)
-                .map_err(|error| error.to_string());
         builtin_app_registry()
             .descriptors()
             .filter_map(|descriptor| {
@@ -231,6 +290,13 @@ impl SkillLiveConfig {
                 Some((descriptor, contract))
             })
             .map(|(descriptor, contract)| {
+                let copy_policy = selected_apps
+                    .get(descriptor.app())
+                    .copied()
+                    .filter(|selected| *selected)
+                    .map_or(SkillCopyPolicy::ManagedOnly, |_| {
+                        SkillCopyPolicy::AllowMatching
+                    });
                 let native_observation = || {
                     self.target(descriptor.app())
                         .map(|target| {
@@ -242,6 +308,7 @@ impl SkillLiveConfig {
                                     &target.skills_root,
                                     directory,
                                     source_valid,
+                                    copy_policy,
                                 ),
                                 Err(error) => SkillAppState {
                                     enabled: None,
@@ -258,46 +325,53 @@ impl SkillLiveConfig {
                         })
                 };
                 let discovery = if contract.discovery() == SkillDiscoveryMode::Unified {
-                    unified_discovery.clone()
+                    inspect_skill_discovery_with_policy(
+                        &self.source_root,
+                        &self.unified_discovery_root,
+                        directory,
+                        copy_policy,
+                    )
+                    .map_err(|error| error.to_string())
                 } else {
                     Ok(SkillDiscoveryState::Missing)
                 };
-                let observation = match (contract.discovery(), contract.config_target(), discovery)
-                {
-                    (SkillDiscoveryMode::Unified, _, Ok(SkillDiscoveryState::External)) => {
-                        SkillAppState {
-                            enabled: None,
-                            issue: Some(
-                                SkillLiveError::UnifiedConflict(
-                                    descriptor.display_name().to_owned(),
-                                )
-                                .to_string(),
-                            ),
-                        }
-                    }
-                    (SkillDiscoveryMode::Unified, None, Ok(SkillDiscoveryState::Selected)) => {
-                        SkillAppState {
-                            enabled: None,
-                            issue: Some(
-                                SkillLiveError::UnifiedDiscovery(
-                                    descriptor.display_name().to_owned(),
-                                )
-                                .to_string(),
-                            ),
-                        }
-                    }
-                    (_, Some(target), Ok(discovery)) => observe_configured_state(
-                        native_observation(),
-                        target,
-                        name,
-                        discovery == SkillDiscoveryState::Selected,
-                        configs,
-                    ),
-                    (SkillDiscoveryMode::Unified, _, Err(issue)) => SkillAppState {
+                let observation = match discovery {
+                    Err(issue) => SkillAppState {
                         enabled: None,
-                        issue: Some(issue.clone()),
+                        issue: Some(issue),
                     },
-                    _ => native_observation(),
+                    Ok(discovery) => {
+                        let direct = contract.discovery() == SkillDiscoveryMode::Unified
+                            && contract.config_target().is_none()
+                            && discovery != SkillDiscoveryState::Missing;
+                        let native = if direct {
+                            SkillAppState {
+                                enabled: None,
+                                issue: None,
+                            }
+                        } else {
+                            native_observation()
+                        };
+                        let config_state = contract
+                            .config_target()
+                            .map(|target| observe_config_state(target, name, configs));
+                        match config_state.transpose() {
+                            Ok(config_state) => apply_effective_state(
+                                descriptor.display_name(),
+                                *contract,
+                                discovery,
+                                native,
+                                config_state,
+                            ),
+                            Err(issue) => append_issue(
+                                SkillAppState {
+                                    enabled: None,
+                                    issue: native.issue,
+                                },
+                                issue,
+                            ),
+                        }
+                    }
                 };
                 let observation = if ambiguous_name && contract.config_target().is_some() {
                     append_issue(
@@ -343,10 +417,11 @@ fn require_safe_target(target: &SkillTarget) -> Result<(), SkillLiveError> {
 }
 
 fn observe_managed_presence(
-    source_root: &std::path::Path,
-    destination_root: &std::path::Path,
+    source_root: &Path,
+    destination_root: &Path,
     directory: &str,
     source_valid: bool,
+    copy_policy: SkillCopyPolicy,
 ) -> SkillAppState {
     match inspect_skill_presence(destination_root, directory) {
         Ok(false) => SkillAppState {
@@ -360,7 +435,12 @@ fn observe_managed_presence(
                     issue: None,
                 };
             }
-            match inspect_skill_deployment(source_root, destination_root, directory) {
+            match inspect_skill_deployment_with_policy(
+                source_root,
+                destination_root,
+                directory,
+                copy_policy,
+            ) {
                 Ok(SkillDeploymentState::Linked | SkillDeploymentState::Copied) => SkillAppState {
                     enabled: Some(true),
                     issue: None,
@@ -382,14 +462,12 @@ fn observe_managed_presence(
     }
 }
 
-fn observe_configured_state(
-    native: SkillAppState,
+fn observe_config_state(
     target: SkillConfigTarget,
     name: &str,
-    external: bool,
     configs: &SkillConfigDocuments,
-) -> SkillAppState {
-    let configured = configs
+) -> Result<SkillConfigState, String> {
+    configs
         .get(&target)
         .ok_or_else(|| "native Skill settings were not observed".to_owned())
         .and_then(|contents| {
@@ -400,40 +478,57 @@ fn observe_configured_state(
                     inspect_skill_config_state(target, contents.as_deref(), name)
                         .map_err(|error| error.to_string())
                 })
-        });
-    match configured {
-        Ok(SkillConfigState::GloballyDisabled) => append_issue(
-            SkillAppState {
-                enabled: Some(false),
-                issue: native.issue,
-            },
-            "Skills are disabled globally in the application's native settings".to_owned(),
-        ),
-        Ok(SkillConfigState::ExternallyDisabled) => append_issue(
-            SkillAppState {
-                enabled: None,
-                issue: native.issue,
-            },
-            "This Skill is disabled by a platform-specific native setting".to_owned(),
-        ),
-        Ok(configured @ (SkillConfigState::Enabled | SkillConfigState::Disabled)) => {
-            let configured = configured == SkillConfigState::Enabled;
-            SkillAppState {
-                enabled: if external || !configured {
-                    Some(configured)
-                } else {
-                    native.enabled
-                },
-                issue: native.issue,
-            }
+        })
+}
+
+fn apply_effective_state(
+    display_name: &str,
+    contract: cc_switch_core::SkillAppContract,
+    discovery: SkillDiscoveryState,
+    native: SkillAppState,
+    config_state: Option<SkillConfigState>,
+) -> SkillAppState {
+    let effective =
+        resolve_skill_effective_state(contract, discovery, native.enabled, config_state);
+    let observation = SkillAppState {
+        enabled: effective.enabled(),
+        issue: native.issue,
+    };
+    match effective.reason() {
+        Some(reason) => append_issue(observation, control_reason_message(display_name, reason)),
+        None => observation,
+    }
+}
+
+fn control_reason_error(display_name: &str, reason: SkillControlReason) -> SkillLiveError {
+    match reason {
+        SkillControlReason::ExternalDiscovery => {
+            SkillLiveError::UnifiedConflict(display_name.to_owned())
         }
-        Err(issue) => append_issue(
-            SkillAppState {
-                enabled: None,
-                issue: native.issue,
-            },
-            issue,
-        ),
+        SkillControlReason::DirectUnifiedDiscovery => {
+            SkillLiveError::UnifiedDiscovery(display_name.to_owned())
+        }
+        _ => SkillLiveError::InvalidTargets(control_reason_message(display_name, reason)),
+    }
+}
+
+fn control_reason_message(display_name: &str, reason: SkillControlReason) -> String {
+    match reason {
+        SkillControlReason::ExternalDiscovery => {
+            SkillLiveError::UnifiedConflict(display_name.to_owned()).to_string()
+        }
+        SkillControlReason::DirectUnifiedDiscovery => {
+            SkillLiveError::UnifiedDiscovery(display_name.to_owned()).to_string()
+        }
+        SkillControlReason::GloballyDisabled => {
+            "Skills are disabled globally in the application's native settings".to_owned()
+        }
+        SkillControlReason::ExternallyDisabled => {
+            "This Skill is disabled by a platform-specific native setting".to_owned()
+        }
+        SkillControlReason::NativeControlUnavailable => {
+            "The application's native Skill control is unavailable".to_owned()
+        }
     }
 }
 
@@ -461,70 +556,231 @@ fn unknown_app_states() -> BTreeMap<String, SkillAppState> {
         .collect()
 }
 
-fn validate_targets(app_roots: &[(AppType, PathBuf)]) -> Result<(), SkillLiveError> {
+fn validate_targets(resources: &[SkillAppResources]) -> Result<(), SkillLiveError> {
     for descriptor in builtin_app_registry().descriptors() {
         let expected = usize::from(descriptor.skill_contract().is_some());
-        let actual = app_roots
+        let matching = resources
             .iter()
-            .filter(|(app, _)| app == descriptor.app())
-            .count();
-        if actual != expected {
+            .filter(|resources| &resources.app == descriptor.app())
+            .collect::<Vec<_>>();
+        if matching.len() != expected {
             return Err(SkillLiveError::InvalidTargets(format!(
-                "application '{}' requires {expected} target(s), found {actual}",
-                descriptor.id()
+                "application '{}' requires {expected} target(s), found {}",
+                descriptor.id(),
+                matching.len()
             )));
+        }
+        if let (Some(contract), Some(resources)) = (descriptor.skill_contract(), matching.first()) {
+            if contract.config_target().is_some() != resources.config_path.is_some() {
+                return Err(SkillLiveError::InvalidTargets(format!(
+                    "application '{}' has an invalid Skill configuration resource",
+                    descriptor.id()
+                )));
+            }
         }
     }
     Ok(())
 }
 
-fn mark_overlapping_targets(targets: &mut [SkillTarget], unified_discovery_root: &std::path::Path) {
-    let identities = targets
-        .iter()
-        .map(|target| skill_path_identity(&target.skills_root).map_err(|error| error.to_string()))
-        .collect::<Vec<_>>();
-    for (target, identity) in targets.iter_mut().zip(&identities) {
-        if let Err(issue) = identity {
-            append_target_issue(target, issue.clone());
+fn mark_overlapping_targets(
+    targets: &mut [SkillTarget],
+    source_root: &Path,
+    unified_discovery_root: &Path,
+) {
+    let mut resources = Vec::new();
+    let source = collect_shared_resource(
+        targets,
+        &mut resources,
+        SkillResourceKind::Source,
+        source_root,
+        "shared Skill source",
+    );
+    let unified = collect_shared_resource(
+        targets,
+        &mut resources,
+        SkillResourceKind::Unified,
+        unified_discovery_root,
+        "unified Skill directory",
+    );
+    if source
+        .as_ref()
+        .zip(unified.as_ref())
+        .is_some_and(|(source, unified)| source == unified)
+    {
+        resources.retain(|resource| resource.kind != SkillResourceKind::Unified);
+    }
+
+    for index in 0..targets.len() {
+        let skills_root = targets[index].skills_root.clone();
+        let config_path = targets[index].config_path.clone();
+        collect_target_resource(
+            targets,
+            &mut resources,
+            SkillResourceKind::Native(index),
+            index,
+            skills_root,
+            "native Skill directory",
+        );
+        if let Some(path) = config_path {
+            collect_target_resource(
+                targets,
+                &mut resources,
+                SkillResourceKind::Config(index),
+                index,
+                path,
+                "native Skill configuration",
+            );
         }
     }
-    if let Ok(unified) = skill_path_identity(unified_discovery_root) {
-        for (target, identity) in targets.iter_mut().zip(&identities) {
-            let Ok(path) = identity else {
+
+    for left in 0..resources.len() {
+        for right in (left + 1)..resources.len() {
+            let left = &resources[left];
+            let right = &resources[right];
+            if !paths_overlap(&left.path, &right.path) {
                 continue;
-            };
-            if paths_overlap(path, &unified) {
-                append_target_issue(
-                    target,
-                    "native Skill directory overlaps the unified Skill directory".to_owned(),
-                );
             }
-        }
-    }
-    for left in 0..targets.len() {
-        for right in (left + 1)..targets.len() {
-            let (Ok(left_path), Ok(right_path)) = (&identities[left], &identities[right]) else {
+            if same_target_resources(left.kind, right.kind) {
+                let index = left.kind.owner().expect("target resource has an owner");
+                append_target_issue(
+                    &mut targets[index],
+                    "native Skill configuration overlaps its Skill directory".to_owned(),
+                );
                 continue;
-            };
-            if paths_overlap(left_path, right_path) {
-                let right_app = targets[right].app.as_str().to_owned();
-                let left_app = targets[left].app.as_str().to_owned();
-                let (before_right, from_right) = targets.split_at_mut(right);
-                append_target_issue(
-                    &mut before_right[left],
-                    format!("native Skill directory overlaps application '{right_app}'"),
-                );
-                append_target_issue(
-                    &mut from_right[0],
-                    format!("native Skill directory overlaps application '{left_app}'"),
-                );
+            }
+            for (current, other) in [(left.kind, right.kind), (right.kind, left.kind)] {
+                if let Some((index, issue)) = resource_overlap_issue(current, other, targets) {
+                    append_target_issue(&mut targets[index], issue);
+                }
             }
         }
     }
 }
 
-fn paths_overlap(left: &std::path::Path, right: &std::path::Path) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillResourceKind {
+    Source,
+    Unified,
+    Native(usize),
+    Config(usize),
+}
+
+impl SkillResourceKind {
+    const fn owner(self) -> Option<usize> {
+        match self {
+            Self::Native(index) | Self::Config(index) => Some(index),
+            Self::Source | Self::Unified => None,
+        }
+    }
+}
+
+struct SkillResource {
+    kind: SkillResourceKind,
+    path: PathBuf,
+}
+
+fn collect_shared_resource(
+    targets: &mut [SkillTarget],
+    resources: &mut Vec<SkillResource>,
+    kind: SkillResourceKind,
+    path: &Path,
+    label: &str,
+) -> Option<PathBuf> {
+    match skill_path_identity(path) {
+        Ok(path) => {
+            resources.push(SkillResource {
+                kind,
+                path: path.clone(),
+            });
+            Some(path)
+        }
+        Err(error) => {
+            for target in targets {
+                append_target_issue(target, format!("{label} is unavailable: {error}"));
+            }
+            None
+        }
+    }
+}
+
+fn collect_target_resource(
+    targets: &mut [SkillTarget],
+    resources: &mut Vec<SkillResource>,
+    kind: SkillResourceKind,
+    index: usize,
+    path: PathBuf,
+    label: &str,
+) {
+    match skill_path_identity(&path) {
+        Ok(path) => resources.push(SkillResource { kind, path }),
+        Err(error) => append_target_issue(
+            &mut targets[index],
+            format!("{label} is unavailable: {error}"),
+        ),
+    }
+}
+
+fn same_target_resources(left: SkillResourceKind, right: SkillResourceKind) -> bool {
+    matches!(
+        (left, right),
+        (SkillResourceKind::Native(left), SkillResourceKind::Config(right))
+            | (SkillResourceKind::Config(left), SkillResourceKind::Native(right))
+            if left == right
+    )
+}
+
+fn resource_overlap_issue(
+    current: SkillResourceKind,
+    other: SkillResourceKind,
+    targets: &[SkillTarget],
+) -> Option<(usize, String)> {
+    let index = current.owner()?;
+    let current_label = match current {
+        SkillResourceKind::Native(_) => "native Skill directory",
+        SkillResourceKind::Config(_) => "native Skill configuration",
+        SkillResourceKind::Source | SkillResourceKind::Unified => unreachable!(),
+    };
+    let other_label = match other {
+        SkillResourceKind::Source => "the shared Skill source".to_owned(),
+        SkillResourceKind::Unified => "the unified Skill directory".to_owned(),
+        SkillResourceKind::Native(other) => {
+            format!("application '{}'", targets[other].app.as_str())
+        }
+        SkillResourceKind::Config(other) => {
+            format!(
+                "application '{}' configuration",
+                targets[other].app.as_str()
+            )
+        }
+    };
+    Some((index, format!("{current_label} overlaps {other_label}")))
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn hash_fingerprint_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(value);
+}
+
+fn hash_fingerprint_path(hasher: &mut Sha256, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hash_fingerprint_field(hasher, path.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let bytes = path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        hash_fingerprint_field(hasher, &bytes);
+    }
 }
 
 fn append_target_issue(target: &mut SkillTarget, issue: String) {
@@ -539,8 +795,13 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn skill_request() -> Vec<(String, String, String)> {
-        vec![("skill".to_owned(), "Docs".to_owned(), "docs".to_owned())]
+    fn skill_request() -> Vec<SkillObservationRequest> {
+        vec![SkillObservationRequest {
+            id: "skill".to_owned(),
+            name: "Docs".to_owned(),
+            directory: "docs".to_owned(),
+            selected_apps: HashMap::new(),
+        }]
     }
 
     fn enabled_configs() -> SkillConfigDocuments {
@@ -553,16 +814,27 @@ mod tests {
 
     #[test]
     fn native_uncertainty_is_not_reported_as_disabled() {
+        let contract = *builtin_app_registry()
+            .for_app(&AppType::Gemini)
+            .skill_contract()
+            .unwrap();
         let native = SkillAppState {
             enabled: None,
             issue: Some("native state unavailable".to_owned()),
         };
-        let enabled = observe_configured_state(
+        let enabled = apply_effective_state(
+            "Gemini",
+            contract,
+            SkillDiscoveryState::Missing,
             native,
-            SkillConfigTarget::GeminiSettings,
-            "Docs",
-            false,
-            &enabled_configs(),
+            Some(
+                observe_config_state(
+                    SkillConfigTarget::GeminiSettings,
+                    "Docs",
+                    &enabled_configs(),
+                )
+                .unwrap(),
+            ),
         );
         assert_eq!(enabled.enabled, None);
 
@@ -571,24 +843,41 @@ mod tests {
             SkillConfigTarget::GeminiSettings,
             Ok(Some(br#"{"skills":{"disabled":["Docs"]}}"#.to_vec())),
         );
-        let disabled = observe_configured_state(
+        let disabled = apply_effective_state(
+            "Gemini",
+            contract,
+            SkillDiscoveryState::Missing,
             SkillAppState {
                 enabled: None,
                 issue: None,
             },
-            SkillConfigTarget::GeminiSettings,
-            "Docs",
-            false,
-            &disabled_configs,
+            Some(
+                observe_config_state(SkillConfigTarget::GeminiSettings, "Docs", &disabled_configs)
+                    .unwrap(),
+            ),
         );
         assert_eq!(disabled.enabled, Some(false));
     }
 
-    fn app_roots(base: &std::path::Path) -> Vec<(AppType, PathBuf)> {
+    fn app_resources(base: &Path) -> Vec<SkillAppResources> {
         builtin_app_registry()
             .descriptors()
-            .filter(|descriptor| descriptor.skill_contract().is_some())
-            .map(|descriptor| (descriptor.app().clone(), base.join(descriptor.id())))
+            .filter_map(|descriptor| {
+                let contract = descriptor.skill_contract()?;
+                let install_root = base.join(descriptor.id());
+                let config_path = contract.config_target().map(|target| {
+                    install_root.join(match target {
+                        SkillConfigTarget::GeminiSettings => "settings.json",
+                        SkillConfigTarget::GrokConfig => "config.toml",
+                        SkillConfigTarget::HermesConfig => "config.yaml",
+                    })
+                });
+                Some(SkillAppResources::new(
+                    descriptor.app().clone(),
+                    install_root,
+                    config_path,
+                ))
+            })
             .collect()
     }
 
@@ -602,12 +891,12 @@ mod tests {
             source,
             directory.path().join("unified"),
             SkillSyncMethod::Copy,
-            app_roots(directory.path()),
+            app_resources(directory.path()),
         )
         .unwrap();
 
         assert!(matches!(
-            live.apply_deployment("docs", &AppType::Claude, true),
+            live.apply_deployment("docs", &AppType::Claude, true, SkillCopyPolicy::ManagedOnly),
             Err(SkillLiveError::AppUnavailable(_))
         ));
         assert!(!directory.path().join("claude").exists());
@@ -621,12 +910,12 @@ mod tests {
         fs::create_dir_all(source.join("docs")).unwrap();
         fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
         fs::create_dir_all(&pi).unwrap();
-        let mut roots = app_roots(directory.path());
+        let mut roots = app_resources(directory.path());
         roots
             .iter_mut()
-            .find(|(app, _)| app == &AppType::Pi)
+            .find(|resources| resources.app == AppType::Pi)
             .unwrap()
-            .1 = pi.clone();
+            .install_root = pi.clone();
         let live = SkillLiveConfig::new(
             source,
             directory.path().join("unified"),
@@ -634,7 +923,7 @@ mod tests {
             roots,
         )
         .unwrap();
-        live.apply_deployment("docs", &AppType::Pi, true)
+        live.apply_deployment("docs", &AppType::Pi, true, SkillCopyPolicy::ManagedOnly)
             .unwrap()
             .commit()
             .unwrap();
@@ -662,9 +951,9 @@ mod tests {
             .unwrap()
             .commit()
             .unwrap();
-        let roots = app_roots(directory.path());
-        for (_, root) in &roots {
-            fs::create_dir_all(root).unwrap();
+        let roots = app_resources(directory.path());
+        for resources in &roots {
+            fs::create_dir_all(&resources.install_root).unwrap();
         }
         let live = SkillLiveConfig::new(source, unified, SkillSyncMethod::Copy, roots).unwrap();
 
@@ -695,7 +984,7 @@ mod tests {
                 descriptor.id()
             );
             assert!(matches!(
-                live.route("docs", descriptor.app()),
+                live.route("docs", descriptor.app(), SkillCopyPolicy::ManagedOnly),
                 Err(SkillLiveError::UnifiedDiscovery(_))
             ));
         }
@@ -705,9 +994,11 @@ mod tests {
             Some(true)
         );
         for app in [AppType::Gemini, AppType::GrokBuild] {
-            let route = live.route("docs", &app).unwrap();
-            assert!(!route.deploy_native);
-            assert!(route.config_target.is_some());
+            let route = live
+                .route("docs", &app, SkillCopyPolicy::ManagedOnly)
+                .unwrap();
+            assert!(!route.deploy_native());
+            assert!(route.config_target().is_some());
         }
     }
 
@@ -722,9 +1013,9 @@ mod tests {
             .unwrap()
             .commit()
             .unwrap();
-        let roots = app_roots(directory.path());
-        for (_, root) in &roots {
-            fs::create_dir_all(root).unwrap();
+        let roots = app_resources(directory.path());
+        for resources in &roots {
+            fs::create_dir_all(&resources.install_root).unwrap();
         }
         let live = SkillLiveConfig::new(source, unified, SkillSyncMethod::Copy, roots).unwrap();
         let configs = HashMap::from([
@@ -752,15 +1043,15 @@ mod tests {
         let unified = directory.path().join(".agents/skills");
         fs::create_dir_all(source.join("docs")).unwrap();
         fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
-        let roots = app_roots(directory.path());
-        for (_, root) in &roots {
-            fs::create_dir_all(root).unwrap();
+        let roots = app_resources(directory.path());
+        for resources in &roots {
+            fs::create_dir_all(&resources.install_root).unwrap();
         }
         let hermes_root = roots
             .iter()
-            .find(|(app, _)| *app == AppType::Hermes)
+            .find(|resources| resources.app == AppType::Hermes)
             .unwrap()
-            .1
+            .install_root
             .clone();
         apply_skill_deployment(
             &source,
@@ -805,9 +1096,9 @@ mod tests {
             fs::create_dir_all(source.join(name)).unwrap();
             fs::write(source.join(name).join("SKILL.md"), "# Skill").unwrap();
         }
-        let roots = app_roots(directory.path());
-        for (_, root) in &roots {
-            fs::create_dir_all(root).unwrap();
+        let roots = app_resources(directory.path());
+        for resources in &roots {
+            fs::create_dir_all(&resources.install_root).unwrap();
         }
         let live = SkillLiveConfig::new(
             source,
@@ -817,8 +1108,18 @@ mod tests {
         )
         .unwrap();
         let skills = vec![
-            ("one".to_owned(), "Docs".to_owned(), "docs".to_owned()),
-            ("two".to_owned(), "Ｄocs".to_owned(), "other".to_owned()),
+            SkillObservationRequest {
+                id: "one".to_owned(),
+                name: "Docs".to_owned(),
+                directory: "docs".to_owned(),
+                selected_apps: HashMap::new(),
+            },
+            SkillObservationRequest {
+                id: "two".to_owned(),
+                name: "Ｄocs".to_owned(),
+                directory: "other".to_owned(),
+                selected_apps: HashMap::new(),
+            },
         ];
 
         let observations = live.observe(&skills, &enabled_configs());
@@ -842,12 +1143,12 @@ mod tests {
         fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
         fs::create_dir_all(claude.join("skills/docs")).unwrap();
         fs::write(claude.join("skills/docs/SKILL.md"), "# Docs").unwrap();
-        let mut roots = app_roots(directory.path());
+        let mut roots = app_resources(directory.path());
         roots
             .iter_mut()
-            .find(|(app, _)| app == &AppType::Claude)
+            .find(|resources| resources.app == AppType::Claude)
             .unwrap()
-            .1 = claude;
+            .install_root = claude;
         let live = SkillLiveConfig::new(
             source,
             directory.path().join("unified"),
@@ -863,16 +1164,61 @@ mod tests {
     }
 
     #[test]
+    fn selected_legacy_copy_can_be_observed_and_disabled() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let claude = directory.path().join("claude");
+        fs::create_dir_all(source.join("docs")).unwrap();
+        fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
+        fs::create_dir_all(claude.join("skills/docs")).unwrap();
+        fs::write(claude.join("skills/docs/SKILL.md"), "# Docs").unwrap();
+        let mut resources = app_resources(directory.path());
+        resources
+            .iter_mut()
+            .find(|resources| resources.app == AppType::Claude)
+            .unwrap()
+            .install_root = claude.clone();
+        let live = SkillLiveConfig::new(
+            source.clone(),
+            directory.path().join("unified"),
+            SkillSyncMethod::Copy,
+            resources,
+        )
+        .unwrap();
+        let mut request = skill_request();
+        request[0].selected_apps.insert(AppType::Claude, true);
+
+        let observations = live.observe(&request, &enabled_configs());
+        assert_eq!(observations[0].app_overrides["claude"].enabled, Some(true));
+        live.apply_deployment(
+            "docs",
+            &AppType::Claude,
+            false,
+            SkillCopyPolicy::AllowMatching,
+        )
+        .unwrap()
+        .commit()
+        .unwrap();
+        assert!(!claude.join("skills/docs").exists());
+        assert!(source.join("docs/SKILL.md").is_file());
+    }
+
+    #[test]
     fn invalid_directory_never_falls_back_to_requested_catalog_state() {
         let directory = tempdir().unwrap();
         let live = SkillLiveConfig::new(
             directory.path().join("source"),
             directory.path().join("unified"),
             SkillSyncMethod::Copy,
-            app_roots(directory.path()),
+            app_resources(directory.path()),
         )
         .unwrap();
-        let skills = vec![("skill".to_owned(), "Docs".to_owned(), "../docs".to_owned())];
+        let skills = vec![SkillObservationRequest {
+            id: "skill".to_owned(),
+            name: "Docs".to_owned(),
+            directory: "../docs".to_owned(),
+            selected_apps: HashMap::new(),
+        }];
 
         let observations = live.observe(&skills, &enabled_configs());
         assert!(observations[0].source_issue.is_some());
@@ -890,12 +1236,12 @@ mod tests {
         fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
         let shared_app_root = directory.path().join("shared-app");
         fs::create_dir_all(&shared_app_root).unwrap();
-        let mut roots = app_roots(directory.path());
-        for (app, root) in &mut roots {
-            if matches!(app, AppType::Claude | AppType::Codex) {
-                *root = shared_app_root.clone();
+        let mut roots = app_resources(directory.path());
+        for resources in &mut roots {
+            if matches!(resources.app, AppType::Claude | AppType::Codex) {
+                resources.install_root = shared_app_root.clone();
             } else {
-                fs::create_dir_all(root).unwrap();
+                fs::create_dir_all(&resources.install_root).unwrap();
             }
         }
         let live = SkillLiveConfig::new(
@@ -916,7 +1262,7 @@ mod tests {
                 .is_some_and(|issue| issue.contains("overlaps")));
         }
         assert!(matches!(
-            live.route("docs", &AppType::Claude),
+            live.route("docs", &AppType::Claude, SkillCopyPolicy::ManagedOnly),
             Err(SkillLiveError::InvalidTargets(_))
         ));
         assert!(observations[0].app_overrides["hermes"].issue.is_none());
@@ -930,14 +1276,14 @@ mod tests {
         fs::create_dir_all(source.join("docs")).unwrap();
         fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
         fs::create_dir_all(&unified).unwrap();
-        let mut roots = app_roots(directory.path());
+        let mut roots = app_resources(directory.path());
         roots
             .iter_mut()
-            .find(|(app, _)| app == &AppType::Codex)
+            .find(|resources| resources.app == AppType::Codex)
             .unwrap()
-            .1 = directory.path().join(".agents");
-        for (_, root) in &roots {
-            fs::create_dir_all(root).unwrap();
+            .install_root = directory.path().join(".agents");
+        for resources in &roots {
+            fs::create_dir_all(&resources.install_root).unwrap();
         }
         let live = SkillLiveConfig::new(source, unified, SkillSyncMethod::Copy, roots).unwrap();
 
@@ -949,7 +1295,44 @@ mod tests {
             .as_deref()
             .is_some_and(|issue| issue.contains("unified Skill directory")));
         assert!(matches!(
-            live.route("docs", &AppType::Codex),
+            live.route("docs", &AppType::Codex, SkillCopyPolicy::ManagedOnly),
+            Err(SkillLiveError::InvalidTargets(_))
+        ));
+    }
+
+    #[test]
+    fn native_configuration_overlapping_skill_source_is_read_only() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir_all(source.join("docs")).unwrap();
+        fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
+        let mut resources = app_resources(directory.path());
+        let gemini = resources
+            .iter_mut()
+            .find(|resources| resources.app == AppType::Gemini)
+            .unwrap();
+        gemini.install_root = source.clone();
+        gemini.config_path = Some(source.join("settings.json"));
+        for resources in &resources {
+            fs::create_dir_all(&resources.install_root).unwrap();
+        }
+        let live = SkillLiveConfig::new(
+            source,
+            directory.path().join("unified"),
+            SkillSyncMethod::Copy,
+            resources,
+        )
+        .unwrap();
+
+        let observations = live.observe(&skill_request(), &enabled_configs());
+        let gemini = &observations[0].app_overrides["gemini"];
+        assert_eq!(gemini.enabled, None);
+        assert!(gemini
+            .issue
+            .as_deref()
+            .is_some_and(|issue| issue.contains("shared Skill source")));
+        assert!(matches!(
+            live.route("docs", &AppType::Gemini, SkillCopyPolicy::ManagedOnly),
             Err(SkillLiveError::InvalidTargets(_))
         ));
     }
@@ -963,9 +1346,9 @@ mod tests {
         fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
         fs::create_dir_all(unified.join("docs")).unwrap();
         fs::write(unified.join("docs/SKILL.md"), "# Other").unwrap();
-        let roots = app_roots(directory.path());
-        for (_, root) in &roots {
-            fs::create_dir_all(root).unwrap();
+        let roots = app_resources(directory.path());
+        for resources in &roots {
+            fs::create_dir_all(&resources.install_root).unwrap();
         }
         let live = SkillLiveConfig::new(source, unified, SkillSyncMethod::Copy, roots).unwrap();
 
@@ -979,7 +1362,7 @@ mod tests {
             assert_eq!(state.enabled, None, "{}", descriptor.id());
             assert!(state.issue.is_some(), "{}", descriptor.id());
             assert!(matches!(
-                live.route("docs", descriptor.app()),
+                live.route("docs", descriptor.app(), SkillCopyPolicy::ManagedOnly),
                 Err(SkillLiveError::UnifiedConflict(_))
             ));
         }

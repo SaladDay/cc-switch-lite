@@ -24,6 +24,7 @@ use provider::{
 };
 use serde::Serialize;
 use skill::{SkillError, SkillRecord, SkillStore};
+use skill_live::SkillObservationRequest;
 use store::{ProviderStore, StoreError};
 use tauri::{Manager, State};
 
@@ -554,12 +555,15 @@ fn list_installed_skills(
     let mut skills = store.list()?;
     let requests = skills
         .iter()
-        .map(|skill| {
-            (
-                skill.id.clone(),
-                skill.name.clone(),
-                skill.directory.clone(),
-            )
+        .map(|skill| SkillObservationRequest {
+            id: skill.id.clone(),
+            name: skill.name.clone(),
+            directory: skill.directory.clone(),
+            selected_apps: skill
+                .apps
+                .iter()
+                .filter_map(|(app_id, state)| Some((app_id.parse().ok()?, state.enabled?)))
+                .collect(),
         })
         .collect::<Vec<_>>();
     let observations = live.observe_skills(&requests)?;
@@ -617,6 +621,7 @@ fn toggle_skill_app(
                 &pending.app,
                 pending.enabled,
                 &pending.runtime_fingerprint,
+                pending.copy_policy(),
             )
         })
         .map_err(CommandError::from)?
@@ -642,6 +647,7 @@ pub fn run() {
                     &pending.app,
                     pending.enabled,
                     &pending.runtime_fingerprint,
+                    pending.copy_policy(),
                 )
             })?;
             for issue in recovery_issues {
