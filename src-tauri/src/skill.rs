@@ -264,11 +264,12 @@ impl SkillStore {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !pending_matches_catalog(&transaction, &pending)? {
-            self.delete_pending(&pending).map_err(|error| {
-                SkillError::Recovery(format!(
-                    "shared catalog changed before native configuration and the stale recovery state could not be cleared: {error}"
-                ))
-            })?;
+            self.cancel_unstarted_pending(&pending, transaction)
+                .map_err(|error| {
+                    SkillError::Recovery(format!(
+                        "shared catalog changed before native configuration and the unapplied catalog update could not be rolled back: {error}"
+                    ))
+                })?;
             return Err(SkillError::Conflict(format!(
                 "Skill '{}' or its '{}' selection changed before native configuration",
                 pending.skill_id,
@@ -347,7 +348,8 @@ impl SkillStore {
                             pending.skill_id,
                             pending.app.as_str()
                         ));
-                    } else if let Err(error) = self.delete_pending(&pending) {
+                    } else if let Err(error) = self.cancel_unstarted_pending(&pending, transaction)
+                    {
                         issues.push(error.to_string());
                     }
                     continue;
@@ -553,44 +555,6 @@ impl SkillStore {
                             "pending Skill change uses application '{app_id}' without Skills"
                         ))
                     })?;
-                let current = connection
-                    .query_row(
-                        "SELECT name, directory FROM skills WHERE id = ?1",
-                        [&skill_id],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                    )
-                    .optional()?
-                    .ok_or_else(|| {
-                        SkillError::InvalidStore(format!(
-                            "pending Skill change references missing Skill '{skill_id}'"
-                        ))
-                    })?;
-                if current != (name.clone(), directory.clone()) {
-                    return Err(SkillError::InvalidStore(format!(
-                        "Skill '{skill_id}' changed while a pending operation was recorded"
-                    )));
-                }
-                validate_unique_directory(&connection, &directory)?;
-                if contract.config_target().is_some() {
-                    validate_unique_native_name(&connection, &name)?;
-                }
-                let mut catalog_matches_previous = false;
-                if let Some(column) = catalog_column(&app) {
-                    let desired = connection.query_row(
-                        &format!("SELECT {column} FROM skills WHERE id = ?1"),
-                        [&skill_id],
-                        |row| row.get::<_, bool>(0),
-                    )?;
-                    if desired != enabled {
-                        if previous_enabled == Some(desired) {
-                            catalog_matches_previous = true;
-                        } else {
-                            return Err(SkillError::InvalidStore(format!(
-                                "pending Skill change for '{skill_id}' does not match the catalog"
-                            )));
-                        }
-                    }
-                }
                 let copy_policy = if matching_copy_evidence {
                     if contract.selection() != SkillSelectionMode::HostManaged
                         || enabled
@@ -615,21 +579,41 @@ impl SkillStore {
                     copy_policy,
                     phase,
                 };
-                Ok((pending, catalog_matches_previous))
+                Ok(pending)
             })();
-            match resolved {
-                Ok((pending, true)) if !pending.phase.live_may_have_started() => stale.push(pending),
-                Ok((pending, true)) => issues.push(format!(
+            let pending = match resolved {
+                Ok(pending) => pending,
+                Err(error) => {
+                    issues.push(error.to_string());
+                    continue;
+                }
+            };
+            let catalog_matches = match pending_matches_catalog(&connection, &pending) {
+                Ok(matches) => matches,
+                Err(SkillError::InvalidSkill(_)) if !pending.phase.live_may_have_started() => false,
+                Err(error) => {
+                    issues.push(error.to_string());
+                    continue;
+                }
+            };
+            if catalog_matches {
+                changes.push(pending);
+            } else if pending.phase.live_may_have_started() {
+                issues.push(format!(
                     "pending Skill change for '{}' and '{}' may have reached native configuration after the catalog changed; recovery state was preserved",
                     pending.skill_id,
                     pending.app.as_str()
-                )),
-                Ok((pending, false)) => changes.push(pending),
-                Err(error) => issues.push(error.to_string()),
+                ));
+            } else {
+                stale.push(pending);
             }
         }
+        drop(connection);
         for pending in stale {
-            self.delete_pending_if_present(&pending)?;
+            let mut connection = self.connect()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            self.cancel_unstarted_pending(&pending, transaction)?;
         }
         for pending in &mut changes {
             if pending.phase == PendingPhase::Prepared {
@@ -637,6 +621,22 @@ impl SkillStore {
             }
         }
         Ok(PendingScan { changes, issues })
+    }
+
+    fn cancel_unstarted_pending(
+        &self,
+        pending: &PendingSkillChange,
+        transaction: rusqlite::Transaction<'_>,
+    ) -> Result<(), SkillError> {
+        if pending.phase.live_may_have_started() {
+            return Err(SkillError::Recovery(format!(
+                "pending live change for '{}' cannot be cancelled as unstarted",
+                pending.skill_id
+            )));
+        }
+        rollback_unstarted_catalog(&transaction, pending)?;
+        transaction.commit()?;
+        self.delete_pending(pending)
     }
 
     #[cfg(test)]
@@ -1127,22 +1127,9 @@ fn restore_catalog(
     connection: &Connection,
     pending: &PendingSkillChange,
 ) -> Result<(), SkillError> {
-    let Some(previous) = pending.previous_enabled else {
+    let Some(updated) = restore_catalog_if_targeted(connection, pending)? else {
         return Ok(());
     };
-    let column = catalog_column(&pending.app).ok_or_else(|| {
-        SkillError::Recovery(format!(
-            "missing catalog binding for '{}'",
-            pending.app.as_str()
-        ))
-    })?;
-    let updated = connection.execute(
-        &format!(
-            "UPDATE skills SET {column} = ?1
-             WHERE id = ?2 AND {column} = ?3"
-        ),
-        params![previous, pending.skill_id, pending.enabled],
-    )?;
     if updated != 1 {
         return Err(SkillError::Recovery(format!(
             "catalog changed while rolling back Skill '{}'",
@@ -1150,6 +1137,38 @@ fn restore_catalog(
         )));
     }
     Ok(())
+}
+
+fn rollback_unstarted_catalog(
+    connection: &Connection,
+    pending: &PendingSkillChange,
+) -> Result<(), SkillError> {
+    restore_catalog_if_targeted(connection, pending).map(|_| ())
+}
+
+fn restore_catalog_if_targeted(
+    connection: &Connection,
+    pending: &PendingSkillChange,
+) -> Result<Option<usize>, SkillError> {
+    let Some(previous) = pending.previous_enabled else {
+        return Ok(None);
+    };
+    let column = catalog_column(&pending.app).ok_or_else(|| {
+        SkillError::Recovery(format!(
+            "missing catalog binding for '{}'",
+            pending.app.as_str()
+        ))
+    })?;
+    connection
+        .execute(
+            &format!(
+                "UPDATE skills SET {column} = ?1
+                 WHERE id = ?2 AND {column} = ?3"
+            ),
+            params![previous, pending.skill_id, pending.enabled],
+        )
+        .map(Some)
+        .map_err(Into::into)
 }
 
 fn delete_pending_row(
@@ -1737,6 +1756,37 @@ mod tests {
             .unwrap();
 
         assert!(issues.is_empty());
+        assert_eq!(journal_count(&store), 0);
+    }
+
+    #[test]
+    fn metadata_change_before_live_rolls_back_the_unapplied_selection() {
+        let (_directory, path, store) = seed_store();
+        store
+            .begin_toggle("docs", AppType::Claude, true, "runtime-v1".to_owned())
+            .unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE skills SET name = 'Renamed' WHERE id = 'docs'", [])
+            .unwrap();
+
+        let issues = store
+            .recover_pending_with_live::<FakeReceipt>(|_| {
+                panic!("a changed catalog entry must not reach live files")
+            })
+            .unwrap();
+
+        assert!(issues.is_empty());
+        let (name, enabled) = Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT name, enabled_claude FROM skills WHERE id = 'docs'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "Renamed");
+        assert!(!enabled);
         assert_eq!(journal_count(&store), 0);
     }
 
