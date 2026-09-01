@@ -279,11 +279,12 @@ dependencies = [
 [[package]]
 name = "cc-switch-core"
 version = "0.1.0"
-source = "git+https://github.com/SaladDay/cc-switch-core?rev=bafbe8b391812df79cc662d66146a93fce523d97#bafbe8b391812df79cc662d66146a93fce523d97"
+source = "git+https://github.com/SaladDay/cc-switch-core?rev=721b45de51b3c6f3f50205cbf09bdc48e10d5b37#721b45de51b3c6f3f50205cbf09bdc48e10d5b37"
 dependencies = [
  "http",
  "json-five",
  "json5",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml",
