@@ -104,6 +104,7 @@ impl PendingSkillChange {
 enum PendingPhase {
     Prepared,
     CatalogCommitted,
+    LiveStarted,
 }
 
 impl PendingPhase {
@@ -111,6 +112,7 @@ impl PendingPhase {
         match self {
             Self::Prepared => "prepared",
             Self::CatalogCommitted => "catalogCommitted",
+            Self::LiveStarted => "liveStarted",
         }
     }
 
@@ -118,8 +120,13 @@ impl PendingPhase {
         match value {
             "prepared" => Some(Self::Prepared),
             "catalogCommitted" => Some(Self::CatalogCommitted),
+            "liveStarted" => Some(Self::LiveStarted),
             _ => None,
         }
+    }
+
+    const fn live_may_have_started(self) -> bool {
+        matches!(self, Self::LiveStarted)
     }
 }
 
@@ -253,16 +260,27 @@ impl SkillStore {
     where
         C: RecoverableSkillChange,
     {
-        let pending = self.begin_toggle(id, app, enabled, runtime_fingerprint)?;
+        let mut pending = self.begin_toggle(id, app, enabled, runtime_fingerprint)?;
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !pending_matches_catalog(&transaction, &pending)? {
+            self.delete_pending(&pending).map_err(|error| {
+                SkillError::Recovery(format!(
+                    "shared catalog changed before native configuration and the stale recovery state could not be cleared: {error}"
+                ))
+            })?;
             return Err(SkillError::Conflict(format!(
                 "Skill '{}' or its '{}' selection changed before native configuration",
                 pending.skill_id,
                 pending.app.as_str()
             )));
         }
+        self.advance_pending_phase(&mut pending, PendingPhase::LiveStarted)
+            .map_err(|error| {
+                SkillError::Recovery(format!(
+                    "native configuration was not started because its recovery phase could not be recorded: {error}"
+                ))
+            })?;
         let mut receipt = match apply(&pending) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -304,7 +322,7 @@ impl SkillStore {
             changes,
             mut issues,
         } = self.pending_changes()?;
-        for pending in changes {
+        for mut pending in changes {
             let mut connection = match self.connect() {
                 Ok(connection) => connection,
                 Err(error) => {
@@ -323,14 +341,26 @@ impl SkillStore {
             match pending_matches_catalog(&transaction, &pending) {
                 Ok(true) => {}
                 Ok(false) => {
-                    issues.push(format!(
-                        "pending Skill change for '{}' and '{}' no longer matches the shared catalog; recovery state was preserved",
-                        pending.skill_id,
-                        pending.app.as_str()
-                    ));
+                    if pending.phase.live_may_have_started() {
+                        issues.push(format!(
+                            "pending Skill change for '{}' and '{}' no longer matches the shared catalog; recovery state was preserved",
+                            pending.skill_id,
+                            pending.app.as_str()
+                        ));
+                    } else if let Err(error) = self.delete_pending(&pending) {
+                        issues.push(error.to_string());
+                    }
                     continue;
                 }
                 Err(error) => {
+                    issues.push(error.to_string());
+                    continue;
+                }
+            }
+            if !pending.phase.live_may_have_started() {
+                if let Err(error) =
+                    self.advance_pending_phase(&mut pending, PendingPhase::LiveStarted)
+                {
                     issues.push(error.to_string());
                     continue;
                 }
@@ -449,12 +479,12 @@ impl SkillStore {
             };
         }
         let mut pending = pending;
-        self.mark_catalog_committed(&pending).map_err(|error| {
-            SkillError::Recovery(format!(
+        self.advance_pending_phase(&mut pending, PendingPhase::CatalogCommitted)
+            .map_err(|error| {
+                SkillError::Recovery(format!(
                 "shared catalog changed but its local recovery phase could not be recorded: {error}"
             ))
-        })?;
-        pending.phase = PendingPhase::CatalogCommitted;
+            })?;
         Ok(pending)
     }
 
@@ -588,9 +618,7 @@ impl SkillStore {
                 Ok((pending, catalog_matches_previous))
             })();
             match resolved {
-                Ok((pending, true)) if pending.phase == PendingPhase::Prepared => {
-                    stale.push(pending)
-                }
+                Ok((pending, true)) if !pending.phase.live_may_have_started() => stale.push(pending),
                 Ok((pending, true)) => issues.push(format!(
                     "pending Skill change for '{}' and '{}' may have reached native configuration after the catalog changed; recovery state was preserved",
                     pending.skill_id,
@@ -605,8 +633,7 @@ impl SkillStore {
         }
         for pending in &mut changes {
             if pending.phase == PendingPhase::Prepared {
-                self.mark_catalog_committed(pending)?;
-                pending.phase = PendingPhase::CatalogCommitted;
+                self.advance_pending_phase(pending, PendingPhase::CatalogCommitted)?;
             }
         }
         Ok(PendingScan { changes, issues })
@@ -697,7 +724,7 @@ impl SkillStore {
                 runtime_fingerprint TEXT,
                 matching_copy_evidence BOOLEAN NOT NULL DEFAULT 0,
                 previous_enabled BOOLEAN,
-                phase TEXT NOT NULL DEFAULT 'catalogCommitted',
+                phase TEXT NOT NULL DEFAULT 'liveStarted',
                 PRIMARY KEY (skill_id, app_id)
             );",
         )?;
@@ -751,9 +778,18 @@ impl SkillStore {
             journal.execute(
                 "INSERT OR IGNORE INTO skill_operation_journal
                     (skill_id, app_id, skill_name, directory, enabled, runtime_fingerprint,
-                     matching_copy_evidence, previous_enabled)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
-                params![row.0, row.1, row.2, row.3, row.4, row.5, row.6],
+                     matching_copy_evidence, previous_enabled, phase)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)",
+                params![
+                    row.0,
+                    row.1,
+                    row.2,
+                    row.3,
+                    row.4,
+                    row.5,
+                    row.6,
+                    PendingPhase::LiveStarted.as_str()
+                ],
             )?;
             let copied = journal.query_row(
                 "SELECT EXISTS(
@@ -761,8 +797,18 @@ impl SkillStore {
                     WHERE skill_id = ?1 AND app_id = ?2 AND skill_name = ?3
                       AND directory = ?4 AND enabled = ?5 AND runtime_fingerprint IS ?6
                       AND matching_copy_evidence = ?7 AND previous_enabled IS NULL
+                      AND phase = ?8
                  )",
-                params![row.0, row.1, row.2, row.3, row.4, row.5, row.6],
+                params![
+                    row.0,
+                    row.1,
+                    row.2,
+                    row.3,
+                    row.4,
+                    row.5,
+                    row.6,
+                    PendingPhase::LiveStarted.as_str()
+                ],
                 |row| row.get::<_, bool>(0),
             )?;
             if !copied {
@@ -800,7 +846,23 @@ impl SkillStore {
         transaction.commit().map_err(Into::into)
     }
 
-    fn mark_catalog_committed(&self, pending: &PendingSkillChange) -> Result<(), SkillError> {
+    fn advance_pending_phase(
+        &self,
+        pending: &mut PendingSkillChange,
+        next: PendingPhase,
+    ) -> Result<(), SkillError> {
+        let valid_transition = matches!(
+            (pending.phase, next),
+            (PendingPhase::Prepared, PendingPhase::CatalogCommitted)
+                | (PendingPhase::CatalogCommitted, PendingPhase::LiveStarted)
+        );
+        if !valid_transition {
+            return Err(SkillError::Recovery(format!(
+                "invalid pending Skill phase transition from '{}' to '{}'",
+                pending.phase.as_str(),
+                next.as_str()
+            )));
+        }
         let mut connection = self.connect_journal()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = transaction.execute(
@@ -810,7 +872,7 @@ impl SkillStore {
                AND matching_copy_evidence = ?8 AND previous_enabled IS ?9
                AND phase = ?10",
             params![
-                PendingPhase::CatalogCommitted.as_str(),
+                next.as_str(),
                 pending.skill_id,
                 pending.app.as_str(),
                 pending.name,
@@ -819,7 +881,7 @@ impl SkillStore {
                 pending.runtime_fingerprint,
                 pending.copy_policy == SkillCopyPolicy::AllowMatching,
                 pending.previous_enabled,
-                PendingPhase::Prepared.as_str(),
+                pending.phase.as_str(),
             ],
         )?;
         if updated != 1 {
@@ -829,7 +891,9 @@ impl SkillStore {
                 pending.app.as_str()
             )));
         }
-        transaction.commit().map_err(Into::into)
+        transaction.commit()?;
+        pending.phase = next;
+        Ok(())
     }
 
     fn delete_pending(&self, pending: &PendingSkillChange) -> Result<(), SkillError> {
@@ -1177,7 +1241,7 @@ fn ensure_journal_extensions(connection: &Connection) -> Result<(), SkillError> 
     if !columns.contains("phase") {
         connection.execute_batch(
             "ALTER TABLE skill_operation_journal
-             ADD COLUMN phase TEXT NOT NULL DEFAULT 'catalogCommitted'",
+             ADD COLUMN phase TEXT NOT NULL DEFAULT 'liveStarted'",
         )?;
     }
     Ok(())
@@ -1510,6 +1574,15 @@ mod tests {
         let store = SkillStore::open(path.clone()).unwrap();
 
         assert_eq!(journal_count(&store), 1);
+        assert_eq!(
+            Connection::open(&store.journal_path)
+                .unwrap()
+                .query_row("SELECT phase FROM skill_operation_journal", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            PendingPhase::LiveStarted.as_str()
+        );
         assert!(!Connection::open(path)
             .unwrap()
             .query_row(
@@ -1539,6 +1612,7 @@ mod tests {
                     assert_eq!(pending.name, "Docs");
                     assert_eq!(pending.app, AppType::Claude);
                     assert!(pending.enabled);
+                    assert_eq!(pending.phase, PendingPhase::LiveStarted);
                     Ok(FakeReceipt {
                         verified: true,
                         committed: committed.clone(),
@@ -1646,7 +1720,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_committed_intent_is_preserved_when_catalog_returns_to_previous_state() {
+    fn catalog_committed_intent_is_discarded_before_live_configuration() {
         let (_directory, path, store) = seed_store();
         store
             .begin_toggle("docs", AppType::Claude, true, "runtime-v1".to_owned())
@@ -1659,6 +1733,30 @@ mod tests {
         let issues = store
             .recover_pending_with_live::<FakeReceipt>(|_| {
                 panic!("an ambiguous committed intent must not reach live files")
+            })
+            .unwrap();
+
+        assert!(issues.is_empty());
+        assert_eq!(journal_count(&store), 0);
+    }
+
+    #[test]
+    fn live_started_intent_is_preserved_when_catalog_returns_to_previous_state() {
+        let (_directory, path, store) = seed_store();
+        let mut pending = store
+            .begin_toggle("docs", AppType::Claude, true, "runtime-v1".to_owned())
+            .unwrap();
+        store
+            .advance_pending_phase(&mut pending, PendingPhase::LiveStarted)
+            .unwrap();
+        Connection::open(path)
+            .unwrap()
+            .execute("UPDATE skills SET enabled_claude = 0 WHERE id = 'docs'", [])
+            .unwrap();
+
+        let issues = store
+            .recover_pending_with_live::<FakeReceipt>(|_| {
+                panic!("a possibly applied intent must not run against a changed catalog")
             })
             .unwrap();
 

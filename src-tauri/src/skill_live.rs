@@ -1143,6 +1143,12 @@ mod tests {
             .issue
             .as_deref()
             .is_some_and(|issue| issue.contains("required by Hermes")));
+
+        fs::remove_dir_all(hermes_root.join("skills/docs")).unwrap();
+        let observations = live.observe(&required, &configs);
+        let state = &observations[0].app_overrides["hermes"];
+        assert_eq!(state.enabled, Some(false));
+        assert!(state.issue.is_none());
     }
 
     #[test]
