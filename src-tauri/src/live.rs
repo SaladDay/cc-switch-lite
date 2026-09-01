@@ -367,7 +367,8 @@ impl LiveConfig {
                     .for_app(&app)
                     .skill_contract()
                     .and_then(|contract| contract.config_target())
-                    .map(|target| native.target_path(target.logical_target()).to_owned());
+                    .map(|target| absolute_skill_root(native.target_path(target.logical_target())))
+                    .transpose()?;
                 let mut resources = SkillAppResources::new(app, install_root, config_path);
                 if let Some(root) = adapter.unified_discovery_root(&dirs) {
                     resources = resources.with_unified_discovery_root(absolute_skill_root(root)?);
@@ -1173,6 +1174,24 @@ mod tests {
             absolute_skill_root(Path::new("relative/hermes")).unwrap(),
             std::env::current_dir().unwrap().join("relative/hermes")
         );
+    }
+
+    #[test]
+    fn relative_hermes_setting_has_a_stable_skill_runtime_identity() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let shared = directory.path().join(".cc-switch");
+        fs::create_dir(&shared).unwrap();
+        fs::write(
+            shared.join("settings.json"),
+            r#"{"hermesConfigDir":"relative/hermes"}"#,
+        )
+        .unwrap();
+
+        let live = LiveConfig::from_home(directory.path()).unwrap();
+        assert!(!live
+            .skill_runtime_fingerprint(&AppType::Hermes)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
