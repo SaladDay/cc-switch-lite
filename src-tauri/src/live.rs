@@ -9,7 +9,8 @@ use std::{
 use cc_switch_core::{
     builtin_app_registry, fs::shared_live_config_lock_path, project_skill_config_enabled, AppType,
     ContentExpectation, PlannedWrite, SkillConfigError, SkillConfigTarget, SkillCopyPolicy,
-    SkillDeploymentReceipt, SkillSyncMethod, MAX_OPERATION_CONTENT_BYTES, OPERATION_CONTRACT_MAJOR,
+    SkillDeploymentReceipt, SkillDiscoveryMode, SkillSyncMethod, MAX_OPERATION_CONTENT_BYTES,
+    OPERATION_CONTRACT_MAJOR,
 };
 use fs4::{FileExt, TryLockError};
 use serde::Deserialize;
@@ -81,6 +82,7 @@ impl LiveError {
 
 pub struct LiveConfig {
     home: PathBuf,
+    shared_dir: PathBuf,
     native: NativeLiveConfig,
     mcp: McpLiveConfig,
     lock_path: PathBuf,
@@ -153,6 +155,7 @@ pub(crate) struct ResolvedConfigDirs {
     pub(crate) claude: PathBuf,
     pub(crate) codex: PathBuf,
     pub(crate) gemini: PathBuf,
+    pub(crate) gemini_unified_skills: PathBuf,
     pub(crate) grok: PathBuf,
     pub(crate) opencode: PathBuf,
     pub(crate) hermes: PathBuf,
@@ -160,12 +163,24 @@ pub(crate) struct ResolvedConfigDirs {
 }
 
 impl LiveConfig {
+    #[cfg(test)]
     pub fn from_home(home: &Path) -> Result<Self, LiveError> {
+        Self::from_home_with_database(home, &crate::store::database_path(home))
+    }
+
+    pub(crate) fn from_home_with_database(
+        home: &Path,
+        database_path: &Path,
+    ) -> Result<Self, LiveError> {
         let settings = load_shared_path_settings(home);
         let dirs = resolve_config_dirs(home, &settings)?;
         let claude_mcp = claude_mcp_path(home, &dirs.claude)?;
+        let shared_dir = database_path.parent().ok_or_else(|| {
+            LiveError::InvalidConfig("shared database path has no parent directory".to_owned())
+        })?;
         Ok(Self {
             home: home.to_owned(),
+            shared_dir: shared_dir.to_owned(),
             native: NativeLiveConfig::from_home(home, &dirs)?,
             mcp: McpLiveConfig::new(
                 (claude_mcp, dirs.claude),
@@ -318,6 +333,7 @@ impl LiveConfig {
         .collect::<Result<Vec<_>, _>>()?;
         let source_root = absolute_skill_root(&skill_source_root(
             &self.home,
+            &self.shared_dir,
             settings.skill_storage_location.as_deref(),
         ))?;
         let unified_discovery_root = absolute_skill_root(&self.home.join(".agents/skills"))?;
@@ -331,7 +347,17 @@ impl LiveConfig {
                     .skill_contract()
                     .and_then(|contract| contract.config_target())
                     .map(|target| native.target_path(target.logical_target()).to_owned());
-                SkillAppResources::new(app, install_root, config_path)
+                let mut resources = SkillAppResources::new(app.clone(), install_root, config_path);
+                if app == AppType::Gemini
+                    && builtin_app_registry()
+                        .for_app(&app)
+                        .skill_contract()
+                        .is_some_and(|contract| contract.discovery() == SkillDiscoveryMode::Unified)
+                {
+                    resources =
+                        resources.with_unified_discovery_root(dirs.gemini_unified_skills.clone());
+                }
+                resources
             })
             .collect();
         Ok(SkillRuntime {
@@ -582,8 +608,15 @@ fn resolve_config_dirs(
 ) -> Result<ResolvedConfigDirs, LiveError> {
     let claude_env = std::env::var_os("CLAUDE_CONFIG_DIR");
     let codex_env = std::env::var_os("CODEX_HOME");
+    let gemini_env = std::env::var_os("GEMINI_CLI_HOME");
+    let grok_env = std::env::var_os("GROK_HOME");
     let hermes_env = std::env::var_os("HERMES_HOME");
     let pi_env = std::env::var_os("PI_CODING_AGENT_DIR");
+    let (gemini, gemini_unified_skills) = gemini_roots(
+        home,
+        settings.gemini_config_dir.as_deref(),
+        gemini_env.as_deref(),
+    )?;
     Ok(ResolvedConfigDirs {
         claude: configured_root(
             home,
@@ -599,17 +632,12 @@ fn resolve_config_dirs(
             &home.join(".codex"),
             "Codex config directory",
         )?,
-        gemini: configured_root(
-            home,
-            settings.gemini_config_dir.as_deref(),
-            None,
-            &home.join(".gemini"),
-            "Gemini config directory",
-        )?,
+        gemini,
+        gemini_unified_skills,
         grok: configured_root(
             home,
             settings.grok_config_dir.as_deref(),
-            None,
+            grok_env.as_deref(),
             &home.join(".grok"),
             "Grok config directory",
         )?,
@@ -636,10 +664,31 @@ fn resolve_config_dirs(
     })
 }
 
-fn skill_source_root(home: &Path, location: Option<&str>) -> PathBuf {
+fn gemini_roots(
+    home: &Path,
+    config_setting: Option<&str>,
+    environment_home: Option<&OsStr>,
+) -> Result<(PathBuf, PathBuf), LiveError> {
+    let native_home = configured_root(home, None, environment_home, home, "Gemini home directory")?;
+    let config = configured_root(
+        home,
+        config_setting,
+        None,
+        &native_home.join(".gemini"),
+        "Gemini config directory",
+    )?;
+    let unified_skills = config_root(
+        None,
+        &native_home.join(".agents/skills"),
+        "Gemini unified Skill directory",
+    )?;
+    Ok((config, unified_skills))
+}
+
+fn skill_source_root(home: &Path, shared_dir: &Path, location: Option<&str>) -> PathBuf {
     match location {
         Some("unified") => home.join(".agents/skills"),
-        _ => shared_database_dir(home).join("skills"),
+        _ => shared_dir.join("skills"),
     }
 }
 
@@ -682,13 +731,6 @@ fn load_shared_path_settings_strict(home: &Path) -> Result<SharedPathSettings, L
 
 fn device_settings_path(home: &Path) -> PathBuf {
     home.join(".cc-switch/settings.json")
-}
-
-fn shared_database_dir(home: &Path) -> PathBuf {
-    crate::store::database_path(home)
-        .parent()
-        .map(Path::to_owned)
-        .unwrap_or_else(|| home.join(".cc-switch"))
 }
 
 fn absolute_skill_root(path: &Path) -> Result<PathBuf, LiveError> {
@@ -920,6 +962,21 @@ mod tests {
             config_root(None, &default, "CODEX_HOME").unwrap(),
             fs::canonicalize(directory.path()).unwrap().join("default")
         );
+    }
+
+    #[test]
+    fn gemini_home_override_moves_both_native_skill_roots() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let native_home = directory.path().join("gemini-home");
+        let expected_home = fs::canonicalize(directory.path())
+            .unwrap()
+            .join("gemini-home");
+
+        let (config, unified) =
+            gemini_roots(directory.path(), None, Some(native_home.as_os_str())).unwrap();
+
+        assert_eq!(config, expected_home.join(".gemini"));
+        assert_eq!(unified, expected_home.join(".agents/skills"));
     }
 
     #[test]

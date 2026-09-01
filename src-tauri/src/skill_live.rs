@@ -67,6 +67,7 @@ pub(crate) struct SkillAppResources {
     app: AppType,
     install_root: PathBuf,
     config_path: Option<PathBuf>,
+    unified_discovery_root: Option<PathBuf>,
 }
 
 impl SkillAppResources {
@@ -75,7 +76,13 @@ impl SkillAppResources {
             app,
             install_root,
             config_path,
+            unified_discovery_root: None,
         }
+    }
+
+    pub(crate) fn with_unified_discovery_root(mut self, root: PathBuf) -> Self {
+        self.unified_discovery_root = Some(root);
+        self
     }
 }
 
@@ -84,12 +91,12 @@ struct SkillTarget {
     install_root: PathBuf,
     skills_root: PathBuf,
     config_path: Option<PathBuf>,
+    unified_discovery_root: Option<PathBuf>,
     issue: Option<String>,
 }
 
 pub(crate) struct SkillLiveConfig {
     source_root: PathBuf,
-    unified_discovery_root: PathBuf,
     sync_method: SkillSyncMethod,
     targets: Vec<SkillTarget>,
 }
@@ -104,18 +111,29 @@ impl SkillLiveConfig {
         validate_targets(&resources)?;
         let mut targets = resources
             .into_iter()
-            .map(|resources| SkillTarget {
-                skills_root: resources.install_root.join("skills"),
-                app: resources.app,
-                install_root: resources.install_root,
-                config_path: resources.config_path,
-                issue: None,
+            .map(|resources| {
+                let contract = builtin_app_registry()
+                    .for_app(&resources.app)
+                    .skill_contract()
+                    .expect("validated Skill resource has a contract");
+                SkillTarget {
+                    skills_root: resources.install_root.join("skills"),
+                    app: resources.app,
+                    install_root: resources.install_root,
+                    config_path: resources.config_path,
+                    unified_discovery_root: (contract.discovery() == SkillDiscoveryMode::Unified)
+                        .then(|| {
+                            resources
+                                .unified_discovery_root
+                                .unwrap_or_else(|| unified_discovery_root.clone())
+                        }),
+                    issue: None,
+                }
             })
             .collect::<Vec<_>>();
-        mark_overlapping_targets(&mut targets, &source_root, &unified_discovery_root);
+        mark_overlapping_targets(&mut targets, &source_root);
         Ok(Self {
             source_root,
-            unified_discovery_root,
             sync_method,
             targets,
         })
@@ -177,10 +195,17 @@ impl SkillLiveConfig {
         let Some(contract) = descriptor.skill_contract() else {
             return Err(SkillLiveError::Unsupported(app.as_str().to_owned()));
         };
+        let target = self
+            .target(app)
+            .ok_or_else(|| SkillLiveError::MissingTarget(app.as_str().to_owned()))?;
+        require_safe_target(target)?;
         let discovery = match contract.discovery() {
             SkillDiscoveryMode::Unified => inspect_skill_discovery_with_policy(
                 &self.source_root,
-                &self.unified_discovery_root,
+                target
+                    .unified_discovery_root
+                    .as_deref()
+                    .expect("unified Skill target has a discovery root"),
                 directory,
                 copy_policy,
             )?,
@@ -188,16 +213,8 @@ impl SkillLiveConfig {
         };
         let route = resolve_skill_route(*contract, discovery)
             .map_err(|reason| control_reason_error(descriptor.display_name(), reason))?;
-        let config_target = route.config_target();
-        let deploy_native = route.deploy_native();
-        if config_target.is_some() || deploy_native {
-            let target = self
-                .target(app)
-                .ok_or_else(|| SkillLiveError::MissingTarget(app.as_str().to_owned()))?;
-            require_safe_target(target)?;
-            if config_target.is_some() {
-                require_app_root(descriptor.display_name(), target)?;
-            }
+        if route.config_target().is_some() {
+            require_app_root(descriptor.display_name(), target)?;
         }
         Ok(route)
     }
@@ -243,12 +260,10 @@ impl SkillLiveConfig {
         let mut hasher = Sha256::new();
         hash_fingerprint_field(&mut hasher, b"cc-switch-lite-skill-runtime-v1");
         hash_fingerprint_field(&mut hasher, app.as_str().as_bytes());
-        for path in [
-            &self.source_root,
-            &self.unified_discovery_root,
-            &target.install_root,
-            &target.skills_root,
-        ] {
+        for path in [&self.source_root, &target.install_root, &target.skills_root] {
+            hash_fingerprint_path(&mut hasher, &skill_path_identity(path)?);
+        }
+        if let Some(path) = &target.unified_discovery_root {
             hash_fingerprint_path(&mut hasher, &skill_path_identity(path)?);
         }
         hash_fingerprint_field(
@@ -297,8 +312,9 @@ impl SkillLiveConfig {
                     .map_or(SkillCopyPolicy::ManagedOnly, |_| {
                         SkillCopyPolicy::AllowMatching
                     });
+                let target = self.target(descriptor.app());
                 let native_observation = || {
-                    self.target(descriptor.app())
+                    target
                         .map(|target| {
                             match require_safe_target(target)
                                 .and_then(|()| require_app_root(descriptor.display_name(), target))
@@ -325,13 +341,23 @@ impl SkillLiveConfig {
                         })
                 };
                 let discovery = if contract.discovery() == SkillDiscoveryMode::Unified {
-                    inspect_skill_discovery_with_policy(
-                        &self.source_root,
-                        &self.unified_discovery_root,
-                        directory,
-                        copy_policy,
-                    )
-                    .map_err(|error| error.to_string())
+                    target
+                        .ok_or_else(|| {
+                            SkillLiveError::MissingTarget(descriptor.id().to_owned()).to_string()
+                        })
+                        .and_then(|target| {
+                            require_safe_target(target).map_err(|error| error.to_string())?;
+                            inspect_skill_discovery_with_policy(
+                                &self.source_root,
+                                target
+                                    .unified_discovery_root
+                                    .as_deref()
+                                    .expect("unified Skill target has a discovery root"),
+                                directory,
+                                copy_policy,
+                            )
+                            .map_err(|error| error.to_string())
+                        })
                 } else {
                     Ok(SkillDiscoveryState::Missing)
                 };
@@ -520,6 +546,9 @@ fn control_reason_message(display_name: &str, reason: SkillControlReason) -> Str
         SkillControlReason::DirectUnifiedDiscovery => {
             SkillLiveError::UnifiedDiscovery(display_name.to_owned()).to_string()
         }
+        SkillControlReason::Required => {
+            format!("This Skill is required by {display_name} and cannot be disabled")
+        }
         SkillControlReason::GloballyDisabled => {
             "Skills are disabled globally in the application's native settings".to_owned()
         }
@@ -577,42 +606,33 @@ fn validate_targets(resources: &[SkillAppResources]) -> Result<(), SkillLiveErro
                     descriptor.id()
                 )));
             }
+            if contract.discovery() == SkillDiscoveryMode::Managed
+                && resources.unified_discovery_root.is_some()
+            {
+                return Err(SkillLiveError::InvalidTargets(format!(
+                    "application '{}' has an unexpected unified Skill resource",
+                    descriptor.id()
+                )));
+            }
         }
     }
     Ok(())
 }
 
-fn mark_overlapping_targets(
-    targets: &mut [SkillTarget],
-    source_root: &Path,
-    unified_discovery_root: &Path,
-) {
+fn mark_overlapping_targets(targets: &mut [SkillTarget], source_root: &Path) {
     let mut resources = Vec::new();
-    let source = collect_shared_resource(
+    collect_shared_resource(
         targets,
         &mut resources,
         SkillResourceKind::Source,
         source_root,
         "shared Skill source",
     );
-    let unified = collect_shared_resource(
-        targets,
-        &mut resources,
-        SkillResourceKind::Unified,
-        unified_discovery_root,
-        "unified Skill directory",
-    );
-    if source
-        .as_ref()
-        .zip(unified.as_ref())
-        .is_some_and(|(source, unified)| source == unified)
-    {
-        resources.retain(|resource| resource.kind != SkillResourceKind::Unified);
-    }
 
     for index in 0..targets.len() {
         let skills_root = targets[index].skills_root.clone();
         let config_path = targets[index].config_path.clone();
+        let unified_discovery_root = targets[index].unified_discovery_root.clone();
         collect_target_resource(
             targets,
             &mut resources,
@@ -631,6 +651,16 @@ fn mark_overlapping_targets(
                 "native Skill configuration",
             );
         }
+        if let Some(path) = unified_discovery_root {
+            collect_target_resource(
+                targets,
+                &mut resources,
+                SkillResourceKind::Discovery(index),
+                index,
+                path,
+                "unified Skill directory",
+            );
+        }
     }
 
     for left in 0..resources.len() {
@@ -638,6 +668,9 @@ fn mark_overlapping_targets(
             let left = &resources[left];
             let right = &resources[right];
             if !paths_overlap(&left.path, &right.path) {
+                continue;
+            }
+            if resources_may_share(left, right) {
                 continue;
             }
             if same_target_resources(left.kind, right.kind) {
@@ -660,7 +693,7 @@ fn mark_overlapping_targets(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SkillResourceKind {
     Source,
-    Unified,
+    Discovery(usize),
     Native(usize),
     Config(usize),
 }
@@ -668,8 +701,8 @@ enum SkillResourceKind {
 impl SkillResourceKind {
     const fn owner(self) -> Option<usize> {
         match self {
-            Self::Native(index) | Self::Config(index) => Some(index),
-            Self::Source | Self::Unified => None,
+            Self::Discovery(index) | Self::Native(index) | Self::Config(index) => Some(index),
+            Self::Source => None,
         }
     }
 }
@@ -685,20 +718,13 @@ fn collect_shared_resource(
     kind: SkillResourceKind,
     path: &Path,
     label: &str,
-) -> Option<PathBuf> {
+) {
     match skill_path_identity(path) {
-        Ok(path) => {
-            resources.push(SkillResource {
-                kind,
-                path: path.clone(),
-            });
-            Some(path)
-        }
+        Ok(path) => resources.push(SkillResource { kind, path }),
         Err(error) => {
             for target in targets {
                 append_target_issue(target, format!("{label} is unavailable: {error}"));
             }
-            None
         }
     }
 }
@@ -729,6 +755,19 @@ fn same_target_resources(left: SkillResourceKind, right: SkillResourceKind) -> b
     )
 }
 
+fn resources_may_share(left: &SkillResource, right: &SkillResource) -> bool {
+    left.path == right.path
+        && matches!(
+            (left.kind, right.kind),
+            (SkillResourceKind::Source, SkillResourceKind::Discovery(_))
+                | (SkillResourceKind::Discovery(_), SkillResourceKind::Source)
+                | (
+                    SkillResourceKind::Discovery(_),
+                    SkillResourceKind::Discovery(_)
+                )
+        )
+}
+
 fn resource_overlap_issue(
     current: SkillResourceKind,
     other: SkillResourceKind,
@@ -736,13 +775,17 @@ fn resource_overlap_issue(
 ) -> Option<(usize, String)> {
     let index = current.owner()?;
     let current_label = match current {
+        SkillResourceKind::Discovery(_) => "unified Skill directory",
         SkillResourceKind::Native(_) => "native Skill directory",
         SkillResourceKind::Config(_) => "native Skill configuration",
-        SkillResourceKind::Source | SkillResourceKind::Unified => unreachable!(),
+        SkillResourceKind::Source => unreachable!(),
     };
     let other_label = match other {
         SkillResourceKind::Source => "the shared Skill source".to_owned(),
-        SkillResourceKind::Unified => "the unified Skill directory".to_owned(),
+        SkillResourceKind::Discovery(other) => format!(
+            "application '{}' unified Skill directory",
+            targets[other].app.as_str()
+        ),
         SkillResourceKind::Native(other) => {
             format!("application '{}'", targets[other].app.as_str())
         }
@@ -1086,6 +1129,20 @@ mod tests {
             .issue
             .as_deref()
             .is_some_and(|issue| issue.contains("platform-specific")));
+
+        configs.insert(
+            SkillConfigTarget::HermesConfig,
+            Ok(Some(b"skills:\n  disabled: [hermes-agent]\n".to_vec())),
+        );
+        let mut required = skill_request();
+        required[0].name = "hermes-agent".to_owned();
+        let observations = live.observe(&required, &configs);
+        let state = &observations[0].app_overrides["hermes"];
+        assert_eq!(state.enabled, Some(true));
+        assert!(state
+            .issue
+            .as_deref()
+            .is_some_and(|issue| issue.contains("required by Hermes")));
     }
 
     #[test]

@@ -29,8 +29,12 @@ pnpm tauri dev
 
 Provider records live in the same `~/.cc-switch/cc-switch.db` database used by
 CC Switch. MCP servers and installed Skills use their existing shared tables as
-well; Lite does not keep parallel catalogs. Updates use SQLite transactions and
-reject stale provider or MCP edits made against an older record revision.
+well; Lite does not keep parallel catalogs. If the full application has a custom
+configuration directory, Lite follows its `app_paths.json` setting. Skill switch
+recovery state stays in a per-database sidecar under
+`~/.cc-switch/cc-switch-lite-state/` and is never part of the shared catalog or
+its backups. Updates use SQLite transactions and reject stale provider or MCP
+edits made against an older record revision.
 Until the full application adopts Core's shared live-file lock protocol, do not
 write configuration from CC Switch and Lite at the same time.
 
@@ -43,6 +47,7 @@ For applications that discover `~/.agents/skills` directly, Lite uses a native
 per-Skill control only when Core declares a safe one. Gemini, Grok, and Hermes
 use their native disabled lists. Other directly discovered copies are shown as
 externally managed instead of guessing whether the application has enabled them.
+Skills required by a native application remain enabled and read-only.
 Skill status is the user-level default managed by Lite; project, workspace,
 system, administrator, or plugin layers can still override it at runtime.
 Pending switches are bound to the resolved paths and sync method that started

@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Display,
+    fs,
     path::PathBuf,
     time::Duration,
 };
@@ -18,8 +19,14 @@ const SKILL_SELECT_BASE: &str = "SELECT id, name, description, directory, repo_o
 
 #[derive(Debug, Error)]
 pub enum SkillError {
-    #[error("shared Skill database failed: {0}")]
+    #[error("Skill database failed: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("local Skill recovery state I/O failed for {path}: {source}")]
+    LocalStateIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("shared Skill data is invalid: {0}")]
     InvalidStore(String),
     #[error("Skill is invalid: {0}")]
@@ -35,7 +42,7 @@ pub enum SkillError {
 impl SkillError {
     pub fn code(&self) -> &'static str {
         match self {
-            Self::Database(_) => "storage_error",
+            Self::Database(_) | Self::LocalStateIo { .. } => "storage_error",
             Self::InvalidStore(_) => "invalid_store",
             Self::InvalidSkill(_) => "invalid_skill",
             Self::NotFound(_) => "not_found",
@@ -107,12 +114,35 @@ pub(crate) trait RecoverableSkillChange: Sized {
 
 pub struct SkillStore {
     path: PathBuf,
+    journal_path: PathBuf,
 }
 
 impl SkillStore {
+    #[cfg(test)]
     pub fn open(path: PathBuf) -> Result<Self, SkillError> {
-        let store = Self { path };
+        let journal_path = path.with_file_name("cc-switch-lite-state.db");
+        Self::open_with_local_state(path, journal_path)
+    }
+
+    pub(crate) fn open_with_local_state(
+        path: PathBuf,
+        journal_path: PathBuf,
+    ) -> Result<Self, SkillError> {
+        if path == journal_path {
+            return Err(SkillError::InvalidStore(
+                "shared Skill data and local recovery state must use separate files".to_owned(),
+            ));
+        }
+        let store = Self { path, journal_path };
         store.initialize()?;
+        if let Some(parent) = store.journal_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| SkillError::LocalStateIo {
+                path: parent.to_owned(),
+                source,
+            })?;
+        }
+        store.initialize_journal()?;
+        store.migrate_embedded_journal()?;
         Ok(store)
     }
 
@@ -158,15 +188,16 @@ impl SkillStore {
             .enumerate()
             .map(|(index, skill)| (skill.id.clone(), index))
             .collect::<HashMap<_, _>>();
-        let mut statement = connection.prepare(
+        let journal = self.connect_journal()?;
+        let mut statement = journal.prepare(
             "SELECT CAST(skill_id AS TEXT), CAST(app_id AS TEXT)
              FROM skill_operation_journal",
         )?;
         let pending = statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
-        for row in pending.flatten() {
-            let (skill_id, app_id) = row;
+        for row in pending {
+            let (skill_id, app_id) = row?;
             let Some(skill) = indexes
                 .get(&skill_id)
                 .and_then(|index| skills.get_mut(*index))
@@ -327,52 +358,36 @@ impl SkillStore {
                 SkillCopyPolicy::ManagedOnly
             },
         };
-        transaction
-            .execute(
-                "INSERT INTO skill_operation_journal
-                 (skill_id, app_id, skill_name, directory, enabled, runtime_fingerprint,
-                  matching_copy_evidence)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    pending.skill_id,
-                    pending.app.as_str(),
-                    pending.name,
-                    pending.directory,
-                    pending.enabled,
-                    pending.runtime_fingerprint,
-                    pending.copy_policy == SkillCopyPolicy::AllowMatching
-                ],
-            )
-            .map_err(|error| match error {
-                rusqlite::Error::SqliteFailure(ref failure, _)
-                    if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
-                {
-                    SkillError::Recovery(format!(
-                        "a pending Skill change already exists for '{}' and '{}'",
-                        pending.skill_id,
-                        pending.app.as_str()
-                    ))
+        self.insert_pending(&pending)?;
+        let database_result = (|| -> Result<(), SkillError> {
+            if let Some(column) = column {
+                let updated = transaction.execute(
+                    &format!("UPDATE skills SET {column} = ?1 WHERE id = ?2"),
+                    params![enabled, id],
+                )?;
+                if updated != 1 {
+                    return Err(SkillError::NotFound(id.to_owned()));
                 }
-                error => SkillError::Database(error),
-            })?;
-        if let Some(column) = column {
-            let updated = transaction.execute(
-                &format!("UPDATE skills SET {column} = ?1 WHERE id = ?2"),
-                params![enabled, id],
-            )?;
-            if updated != 1 {
-                return Err(SkillError::NotFound(id.to_owned()));
             }
+            transaction.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = database_result {
+            return match self.delete_pending_if_present(&pending) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(SkillError::Recovery(format!(
+                    "shared catalog update failed: {error}; local journal cleanup failed: {cleanup}"
+                ))),
+            };
         }
-        transaction.commit()?;
         Ok(pending)
     }
 
     fn pending_changes(&self) -> Result<PendingScan, SkillError> {
-        let connection = self.connect()?;
-        let mut statement = connection.prepare(
+        let journal = self.connect_journal()?;
+        let mut statement = journal.prepare(
             "SELECT skill_id, app_id, skill_name, directory, enabled, runtime_fingerprint,
-                    matching_copy_evidence
+                    matching_copy_evidence, previous_enabled
              FROM skill_operation_journal ORDER BY skill_id, app_id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -384,18 +399,17 @@ impl SkillStore {
                 row.get::<_, bool>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, bool>(6)?,
+                row.get::<_, Option<bool>>(7)?,
             ))
         })?;
+        let rows = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(journal);
+        let connection = self.connect()?;
         let mut changes = Vec::new();
+        let mut stale = Vec::new();
         let mut issues = Vec::new();
         for row in rows {
-            let row = match row {
-                Ok(row) => row,
-                Err(error) => {
-                    issues.push(format!("invalid pending Skill row: {error}"));
-                    continue;
-                }
-            };
             let resolved = (|| {
                 let (
                     skill_id,
@@ -405,6 +419,7 @@ impl SkillStore {
                     enabled,
                     runtime_fingerprint,
                     matching_copy_evidence,
+                    previous_enabled,
                 ) = row;
                 let runtime_fingerprint = runtime_fingerprint
                     .filter(|fingerprint| !fingerprint.is_empty())
@@ -447,6 +462,7 @@ impl SkillStore {
                 if contract.config_target().is_some() {
                     validate_unique_native_name(&connection, &name)?;
                 }
+                let mut catalog_matches_previous = false;
                 if let Some(column) = catalog_column(&app) {
                     let desired = connection.query_row(
                         &format!("SELECT {column} FROM skills WHERE id = ?1"),
@@ -454,13 +470,20 @@ impl SkillStore {
                         |row| row.get::<_, bool>(0),
                     )?;
                     if desired != enabled {
-                        return Err(SkillError::InvalidStore(format!(
-                            "pending Skill change for '{skill_id}' does not match the catalog"
-                        )));
+                        if previous_enabled == Some(desired) {
+                            catalog_matches_previous = true;
+                        } else {
+                            return Err(SkillError::InvalidStore(format!(
+                                "pending Skill change for '{skill_id}' does not match the catalog"
+                            )));
+                        }
                     }
                 }
                 let copy_policy = if matching_copy_evidence {
-                    if contract.selection() != SkillSelectionMode::HostManaged || enabled {
+                    if contract.selection() != SkillSelectionMode::HostManaged
+                        || enabled
+                        || previous_enabled == Some(false)
+                    {
                         return Err(SkillError::InvalidStore(format!(
                             "pending Skill change for '{skill_id}' has invalid copy evidence"
                         )));
@@ -469,21 +492,26 @@ impl SkillStore {
                 } else {
                     SkillCopyPolicy::ManagedOnly
                 };
-                Ok(PendingSkillChange {
+                let pending = PendingSkillChange {
                     skill_id,
                     name,
                     directory,
                     app,
                     enabled,
                     runtime_fingerprint,
-                    previous_enabled: None,
+                    previous_enabled,
                     copy_policy,
-                })
+                };
+                Ok((pending, catalog_matches_previous))
             })();
             match resolved {
-                Ok(pending) => changes.push(pending),
+                Ok((pending, true)) => stale.push(pending),
+                Ok((pending, false)) => changes.push(pending),
                 Err(error) => issues.push(error.to_string()),
             }
+        }
+        for pending in stale {
+            self.delete_pending_if_present(&pending)?;
         }
         Ok(PendingScan { changes, issues })
     }
@@ -512,8 +540,9 @@ impl SkillStore {
                 )));
             }
         }
-        delete_pending(&transaction, pending)?;
-        transaction.commit().map_err(Into::into)
+        transaction.commit()?;
+        self.delete_pending(pending)?;
+        Ok(())
     }
 
     fn finalize_pending<C>(
@@ -532,7 +561,7 @@ impl SkillStore {
                     "catalog changed and native rollback failed: {error}"
                 )));
             }
-            delete_pending_if_present(&transaction, pending)?;
+            self.delete_pending_if_present(pending)?;
             transaction.commit()?;
             return Err(SkillError::Conflict(format!(
                 "Skill '{}' or its '{}' selection changed",
@@ -543,7 +572,7 @@ impl SkillStore {
         if let Err(error) = receipt.commit() {
             return Ok(Err(error));
         }
-        delete_pending(&transaction, pending)?;
+        self.delete_pending(pending)?;
         transaction.commit()?;
         Ok(Ok(()))
     }
@@ -564,22 +593,10 @@ impl SkillStore {
                 installed_at INTEGER NOT NULL DEFAULT 0,
                 content_hash TEXT,
                 updated_at INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS skill_operation_journal (
-                skill_id TEXT NOT NULL,
-                app_id TEXT NOT NULL,
-                skill_name TEXT NOT NULL,
-                directory TEXT NOT NULL,
-                enabled BOOLEAN NOT NULL,
-                runtime_fingerprint TEXT,
-                matching_copy_evidence BOOLEAN NOT NULL DEFAULT 0,
-                PRIMARY KEY (skill_id, app_id)
             );",
         )?;
         let mut columns = skill_columns(&transaction)?;
         verify_base_columns(&columns)?;
-        ensure_journal_extensions(&transaction)?;
-        verify_journal_schema(&transaction)?;
         for binding in catalog_bindings() {
             if columns.insert(binding.column.to_owned()) {
                 transaction.execute_batch(&format!(
@@ -592,6 +609,141 @@ impl SkillStore {
         transaction.commit().map_err(Into::into)
     }
 
+    fn initialize_journal(&self) -> Result<(), SkillError> {
+        let mut connection = self.connect_journal()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS skill_operation_journal (
+                skill_id TEXT NOT NULL,
+                app_id TEXT NOT NULL,
+                skill_name TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL,
+                runtime_fingerprint TEXT,
+                matching_copy_evidence BOOLEAN NOT NULL DEFAULT 0,
+                previous_enabled BOOLEAN,
+                PRIMARY KEY (skill_id, app_id)
+            );",
+        )?;
+        ensure_journal_extensions(&transaction)?;
+        verify_journal_schema(&transaction)?;
+        transaction.commit().map_err(Into::into)
+    }
+
+    fn migrate_embedded_journal(&self) -> Result<(), SkillError> {
+        let mut shared = self.connect()?;
+        let shared = shared.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists = shared.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema
+                WHERE type = 'table' AND name = 'skill_operation_journal'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Ok(());
+        }
+        let info = journal_schema_info(&shared)?;
+        if !is_owned_embedded_journal(&info) {
+            return Ok(());
+        }
+        let rows = {
+            let mut statement = shared.prepare(
+                "SELECT skill_id, app_id, skill_name, directory, enabled,
+                        runtime_fingerprint, matching_copy_evidence
+                 FROM skill_operation_journal ORDER BY skill_id, app_id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, bool>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, bool>(6)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut journal = self.connect_journal()?;
+        let journal = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for row in &rows {
+            journal.execute(
+                "INSERT OR IGNORE INTO skill_operation_journal
+                    (skill_id, app_id, skill_name, directory, enabled, runtime_fingerprint,
+                     matching_copy_evidence, previous_enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+                params![row.0, row.1, row.2, row.3, row.4, row.5, row.6],
+            )?;
+            let copied = journal.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM skill_operation_journal
+                    WHERE skill_id = ?1 AND app_id = ?2 AND skill_name = ?3
+                      AND directory = ?4 AND enabled = ?5 AND runtime_fingerprint IS ?6
+                      AND matching_copy_evidence = ?7 AND previous_enabled IS NULL
+                 )",
+                params![row.0, row.1, row.2, row.3, row.4, row.5, row.6],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !copied {
+                return Err(SkillError::Recovery(format!(
+                    "local Skill recovery state conflicts with the previous embedded journal for '{}' and '{}'",
+                    row.0, row.1
+                )));
+            }
+        }
+        journal.commit()?;
+        shared.execute_batch("DROP TABLE skill_operation_journal")?;
+        shared.commit().map_err(Into::into)
+    }
+
+    fn insert_pending(&self, pending: &PendingSkillChange) -> Result<(), SkillError> {
+        let mut connection = self.connect_journal()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO skill_operation_journal
+                (skill_id, app_id, skill_name, directory, enabled, runtime_fingerprint,
+                 matching_copy_evidence, previous_enabled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                pending.skill_id,
+                pending.app.as_str(),
+                pending.name,
+                pending.directory,
+                pending.enabled,
+                pending.runtime_fingerprint,
+                pending.copy_policy == SkillCopyPolicy::AllowMatching,
+                pending.previous_enabled,
+            ],
+        )?;
+        transaction.commit().map_err(Into::into)
+    }
+
+    fn delete_pending(&self, pending: &PendingSkillChange) -> Result<(), SkillError> {
+        let mut connection = self.connect_journal()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = delete_pending_row(&transaction, pending)?;
+        if deleted != 1 {
+            return Err(SkillError::Recovery(format!(
+                "pending Skill change disappeared for '{}' and '{}'",
+                pending.skill_id,
+                pending.app.as_str()
+            )));
+        }
+        transaction.commit().map_err(Into::into)
+    }
+
+    fn delete_pending_if_present(&self, pending: &PendingSkillChange) -> Result<(), SkillError> {
+        let mut connection = self.connect_journal()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        delete_pending_row(&transaction, pending)?;
+        transaction.commit().map_err(Into::into)
+    }
+
     fn connect(&self) -> Result<Connection, SkillError> {
         let connection = Connection::open_with_flags(
             &self.path,
@@ -601,6 +753,17 @@ impl SkillStore {
         )?;
         connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "foreign_keys", true)?;
+        Ok(connection)
+    }
+
+    fn connect_journal(&self) -> Result<Connection, SkillError> {
+        let connection = Connection::open_with_flags(
+            &self.journal_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         Ok(connection)
     }
 }
@@ -768,52 +931,28 @@ fn pending_matches_catalog(
     Ok(catalog_column(&pending.app).is_none_or(|_| enabled == Some(pending.enabled)))
 }
 
-fn delete_pending(connection: &Connection, pending: &PendingSkillChange) -> Result<(), SkillError> {
-    let deleted = connection.execute(
-        "DELETE FROM skill_operation_journal
-         WHERE skill_id = ?1 AND app_id = ?2 AND skill_name = ?3
-           AND directory = ?4 AND enabled = ?5 AND runtime_fingerprint = ?6
-           AND matching_copy_evidence = ?7",
-        params![
-            pending.skill_id,
-            pending.app.as_str(),
-            pending.name,
-            pending.directory,
-            pending.enabled,
-            pending.runtime_fingerprint,
-            pending.copy_policy == SkillCopyPolicy::AllowMatching
-        ],
-    )?;
-    if deleted != 1 {
-        return Err(SkillError::Recovery(format!(
-            "pending Skill change disappeared for '{}' and '{}'",
-            pending.skill_id,
-            pending.app.as_str()
-        )));
-    }
-    Ok(())
-}
-
-fn delete_pending_if_present(
+fn delete_pending_row(
     connection: &Connection,
     pending: &PendingSkillChange,
-) -> Result<(), SkillError> {
-    connection.execute(
-        "DELETE FROM skill_operation_journal
+) -> Result<usize, SkillError> {
+    connection
+        .execute(
+            "DELETE FROM skill_operation_journal
          WHERE skill_id = ?1 AND app_id = ?2 AND skill_name = ?3
            AND directory = ?4 AND enabled = ?5 AND runtime_fingerprint = ?6
-           AND matching_copy_evidence = ?7",
-        params![
-            pending.skill_id,
-            pending.app.as_str(),
-            pending.name,
-            pending.directory,
-            pending.enabled,
-            pending.runtime_fingerprint,
-            pending.copy_policy == SkillCopyPolicy::AllowMatching
-        ],
-    )?;
-    Ok(())
+           AND matching_copy_evidence = ?7 AND previous_enabled IS ?8",
+            params![
+                pending.skill_id,
+                pending.app.as_str(),
+                pending.name,
+                pending.directory,
+                pending.enabled,
+                pending.runtime_fingerprint,
+                pending.copy_policy == SkillCopyPolicy::AllowMatching,
+                pending.previous_enabled,
+            ],
+        )
+        .map_err(Into::into)
 }
 
 fn format_recovery(
@@ -859,7 +998,7 @@ fn ensure_journal_extensions(connection: &Connection) -> Result<(), SkillError> 
     verify_journal_info(&info, false)?;
     let columns = info
         .iter()
-        .map(|(name, _)| name.as_str())
+        .map(|column| column.name.as_str())
         .collect::<HashSet<_>>();
     if !columns.contains("runtime_fingerprint") {
         connection.execute_batch(
@@ -872,6 +1011,11 @@ fn ensure_journal_extensions(connection: &Connection) -> Result<(), SkillError> 
              ADD COLUMN matching_copy_evidence BOOLEAN NOT NULL DEFAULT 0",
         )?;
     }
+    if !columns.contains("previous_enabled") {
+        connection.execute_batch(
+            "ALTER TABLE skill_operation_journal ADD COLUMN previous_enabled BOOLEAN",
+        )?;
+    }
     Ok(())
 }
 
@@ -879,11 +1023,25 @@ fn verify_journal_schema(connection: &Connection) -> Result<(), SkillError> {
     verify_journal_info(&journal_schema_info(connection)?, true)
 }
 
-fn journal_schema_info(connection: &Connection) -> Result<Vec<(String, usize)>, SkillError> {
+struct JournalColumnInfo {
+    name: String,
+    declared_type: String,
+    not_null: bool,
+    default_value: Option<String>,
+    primary_key: usize,
+}
+
+fn journal_schema_info(connection: &Connection) -> Result<Vec<JournalColumnInfo>, SkillError> {
     let mut statement = connection.prepare("PRAGMA table_info(skill_operation_journal)")?;
     let info = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, usize>(5)?))
+            Ok(JournalColumnInfo {
+                name: row.get(1)?,
+                declared_type: row.get(2)?,
+                not_null: row.get(3)?,
+                default_value: row.get(4)?,
+                primary_key: row.get(5)?,
+            })
         })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(SkillError::from)?;
@@ -891,17 +1049,18 @@ fn journal_schema_info(connection: &Connection) -> Result<Vec<(String, usize)>, 
 }
 
 fn verify_journal_info(
-    info: &[(String, usize)],
+    info: &[JournalColumnInfo],
     require_runtime_fingerprint: bool,
 ) -> Result<(), SkillError> {
     let columns = info
         .iter()
-        .map(|(name, _)| name.as_str())
+        .map(|column| column.name.as_str())
         .collect::<HashSet<_>>();
     let mut required = vec!["skill_id", "app_id", "skill_name", "directory", "enabled"];
     if require_runtime_fingerprint {
         required.push("runtime_fingerprint");
         required.push("matching_copy_evidence");
+        required.push("previous_enabled");
     }
     for required in required {
         if !columns.contains(required) {
@@ -912,8 +1071,8 @@ fn verify_journal_info(
     }
     let primary_key = info
         .iter()
-        .filter(|(_, position)| *position > 0)
-        .map(|(name, position)| (name.as_str(), *position))
+        .filter(|column| column.primary_key > 0)
+        .map(|column| (column.name.as_str(), column.primary_key))
         .collect::<Vec<_>>();
     if primary_key != [("skill_id", 1), ("app_id", 2)] {
         return Err(SkillError::InvalidStore(
@@ -921,6 +1080,26 @@ fn verify_journal_info(
         ));
     }
     Ok(())
+}
+
+fn is_owned_embedded_journal(info: &[JournalColumnInfo]) -> bool {
+    let expected = [
+        ("skill_id", "TEXT", true, None, 1),
+        ("app_id", "TEXT", true, None, 2),
+        ("skill_name", "TEXT", true, None, 0),
+        ("directory", "TEXT", true, None, 0),
+        ("enabled", "BOOLEAN", true, None, 0),
+        ("runtime_fingerprint", "TEXT", false, None, 0),
+        ("matching_copy_evidence", "BOOLEAN", true, Some("0"), 0),
+    ];
+    info.len() == expected.len()
+        && info.iter().zip(expected).all(|(column, expected)| {
+            column.name == expected.0
+                && column.declared_type.eq_ignore_ascii_case(expected.1)
+                && column.not_null == expected.2
+                && column.default_value.as_deref() == expected.3
+                && column.primary_key == expected.4
+        })
 }
 
 fn verify_base_columns(columns: &HashSet<String>) -> Result<(), SkillError> {
@@ -993,6 +1172,15 @@ mod tests {
         (directory, path, store)
     }
 
+    fn journal_count(store: &SkillStore) -> usize {
+        Connection::open(&store.journal_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
     #[test]
     fn host_catalog_mapping_covers_every_managed_selection() {
         for descriptor in builtin_app_registry().descriptors() {
@@ -1024,8 +1212,9 @@ mod tests {
     #[test]
     fn incompatible_journal_key_is_rejected() {
         let (_directory, path, store) = seed_store();
+        let journal_path = store.journal_path.clone();
         drop(store);
-        Connection::open(&path)
+        Connection::open(journal_path)
             .unwrap()
             .execute_batch(
                 "DROP TABLE skill_operation_journal;
@@ -1050,8 +1239,9 @@ mod tests {
     #[test]
     fn legacy_journal_rows_without_runtime_identity_stay_read_only() {
         let (_directory, path, store) = seed_store();
+        let journal_path = store.journal_path.clone();
         drop(store);
-        Connection::open(&path)
+        Connection::open(&journal_path)
             .unwrap()
             .execute_batch(
                 "DROP TABLE skill_operation_journal;
@@ -1078,7 +1268,7 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert!(issues[0].contains("runtime fingerprint"));
         assert_eq!(
-            Connection::open(path)
+            Connection::open(journal_path)
                 .unwrap()
                 .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
                     row.get::<_, usize>(0)
@@ -1111,6 +1301,58 @@ mod tests {
                 .unwrap(),
             "keep"
         );
+        assert!(!connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'skill_operation_journal'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+        assert_eq!(journal_count(&store), 0);
+    }
+
+    #[test]
+    fn previous_embedded_journal_moves_to_local_state_once() {
+        let (_directory, path, store) = seed_store();
+        drop(store);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE skill_operation_journal (
+                    skill_id TEXT NOT NULL,
+                    app_id TEXT NOT NULL,
+                    skill_name TEXT NOT NULL,
+                    directory TEXT NOT NULL,
+                    enabled BOOLEAN NOT NULL,
+                    runtime_fingerprint TEXT,
+                    matching_copy_evidence BOOLEAN NOT NULL DEFAULT 0,
+                    PRIMARY KEY (skill_id, app_id)
+                 );
+                 UPDATE skills SET enabled_claude = 1 WHERE id = 'docs';
+                 INSERT INTO skill_operation_journal
+                    (skill_id, app_id, skill_name, directory, enabled,
+                     runtime_fingerprint, matching_copy_evidence)
+                 VALUES ('docs', 'claude', 'Docs', 'docs', 1, 'runtime-v1', 0);",
+            )
+            .unwrap();
+
+        let store = SkillStore::open(path.clone()).unwrap();
+
+        assert_eq!(journal_count(&store), 1);
+        assert!(!Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'skill_operation_journal'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
     }
 
     #[test]
@@ -1149,21 +1391,48 @@ mod tests {
     }
 
     #[test]
-    fn durable_intent_is_replayed_after_an_interrupted_toggle() {
+    fn unverified_embedded_journal_is_never_claimed_or_dropped() {
         let (_directory, path, store) = seed_store();
+        drop(store);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE skill_operation_journal (
+                    skill_id TEXT NOT NULL,
+                    app_id TEXT NOT NULL,
+                    skill_name TEXT NOT NULL,
+                    directory TEXT NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    runtime_fingerprint TEXT,
+                    matching_copy_evidence BOOLEAN NOT NULL DEFAULT 0,
+                    PRIMARY KEY (skill_id, app_id)
+                 );",
+            )
+            .unwrap();
+
+        SkillStore::open(path.clone()).unwrap();
+
+        assert!(Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'skill_operation_journal'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn durable_intent_is_replayed_after_an_interrupted_toggle() {
+        let (_directory, _path, store) = seed_store();
         let pending = store
             .begin_toggle("docs", AppType::Claude, true, "runtime-v1".to_owned())
             .unwrap();
         assert!(pending.enabled);
-        assert_eq!(
-            Connection::open(&path)
-                .unwrap()
-                .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
-                    row.get::<_, usize>(0)
-                })
-                .unwrap(),
-            1
-        );
+        assert_eq!(journal_count(&store), 1);
 
         let committed = Rc::new(Cell::new(false));
         let issues = store
@@ -1180,15 +1449,28 @@ mod tests {
             .unwrap();
         assert!(issues.is_empty());
         assert!(committed.get());
-        assert_eq!(
-            Connection::open(path)
-                .unwrap()
-                .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
-                    row.get::<_, usize>(0)
-                })
-                .unwrap(),
-            0
-        );
+        assert_eq!(journal_count(&store), 0);
+    }
+
+    #[test]
+    fn intent_left_before_catalog_commit_is_discarded_without_live_changes() {
+        let (_directory, path, store) = seed_store();
+        store
+            .begin_toggle("docs", AppType::Claude, true, "runtime-v1".to_owned())
+            .unwrap();
+        Connection::open(path)
+            .unwrap()
+            .execute("UPDATE skills SET enabled_claude = 0 WHERE id = 'docs'", [])
+            .unwrap();
+
+        let issues = store
+            .recover_pending_with_live::<FakeReceipt>(|_| {
+                panic!("an intent without its catalog commit must not reach live files")
+            })
+            .unwrap();
+
+        assert!(issues.is_empty());
+        assert_eq!(journal_count(&store), 0);
     }
 
     #[test]
@@ -1251,15 +1533,7 @@ mod tests {
 
         assert_eq!(issues.len(), 1);
         assert!(committed.get());
-        assert_eq!(
-            Connection::open(&path)
-                .unwrap()
-                .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
-                    row.get::<_, usize>(0)
-                })
-                .unwrap(),
-            1
-        );
+        assert_eq!(journal_count(&store), 1);
         assert!(store.list().unwrap()[0].apps["claude"].issue.is_some());
     }
 
@@ -1282,14 +1556,7 @@ mod tests {
             .query_row("SELECT enabled_claude FROM skills", [], |row| row
                 .get::<_, bool>(0))
             .unwrap());
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
-                    row.get::<_, usize>(0)
-                })
-                .unwrap(),
-            1
-        );
+        assert_eq!(journal_count(&store), 1);
     }
 
     #[test]
@@ -1325,15 +1592,7 @@ mod tests {
             assert!(matches!(result, Err(SkillError::Conflict(_))));
             assert!(!committed.get());
             assert!(rolled_back.get());
-            assert_eq!(
-                Connection::open(&path)
-                    .unwrap()
-                    .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
-                        row.get::<_, usize>(0)
-                    })
-                    .unwrap(),
-                0
-            );
+            assert_eq!(journal_count(&store), 0);
         }
     }
 
@@ -1364,6 +1623,33 @@ mod tests {
             .query_row("SELECT enabled_codex FROM skills", [], |row| row
                 .get::<_, bool>(0))
             .unwrap());
+    }
+
+    #[test]
+    fn catalog_rollback_commits_before_journal_cleanup() {
+        let (_directory, path, store) = seed_store();
+        let pending = store
+            .begin_toggle("docs", AppType::Claude, true, "runtime-v1".to_owned())
+            .unwrap();
+        Connection::open(&store.journal_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_skill_journal_delete
+                 BEFORE DELETE ON skill_operation_journal
+                 BEGIN SELECT RAISE(ABORT, 'keep journal'); END;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.cancel_pending(&pending),
+            Err(SkillError::Database(_))
+        ));
+        assert!(!Connection::open(path)
+            .unwrap()
+            .query_row("SELECT enabled_claude FROM skills", [], |row| row
+                .get::<_, bool>(0))
+            .unwrap());
+        assert_eq!(journal_count(&store), 1);
     }
 
     #[test]
@@ -1549,15 +1835,7 @@ mod tests {
             assert_eq!(claude.join("skills/docs").exists(), enabled);
         }
         assert!(source.join("SKILL.md").exists());
-        assert_eq!(
-            Connection::open(path)
-                .unwrap()
-                .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
-                    row.get::<_, usize>(0)
-                })
-                .unwrap(),
-            0
-        );
+        assert_eq!(journal_count(&store), 0);
     }
 
     #[test]
@@ -1620,15 +1898,7 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert!(!initial_claude.join("skills/docs").exists());
         assert!(!current_claude.join("skills/docs").exists());
-        assert_eq!(
-            Connection::open(path)
-                .unwrap()
-                .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
-                    row.get::<_, usize>(0)
-                })
-                .unwrap(),
-            1
-        );
+        assert_eq!(journal_count(&store), 1);
     }
 
     #[test]

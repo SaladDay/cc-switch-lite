@@ -38,7 +38,7 @@ fn list_simple_provider_forms() -> Vec<SimpleProviderFormDescriptor> {
     builtin_simple_provider_forms().cloned().collect()
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CommandError {
     code: &'static str,
@@ -82,6 +82,37 @@ impl From<SkillError> for CommandError {
 }
 
 type CommandResult<T> = Result<T, CommandError>;
+
+enum SkillStoreState {
+    Available(SkillStore),
+    Unavailable(CommandError),
+}
+
+impl SkillStoreState {
+    fn open(database_path: std::path::PathBuf, state_path: std::path::PathBuf) -> Self {
+        match SkillStore::open_with_local_state(database_path, state_path) {
+            Ok(store) => Self::Available(store),
+            Err(error) => Self::Unavailable(CommandError {
+                code: error.code(),
+                message: error.to_string(),
+            }),
+        }
+    }
+
+    fn store(&self) -> CommandResult<&SkillStore> {
+        match self {
+            Self::Available(store) => Ok(store),
+            Self::Unavailable(error) => Err(error.clone()),
+        }
+    }
+
+    fn available(&self) -> Option<&SkillStore> {
+        match self {
+            Self::Available(store) => Some(store),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
 
 fn unavailable_adapter() -> StoreError {
     StoreError::InvalidProvider("provider adapter is not available in Lite".to_owned())
@@ -549,10 +580,10 @@ fn import_mcp_from_apps(
 
 #[tauri::command]
 fn list_installed_skills(
-    store: State<'_, SkillStore>,
+    store: State<'_, SkillStoreState>,
     live: State<'_, LiveConfig>,
 ) -> CommandResult<Vec<SkillRecord>> {
-    let mut skills = store.list()?;
+    let mut skills = store.store()?.list()?;
     let requests = skills
         .iter()
         .map(|skill| SkillObservationRequest {
@@ -601,7 +632,7 @@ fn list_installed_skills(
 
 #[tauri::command]
 fn toggle_skill_app(
-    store: State<'_, SkillStore>,
+    store: State<'_, SkillStoreState>,
     live: State<'_, LiveConfig>,
     skill_id: String,
     app_id: String,
@@ -614,6 +645,7 @@ fn toggle_skill_app(
     })?;
     let runtime_fingerprint = live.skill_runtime_fingerprint(&app)?;
     match store
+        .store()?
         .toggle_with_live(&skill_id, app, enabled, runtime_fingerprint, |pending| {
             live.apply_skill_recoverable(
                 &pending.name,
@@ -636,22 +668,38 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let home_dir = app.path().home_dir()?;
-            let store = ProviderStore::from_home(&home_dir)?;
-            let mcp_store = McpStore::open(store::database_path(&home_dir))?;
-            let skill_store = SkillStore::open(store::database_path(&home_dir))?;
-            let live = LiveConfig::from_home(&home_dir)?;
-            let recovery_issues = skill_store.recover_pending_with_live(|pending| {
-                live.apply_skill_recoverable(
-                    &pending.name,
-                    &pending.directory,
-                    &pending.app,
-                    pending.enabled,
-                    &pending.runtime_fingerprint,
-                    pending.copy_policy(),
-                )
-            })?;
-            for issue in recovery_issues {
-                eprintln!("CC Switch Lite Skill recovery: {issue}");
+            let database_path = store::shared_database_path(&home_dir, &app.path().data_dir()?)
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "CC Switch Lite could not read the full app's custom data path: {error}"
+                    );
+                    store::database_path(&home_dir)
+                });
+            let store = ProviderStore::open(database_path.clone())?;
+            let mcp_store = McpStore::open(database_path.clone())?;
+            let skill_store = SkillStoreState::open(
+                database_path.clone(),
+                store::local_skill_state_path(&home_dir, &database_path),
+            );
+            let live = LiveConfig::from_home_with_database(&home_dir, &database_path)?;
+            if let Some(store) = skill_store.available() {
+                match store.recover_pending_with_live(|pending| {
+                    live.apply_skill_recoverable(
+                        &pending.name,
+                        &pending.directory,
+                        &pending.app,
+                        pending.enabled,
+                        &pending.runtime_fingerprint,
+                        pending.copy_policy(),
+                    )
+                }) {
+                    Ok(issues) => {
+                        for issue in issues {
+                            eprintln!("CC Switch Lite Skill recovery: {issue}");
+                        }
+                    }
+                    Err(error) => eprintln!("CC Switch Lite Skill recovery: {error}"),
+                }
             }
             // The shared database is authoritative; startup never imports old Lite files.
             app.manage(store);
@@ -688,6 +736,25 @@ pub fn run() {
 mod tests {
     use super::*;
     use serde_json::{json, Map};
+
+    #[test]
+    fn incompatible_skill_data_does_not_disable_providers_or_mcp() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("cc-switch.db");
+        let state_path = directory.path().join("state/cc-switch-lite-state.db");
+        rusqlite::Connection::open(&database_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE skills (directory TEXT NOT NULL);")
+            .unwrap();
+
+        assert!(ProviderStore::open(database_path.clone()).is_ok());
+        assert!(McpStore::open(database_path.clone()).is_ok());
+        let state = SkillStoreState::open(database_path, state_path.clone());
+
+        assert!(state.available().is_none());
+        assert_eq!(state.store().err().unwrap().code, "invalid_store");
+        assert!(!state_path.exists());
+    }
 
     #[test]
     fn host_adapters_cover_every_core_application() {

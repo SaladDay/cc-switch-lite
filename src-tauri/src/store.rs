@@ -12,7 +12,7 @@ use rusqlite::{
     TransactionBehavior,
 };
 use serde_json::{Map, Value};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -28,6 +28,9 @@ const SAFE_JS_INTEGER_MASK: u64 = (1_u64 << 53) - 1;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const ADAPTER_BINDINGS_TABLE: &str = "cc_switch_lite_provider_adapters";
 const MAX_NATIVE_SETTINGS_BYTES: usize = 1024 * 1024;
+const FULL_APP_IDENTIFIER: &str = "com.ccswitch.desktop";
+const FULL_APP_PATH_STORE: &str = "app_paths.json";
+const APP_CONFIG_DIR_OVERRIDE: &str = "app_config_dir_override";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -119,10 +122,6 @@ pub struct ProviderStore {
 }
 
 impl ProviderStore {
-    pub fn from_home(home: &Path) -> Result<Self, StoreError> {
-        Self::open(database_path(home))
-    }
-
     pub fn open(path: PathBuf) -> Result<Self, StoreError> {
         let store = Self {
             path,
@@ -1410,6 +1409,89 @@ pub(crate) fn database_path(home: &Path) -> PathBuf {
     }
 
     default
+}
+
+pub(crate) fn shared_database_path(
+    home: &Path,
+    platform_data_dir: &Path,
+) -> Result<PathBuf, StoreError> {
+    let store_path = platform_data_dir
+        .join(FULL_APP_IDENTIFIER)
+        .join(FULL_APP_PATH_STORE);
+    let contents = match fs::read(&store_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(database_path(home));
+        }
+        Err(source) => {
+            return Err(StoreError::Io {
+                path: store_path,
+                source,
+            });
+        }
+    };
+    if contents.len() > MAX_NATIVE_SETTINGS_BYTES {
+        return Err(StoreError::InvalidStore(
+            "CC Switch path settings are too large".to_owned(),
+        ));
+    }
+    let settings = serde_json::from_slice::<Map<String, Value>>(&contents)
+        .map_err(|_| StoreError::InvalidStore("CC Switch path settings are invalid".to_owned()))?;
+    let Some(value) = settings.get(APP_CONFIG_DIR_OVERRIDE) else {
+        return Ok(database_path(home));
+    };
+    let raw = value.as_str().ok_or_else(|| {
+        StoreError::InvalidStore("CC Switch config directory override is invalid".to_owned())
+    })?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(database_path(home));
+    }
+    let configured = resolve_shared_path(home, raw);
+    if !configured.is_absolute() {
+        return Err(StoreError::InvalidStore(
+            "CC Switch config directory override must be absolute".to_owned(),
+        ));
+    }
+    let configured = fs::canonicalize(&configured).map_err(|source| StoreError::Io {
+        path: configured,
+        source,
+    })?;
+    if !configured.is_dir() {
+        return Err(StoreError::InvalidStore(
+            "CC Switch config directory override is not a directory".to_owned(),
+        ));
+    }
+    Ok(configured.join("cc-switch.db"))
+}
+
+pub(crate) fn local_skill_state_path(home: &Path, database_path: &Path) -> PathBuf {
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(database_path.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for value in database_path.as_os_str().encode_wide() {
+            hasher.update(value.to_le_bytes());
+        }
+    }
+    let database_id = format!("{:x}", hasher.finalize());
+    home.join(".cc-switch/cc-switch-lite-state")
+        .join(format!("{database_id}.db"))
+}
+
+fn resolve_shared_path(home: &Path, raw: &str) -> PathBuf {
+    if raw == "~" {
+        home.to_owned()
+    } else if let Some(path) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        home.join(path)
+    } else {
+        PathBuf::from(raw)
+    }
 }
 
 #[cfg(test)]
@@ -3073,5 +3155,51 @@ requires_openai_auth = true
             ));
             assert_eq!(store.list(app.as_str()).unwrap()[0].name, provider.name);
         }
+    }
+
+    #[test]
+    fn shared_database_path_honors_the_full_app_override() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let home = directory.path().join("home");
+        let data = directory.path().join("data");
+        fs::create_dir_all(&home).unwrap();
+        assert_eq!(
+            shared_database_path(&home, &data).unwrap(),
+            home.join(".cc-switch/cc-switch.db")
+        );
+
+        let configured = directory.path().join("shared-config");
+        fs::create_dir_all(&configured).unwrap();
+        let store_dir = data.join(FULL_APP_IDENTIFIER);
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(
+            store_dir.join(FULL_APP_PATH_STORE),
+            serde_json::to_vec(&serde_json::json!({
+                (APP_CONFIG_DIR_OVERRIDE): configured
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            shared_database_path(&home, &data).unwrap(),
+            fs::canonicalize(configured).unwrap().join("cc-switch.db")
+        );
+    }
+
+    #[test]
+    fn local_skill_recovery_is_isolated_per_shared_database() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let home = directory.path().join("home");
+        let first = local_skill_state_path(&home, &directory.path().join("one/cc-switch.db"));
+        let same = local_skill_state_path(&home, &directory.path().join("one/cc-switch.db"));
+        let second = local_skill_state_path(&home, &directory.path().join("two/cc-switch.db"));
+
+        assert_eq!(first, same);
+        assert_ne!(first, second);
+        assert_eq!(
+            first.parent(),
+            Some(home.join(".cc-switch/cc-switch-lite-state").as_path())
+        );
     }
 }
