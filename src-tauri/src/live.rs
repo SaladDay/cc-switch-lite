@@ -8,8 +8,8 @@ use std::{
 
 use cc_switch_core::{
     builtin_app_registry, fs::shared_live_config_lock_path, project_skill_config_enabled, AppType,
-    ContentExpectation, PlannedWrite, SkillConfigTarget, SkillDeploymentReceipt, SkillSyncMethod,
-    MAX_OPERATION_CONTENT_BYTES, OPERATION_CONTRACT_MAJOR,
+    ContentExpectation, PlannedWrite, SkillConfigError, SkillConfigTarget, SkillDeploymentReceipt,
+    SkillSyncMethod, MAX_OPERATION_CONTENT_BYTES, OPERATION_CONTRACT_MAJOR,
 };
 use fs4::{FileExt, TryLockError};
 use serde::Deserialize;
@@ -64,6 +64,15 @@ impl LiveError {
             Self::Io { .. } => "live_io_error",
             Self::Recovery(_) => "rollback_failed",
         }
+    }
+
+    fn recovery_incomplete(&self) -> bool {
+        matches!(
+            self,
+            Self::Recovery(_)
+                | Self::Operation(OperationError::Rollback(_))
+                | Self::Skill(SkillLiveError::Config(SkillConfigError::Recovery { .. }))
+        )
     }
 }
 
@@ -524,7 +533,7 @@ impl RecoverableSkillChange for SkillWriteReceipt<'_> {
     }
 
     fn recovery_incomplete(error: &Self::Error) -> bool {
-        matches!(error, LiveError::Recovery(_))
+        error.recovery_incomplete()
     }
 }
 
@@ -846,6 +855,18 @@ fn config_root(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn nested_rollback_failures_keep_the_skill_recovery_intent() {
+        let operation = LiveError::Operation(OperationError::Rollback("incomplete".to_owned()));
+        let deployment = LiveError::Skill(SkillLiveError::Config(SkillConfigError::Recovery {
+            message: "incomplete".to_owned(),
+        }));
+
+        assert!(operation.recovery_incomplete());
+        assert!(deployment.recovery_incomplete());
+        assert!(!LiveError::LockUnavailable.recovery_incomplete());
+    }
 
     #[test]
     fn config_roots_require_absolute_paths_and_allow_missing_directories() {

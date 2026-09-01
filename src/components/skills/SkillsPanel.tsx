@@ -100,19 +100,6 @@ export function SkillsPanel({
     setError(null);
     try {
       await skillsApi.toggle(skill.id, appId, enabled);
-      setSkills((current) =>
-        current.map((item) =>
-          item.id === skill.id
-            ? {
-                ...item,
-                apps: {
-                  ...item.apps,
-                  [appId]: { enabled },
-                },
-              }
-            : item,
-        ),
-      );
       const refreshed = await skillsApi.list();
       setSkills(refreshed);
     } catch (reason) {
@@ -246,7 +233,8 @@ export function SkillsPanel({
                     {apps.map((app) => {
                       const definition = appDefinition(app.id, [app]);
                       const appState = skill.apps[app.id] ?? {
-                        enabled: false,
+                        enabled: null,
+                        issue: "Skill state was not reported",
                       };
                       const enabled = appState.enabled === true;
                       const key = `${skill.id}:${app.id}`;

@@ -1,6 +1,7 @@
 # CC Switch Lite
 
-A provider configuration editor for every application supported by CC Switch.
+A lightweight provider, MCP, and Skill configuration switcher for every
+application supported by CC Switch.
 
 CC Switch Lite uses
 [`cc-switch-core`](https://github.com/SaladDay/cc-switch-core) as its built-in
@@ -42,6 +43,8 @@ For applications that discover `~/.agents/skills` directly, Lite uses a native
 per-Skill control only when Core declares a safe one. Gemini, Grok, and Hermes
 use their native disabled lists. Other directly discovered copies are shown as
 externally managed instead of guessing whether the application has enabled them.
+Skill status is the user-level default managed by Lite; project, workspace,
+system, administrator, or plugin layers can still override it at runtime.
 
 Import reads only the API-provider fields that Lite can reproduce. Switching
 uses the shared Core executor with logical configuration targets. Lite updates its
