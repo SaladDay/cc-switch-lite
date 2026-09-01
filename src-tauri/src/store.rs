@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
+    io::Read,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -1418,8 +1419,8 @@ pub(crate) fn shared_database_path(
     let store_path = platform_data_dir
         .join(FULL_APP_IDENTIFIER)
         .join(FULL_APP_PATH_STORE);
-    let contents = match fs::read(&store_path) {
-        Ok(contents) => contents,
+    let file = match fs::File::open(&store_path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(database_path(home));
         }
@@ -1430,6 +1431,27 @@ pub(crate) fn shared_database_path(
             });
         }
     };
+    let metadata = file.metadata().map_err(|source| StoreError::Io {
+        path: store_path.clone(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(StoreError::InvalidStore(
+            "CC Switch path settings are not a regular file".to_owned(),
+        ));
+    }
+    if metadata.len() > MAX_NATIVE_SETTINGS_BYTES as u64 {
+        return Err(StoreError::InvalidStore(
+            "CC Switch path settings are too large".to_owned(),
+        ));
+    }
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_NATIVE_SETTINGS_BYTES + 1) as u64)
+        .read_to_end(&mut contents)
+        .map_err(|source| StoreError::Io {
+            path: store_path.clone(),
+            source,
+        })?;
     if contents.len() > MAX_NATIVE_SETTINGS_BYTES {
         return Err(StoreError::InvalidStore(
             "CC Switch path settings are too large".to_owned(),
@@ -1466,6 +1488,8 @@ pub(crate) fn shared_database_path(
 }
 
 pub(crate) fn local_skill_state_path(home: &Path, database_path: &Path) -> PathBuf {
+    let database_path =
+        fs::canonicalize(database_path).unwrap_or_else(|_| database_path.to_owned());
     let mut hasher = Sha256::new();
     #[cfg(unix)]
     {
@@ -3191,6 +3215,15 @@ requires_openai_auth = true
             shared_database_path(&home, &data),
             Err(StoreError::InvalidStore(_))
         ));
+
+        fs::File::create(store_dir.join(FULL_APP_PATH_STORE))
+            .unwrap()
+            .set_len(MAX_NATIVE_SETTINGS_BYTES as u64 + 1)
+            .unwrap();
+        assert!(matches!(
+            shared_database_path(&home, &data),
+            Err(StoreError::InvalidStore(_))
+        ));
     }
 
     #[test]
@@ -3206,6 +3239,22 @@ requires_openai_auth = true
         assert_eq!(
             first.parent(),
             Some(home.join(".cc-switch/cc-switch-lite-state").as_path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_skill_recovery_follows_the_resolved_shared_database() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let home = directory.path().join("home");
+        let database = directory.path().join("cc-switch.db");
+        let alias = directory.path().join("database-alias.db");
+        fs::write(&database, b"").unwrap();
+        std::os::unix::fs::symlink(&database, &alias).unwrap();
+
+        assert_eq!(
+            local_skill_state_path(&home, &database),
+            local_skill_state_path(&home, &alias)
         );
     }
 }

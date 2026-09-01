@@ -15,12 +15,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.4.0", features = [] }
 
 [dependencies]
-cc-switch-core = { git = "https://github.com/SaladDay/cc-switch-core", rev = "291900d0f14df9b9d687d71a5fcfc8395799d5a9" }
+cc-switch-core = { git = "https://github.com/SaladDay/cc-switch-core", rev = "bb75a9be968df6b793bda5f66bf106ac637baae1" }
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 hmac = "0.12"
 json5 = "0.4"
 libc = "0.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
+same-file = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 serde_yaml = "0.9"

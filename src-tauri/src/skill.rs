@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Display,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -91,11 +91,35 @@ pub(crate) struct PendingSkillChange {
     pub(crate) runtime_fingerprint: String,
     previous_enabled: Option<bool>,
     copy_policy: SkillCopyPolicy,
+    phase: PendingPhase,
 }
 
 impl PendingSkillChange {
     pub(crate) fn copy_policy(&self) -> SkillCopyPolicy {
         self.copy_policy
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingPhase {
+    Prepared,
+    CatalogCommitted,
+}
+
+impl PendingPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::CatalogCommitted => "catalogCommitted",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "prepared" => Some(Self::Prepared),
+            "catalogCommitted" => Some(Self::CatalogCommitted),
+            _ => None,
+        }
     }
 }
 
@@ -108,8 +132,8 @@ pub(crate) trait RecoverableSkillChange: Sized {
     type Error: Display;
 
     fn verify(&self) -> Result<(), Self::Error>;
-    fn commit(self) -> Result<(), Self::Error>;
-    fn rollback(self) -> Result<(), Self::Error>;
+    fn commit(&mut self) -> Result<(), Self::Error>;
+    fn rollback(&mut self) -> Result<(), Self::Error>;
 
     fn recovery_incomplete(_error: &Self::Error) -> bool {
         false
@@ -145,6 +169,7 @@ impl SkillStore {
                 source,
             })?;
         }
+        ensure_separate_recovery_file(&store.path, &store.journal_path)?;
         store.initialize_journal()?;
         store.migrate_embedded_journal()?;
         Ok(store)
@@ -229,26 +254,34 @@ impl SkillStore {
         C: RecoverableSkillChange,
     {
         let pending = self.begin_toggle(id, app, enabled, runtime_fingerprint)?;
-        let receipt = match apply(&pending) {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !pending_matches_catalog(&transaction, &pending)? {
+            return Err(SkillError::Conflict(format!(
+                "Skill '{}' or its '{}' selection changed before native configuration",
+                pending.skill_id,
+                pending.app.as_str()
+            )));
+        }
+        let mut receipt = match apply(&pending) {
             Ok(receipt) => receipt,
             Err(error) => {
                 if !C::recovery_incomplete(&error) {
-                    self.cancel_pending(&pending)?;
+                    restore_catalog(&transaction, &pending)?;
+                    transaction.commit()?;
+                    self.delete_pending(&pending)?;
                 }
                 return Ok(Err(error));
             }
         };
         if let Err(error) = receipt.verify() {
             return match receipt.rollback() {
-                Ok(()) => match self.cancel_pending(&pending) {
-                    Ok(()) => Ok(Err(error)),
-                    Err(database) => Err(SkillError::Recovery(format_recovery(
-                        "live verification",
-                        &error,
-                        Some(database),
-                        None::<C::Error>,
-                    ))),
-                },
+                Ok(()) => {
+                    restore_catalog(&transaction, &pending)?;
+                    transaction.commit()?;
+                    self.delete_pending(&pending)?;
+                    Ok(Err(error))
+                }
                 Err(live) => Err(SkillError::Recovery(format_recovery(
                     "live verification",
                     &error,
@@ -257,7 +290,7 @@ impl SkillStore {
                 ))),
             };
         }
-        self.finalize_pending(&pending, receipt)
+        self.finalize_pending(&pending, transaction, receipt)
     }
 
     pub(crate) fn recover_pending_with_live<C>(
@@ -272,7 +305,37 @@ impl SkillStore {
             mut issues,
         } = self.pending_changes()?;
         for pending in changes {
-            let receipt = match apply(&pending) {
+            let mut connection = match self.connect() {
+                Ok(connection) => connection,
+                Err(error) => {
+                    issues.push(error.to_string());
+                    continue;
+                }
+            };
+            let transaction =
+                match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
+                    Ok(transaction) => transaction,
+                    Err(error) => {
+                        issues.push(error.to_string());
+                        continue;
+                    }
+                };
+            match pending_matches_catalog(&transaction, &pending) {
+                Ok(true) => {}
+                Ok(false) => {
+                    issues.push(format!(
+                        "pending Skill change for '{}' and '{}' no longer matches the shared catalog; recovery state was preserved",
+                        pending.skill_id,
+                        pending.app.as_str()
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    issues.push(error.to_string());
+                    continue;
+                }
+            }
+            let mut receipt = match apply(&pending) {
                 Ok(receipt) => receipt,
                 Err(error) => {
                     issues.push(format!(
@@ -297,7 +360,7 @@ impl SkillStore {
                 issues.push(issue);
                 continue;
             }
-            match self.finalize_pending(&pending, receipt) {
+            match self.finalize_pending(&pending, transaction, receipt) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => issues.push(format!(
                     "could not finalize recovery for '{}' and '{}': {error}",
@@ -361,6 +424,7 @@ impl SkillStore {
             } else {
                 SkillCopyPolicy::ManagedOnly
             },
+            phase: PendingPhase::Prepared,
         };
         self.insert_pending(&pending)?;
         let database_result = (|| -> Result<(), SkillError> {
@@ -384,6 +448,13 @@ impl SkillStore {
                 ))),
             };
         }
+        let mut pending = pending;
+        self.mark_catalog_committed(&pending).map_err(|error| {
+            SkillError::Recovery(format!(
+                "shared catalog changed but its local recovery phase could not be recorded: {error}"
+            ))
+        })?;
+        pending.phase = PendingPhase::CatalogCommitted;
         Ok(pending)
     }
 
@@ -391,7 +462,7 @@ impl SkillStore {
         let journal = self.connect_journal()?;
         let mut statement = journal.prepare(
             "SELECT skill_id, app_id, skill_name, directory, enabled, runtime_fingerprint,
-                    matching_copy_evidence, previous_enabled
+                    matching_copy_evidence, previous_enabled, phase
              FROM skill_operation_journal ORDER BY skill_id, app_id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -404,6 +475,7 @@ impl SkillStore {
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, bool>(6)?,
                 row.get::<_, Option<bool>>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })?;
         let rows = rows.collect::<Result<Vec<_>, _>>()?;
@@ -424,7 +496,13 @@ impl SkillStore {
                     runtime_fingerprint,
                     matching_copy_evidence,
                     previous_enabled,
+                    phase,
                 ) = row;
+                let phase = PendingPhase::parse(&phase).ok_or_else(|| {
+                    SkillError::InvalidStore(format!(
+                        "pending Skill change for '{skill_id}' has invalid phase '{phase}'"
+                    ))
+                })?;
                 let runtime_fingerprint = runtime_fingerprint
                     .filter(|fingerprint| !fingerprint.is_empty())
                     .ok_or_else(|| {
@@ -505,11 +583,19 @@ impl SkillStore {
                     runtime_fingerprint,
                     previous_enabled,
                     copy_policy,
+                    phase,
                 };
                 Ok((pending, catalog_matches_previous))
             })();
             match resolved {
-                Ok((pending, true)) => stale.push(pending),
+                Ok((pending, true)) if pending.phase == PendingPhase::Prepared => {
+                    stale.push(pending)
+                }
+                Ok((pending, true)) => issues.push(format!(
+                    "pending Skill change for '{}' and '{}' may have reached native configuration after the catalog changed; recovery state was preserved",
+                    pending.skill_id,
+                    pending.app.as_str()
+                )),
                 Ok((pending, false)) => changes.push(pending),
                 Err(error) => issues.push(error.to_string()),
             }
@@ -517,33 +603,20 @@ impl SkillStore {
         for pending in stale {
             self.delete_pending_if_present(&pending)?;
         }
+        for pending in &mut changes {
+            if pending.phase == PendingPhase::Prepared {
+                self.mark_catalog_committed(pending)?;
+                pending.phase = PendingPhase::CatalogCommitted;
+            }
+        }
         Ok(PendingScan { changes, issues })
     }
 
+    #[cfg(test)]
     fn cancel_pending(&self, pending: &PendingSkillChange) -> Result<(), SkillError> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(previous) = pending.previous_enabled {
-            let column = catalog_column(&pending.app).ok_or_else(|| {
-                SkillError::Recovery(format!(
-                    "missing catalog binding for '{}'",
-                    pending.app.as_str()
-                ))
-            })?;
-            let updated = transaction.execute(
-                &format!(
-                    "UPDATE skills SET {column} = ?1
-                     WHERE id = ?2 AND {column} = ?3"
-                ),
-                params![previous, pending.skill_id, pending.enabled],
-            )?;
-            if updated != 1 {
-                return Err(SkillError::Recovery(format!(
-                    "catalog changed while rolling back Skill '{}'",
-                    pending.skill_id
-                )));
-            }
-        }
+        restore_catalog(&transaction, pending)?;
         transaction.commit()?;
         self.delete_pending(pending)?;
         Ok(())
@@ -552,23 +625,20 @@ impl SkillStore {
     fn finalize_pending<C>(
         &self,
         pending: &PendingSkillChange,
-        receipt: C,
+        transaction: rusqlite::Transaction<'_>,
+        mut receipt: C,
     ) -> Result<Result<(), C::Error>, SkillError>
     where
         C: RecoverableSkillChange,
     {
-        let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !pending_matches_catalog(&transaction, pending)? {
             if let Err(error) = receipt.rollback() {
                 return Err(SkillError::Recovery(format!(
                     "catalog changed and native rollback failed: {error}"
                 )));
             }
-            self.delete_pending_if_present(pending)?;
-            transaction.commit()?;
             return Err(SkillError::Conflict(format!(
-                "Skill '{}' or its '{}' selection changed",
+                "Skill '{}' or its '{}' selection changed; recovery state was preserved",
                 pending.skill_id,
                 pending.app.as_str()
             )));
@@ -627,6 +697,7 @@ impl SkillStore {
                 runtime_fingerprint TEXT,
                 matching_copy_evidence BOOLEAN NOT NULL DEFAULT 0,
                 previous_enabled BOOLEAN,
+                phase TEXT NOT NULL DEFAULT 'catalogCommitted',
                 PRIMARY KEY (skill_id, app_id)
             );",
         )?;
@@ -712,8 +783,8 @@ impl SkillStore {
         transaction.execute(
             "INSERT INTO skill_operation_journal
                 (skill_id, app_id, skill_name, directory, enabled, runtime_fingerprint,
-                 matching_copy_evidence, previous_enabled)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 matching_copy_evidence, previous_enabled, phase)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 pending.skill_id,
                 pending.app.as_str(),
@@ -723,8 +794,41 @@ impl SkillStore {
                 pending.runtime_fingerprint,
                 pending.copy_policy == SkillCopyPolicy::AllowMatching,
                 pending.previous_enabled,
+                pending.phase.as_str(),
             ],
         )?;
+        transaction.commit().map_err(Into::into)
+    }
+
+    fn mark_catalog_committed(&self, pending: &PendingSkillChange) -> Result<(), SkillError> {
+        let mut connection = self.connect_journal()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = transaction.execute(
+            "UPDATE skill_operation_journal SET phase = ?1
+             WHERE skill_id = ?2 AND app_id = ?3 AND skill_name = ?4
+               AND directory = ?5 AND enabled = ?6 AND runtime_fingerprint = ?7
+               AND matching_copy_evidence = ?8 AND previous_enabled IS ?9
+               AND phase = ?10",
+            params![
+                PendingPhase::CatalogCommitted.as_str(),
+                pending.skill_id,
+                pending.app.as_str(),
+                pending.name,
+                pending.directory,
+                pending.enabled,
+                pending.runtime_fingerprint,
+                pending.copy_policy == SkillCopyPolicy::AllowMatching,
+                pending.previous_enabled,
+                PendingPhase::Prepared.as_str(),
+            ],
+        )?;
+        if updated != 1 {
+            return Err(SkillError::Recovery(format!(
+                "pending Skill phase changed for '{}' and '{}'",
+                pending.skill_id,
+                pending.app.as_str()
+            )));
+        }
         transaction.commit().map_err(Into::into)
     }
 
@@ -770,6 +874,34 @@ impl SkillStore {
         )?;
         connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         Ok(connection)
+    }
+}
+
+fn ensure_separate_recovery_file(shared: &Path, journal: &Path) -> Result<(), SkillError> {
+    let metadata = match fs::symlink_metadata(journal) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(SkillError::LocalStateIo {
+                path: journal.to_owned(),
+                source,
+            })
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(SkillError::InvalidStore(
+            "local Skill recovery state must be a regular non-symbolic file".to_owned(),
+        ));
+    }
+    match same_file::is_same_file(shared, journal) {
+        Ok(true) => Err(SkillError::InvalidStore(
+            "shared Skill data and local recovery state resolve to the same file".to_owned(),
+        )),
+        Ok(false) => Ok(()),
+        Err(source) => Err(SkillError::LocalStateIo {
+            path: journal.to_owned(),
+            source,
+        }),
     }
 }
 
@@ -927,6 +1059,35 @@ fn pending_matches_catalog(
     Ok(catalog_column(&pending.app).is_none_or(|_| enabled == Some(pending.enabled)))
 }
 
+fn restore_catalog(
+    connection: &Connection,
+    pending: &PendingSkillChange,
+) -> Result<(), SkillError> {
+    let Some(previous) = pending.previous_enabled else {
+        return Ok(());
+    };
+    let column = catalog_column(&pending.app).ok_or_else(|| {
+        SkillError::Recovery(format!(
+            "missing catalog binding for '{}'",
+            pending.app.as_str()
+        ))
+    })?;
+    let updated = connection.execute(
+        &format!(
+            "UPDATE skills SET {column} = ?1
+             WHERE id = ?2 AND {column} = ?3"
+        ),
+        params![previous, pending.skill_id, pending.enabled],
+    )?;
+    if updated != 1 {
+        return Err(SkillError::Recovery(format!(
+            "catalog changed while rolling back Skill '{}'",
+            pending.skill_id
+        )));
+    }
+    Ok(())
+}
+
 fn delete_pending_row(
     connection: &Connection,
     pending: &PendingSkillChange,
@@ -936,7 +1097,7 @@ fn delete_pending_row(
             "DELETE FROM skill_operation_journal
          WHERE skill_id = ?1 AND app_id = ?2 AND skill_name = ?3
            AND directory = ?4 AND enabled = ?5 AND runtime_fingerprint = ?6
-           AND matching_copy_evidence = ?7 AND previous_enabled IS ?8",
+           AND matching_copy_evidence = ?7 AND previous_enabled IS ?8 AND phase = ?9",
             params![
                 pending.skill_id,
                 pending.app.as_str(),
@@ -946,6 +1107,7 @@ fn delete_pending_row(
                 pending.runtime_fingerprint,
                 pending.copy_policy == SkillCopyPolicy::AllowMatching,
                 pending.previous_enabled,
+                pending.phase.as_str(),
             ],
         )
         .map_err(Into::into)
@@ -1012,6 +1174,12 @@ fn ensure_journal_extensions(connection: &Connection) -> Result<(), SkillError> 
             "ALTER TABLE skill_operation_journal ADD COLUMN previous_enabled BOOLEAN",
         )?;
     }
+    if !columns.contains("phase") {
+        connection.execute_batch(
+            "ALTER TABLE skill_operation_journal
+             ADD COLUMN phase TEXT NOT NULL DEFAULT 'catalogCommitted'",
+        )?;
+    }
     Ok(())
 }
 
@@ -1057,6 +1225,7 @@ fn verify_journal_info(
         required.push("runtime_fingerprint");
         required.push("matching_copy_evidence");
         required.push("previous_enabled");
+        required.push("phase");
     }
     for required in required {
         if !columns.contains(required) {
@@ -1138,12 +1307,12 @@ mod tests {
             self.verified.then_some(()).ok_or("verification failed")
         }
 
-        fn commit(self) -> Result<(), Self::Error> {
+        fn commit(&mut self) -> Result<(), Self::Error> {
             self.committed.set(true);
             Ok(())
         }
 
-        fn rollback(self) -> Result<(), Self::Error> {
+        fn rollback(&mut self) -> Result<(), Self::Error> {
             self.rolled_back.set(true);
             Ok(())
         }
@@ -1218,6 +1387,19 @@ mod tests {
 
         assert!(matches!(
             SkillStore::open(path),
+            Err(SkillError::InvalidStore(_))
+        ));
+    }
+
+    #[test]
+    fn recovery_database_hardlink_to_shared_database_is_rejected() {
+        let (directory, path, store) = seed_store();
+        drop(store);
+        let alias = directory.path().join("recovery-alias.db");
+        fs::hard_link(&path, &alias).unwrap();
+
+        assert!(matches!(
+            SkillStore::open_with_local_state(path, alias),
             Err(SkillError::InvalidStore(_))
         ));
     }
@@ -1439,7 +1621,32 @@ mod tests {
     }
 
     #[test]
-    fn intent_left_before_catalog_commit_is_discarded_without_live_changes() {
+    fn prepared_intent_left_before_catalog_commit_is_discarded_without_live_changes() {
+        let (_directory, path, store) = seed_store();
+        store
+            .begin_toggle("docs", AppType::Claude, true, "runtime-v1".to_owned())
+            .unwrap();
+        Connection::open(path)
+            .unwrap()
+            .execute("UPDATE skills SET enabled_claude = 0 WHERE id = 'docs'", [])
+            .unwrap();
+        Connection::open(&store.journal_path)
+            .unwrap()
+            .execute("UPDATE skill_operation_journal SET phase = 'prepared'", [])
+            .unwrap();
+
+        let issues = store
+            .recover_pending_with_live::<FakeReceipt>(|_| {
+                panic!("an intent without its catalog commit must not reach live files")
+            })
+            .unwrap();
+
+        assert!(issues.is_empty());
+        assert_eq!(journal_count(&store), 0);
+    }
+
+    #[test]
+    fn catalog_committed_intent_is_preserved_when_catalog_returns_to_previous_state() {
         let (_directory, path, store) = seed_store();
         store
             .begin_toggle("docs", AppType::Claude, true, "runtime-v1".to_owned())
@@ -1451,12 +1658,12 @@ mod tests {
 
         let issues = store
             .recover_pending_with_live::<FakeReceipt>(|_| {
-                panic!("an intent without its catalog commit must not reach live files")
+                panic!("an ambiguous committed intent must not reach live files")
             })
             .unwrap();
 
-        assert!(issues.is_empty());
-        assert_eq!(journal_count(&store), 0);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(journal_count(&store), 1);
     }
 
     #[test]
@@ -1546,43 +1753,6 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_catalog_changes_roll_back_before_the_journal_is_cleared() {
-        for delete in [false, true] {
-            let (_directory, path, store) = seed_store();
-            let committed = Rc::new(Cell::new(false));
-            let rolled_back = Rc::new(Cell::new(false));
-            let result = store.toggle_with_live(
-                "docs",
-                AppType::Claude,
-                true,
-                "runtime-v1".to_owned(),
-                |_| {
-                    let connection = Connection::open(&path).unwrap();
-                    if delete {
-                        connection
-                            .execute("DELETE FROM skills WHERE id = 'docs'", [])
-                            .unwrap();
-                    } else {
-                        connection
-                            .execute("UPDATE skills SET enabled_claude = 0 WHERE id = 'docs'", [])
-                            .unwrap();
-                    }
-                    Ok(FakeReceipt {
-                        verified: true,
-                        committed: committed.clone(),
-                        rolled_back: rolled_back.clone(),
-                    })
-                },
-            );
-
-            assert!(matches!(result, Err(SkillError::Conflict(_))));
-            assert!(!committed.get());
-            assert!(rolled_back.get());
-            assert_eq!(journal_count(&store), 0);
-        }
-    }
-
-    #[test]
     fn failed_live_verification_rolls_back_the_catalog() {
         let (_directory, path, store) = seed_store();
         let rolled_back = Rc::new(Cell::new(false));
@@ -1609,6 +1779,43 @@ mod tests {
             .query_row("SELECT enabled_codex FROM skills", [], |row| row
                 .get::<_, bool>(0))
             .unwrap());
+    }
+
+    #[test]
+    fn shared_write_transaction_is_held_before_live_configuration() {
+        let (_directory, path, store) = seed_store();
+        let path_for_apply = path.clone();
+        let observed_lock = Rc::new(Cell::new(false));
+        let observed_lock_for_apply = observed_lock.clone();
+
+        store
+            .toggle_with_live(
+                "docs",
+                AppType::Claude,
+                true,
+                "runtime-v1".to_owned(),
+                |_| {
+                    let connection = Connection::open(&path_for_apply).unwrap();
+                    connection.busy_timeout(Duration::ZERO).unwrap();
+                    let locked = connection
+                        .execute(
+                            "UPDATE skills SET updated_at = updated_at + 1 WHERE id = 'docs'",
+                            [],
+                        )
+                        .is_err();
+                    observed_lock_for_apply.set(locked);
+                    Ok(FakeReceipt {
+                        verified: true,
+                        committed: Rc::new(Cell::new(false)),
+                        rolled_back: Rc::new(Cell::new(false)),
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(observed_lock.get());
+        assert_eq!(journal_count(&store), 0);
     }
 
     #[test]

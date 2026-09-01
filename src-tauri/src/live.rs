@@ -532,39 +532,36 @@ impl RecoverableSkillChange for SkillWriteReceipt<'_> {
         Ok(())
     }
 
-    fn commit(self) -> Result<(), Self::Error> {
-        let LockedLiveReceipt {
-            value,
-            gate,
-            file_lock,
-        } = self;
-        let result = value
+    fn commit(&mut self) -> Result<(), Self::Error> {
+        let result = self
+            .value
             .deployment
+            .take()
             .map(SkillDeploymentReceipt::commit)
             .transpose()
             .map(|_| ())
             .map_err(|error| LiveError::Skill(error.into()));
-        drop(file_lock);
-        drop(gate);
+        if result.is_ok() {
+            self.value.configuration.take();
+        }
         result
     }
 
-    fn rollback(self) -> Result<(), Self::Error> {
-        let LockedLiveReceipt {
-            value,
-            gate,
-            file_lock,
-        } = self;
-        let deployment = value
+    fn rollback(&mut self) -> Result<(), Self::Error> {
+        let deployment = self
+            .value
             .deployment
+            .take()
             .map(SkillDeploymentReceipt::rollback)
             .transpose()
             .map_err(|error| LiveError::Skill(error.into()));
-        let configuration = value
+        let configuration = self
+            .value
             .configuration
+            .take()
             .map(SkillConfigurationReceipt::rollback)
             .transpose();
-        let result = match (deployment, configuration) {
+        match (deployment, configuration) {
             (Ok(_), Ok(_)) => Ok(()),
             (deployment, configuration) => Err(LiveError::Recovery(
                 [
@@ -576,10 +573,7 @@ impl RecoverableSkillChange for SkillWriteReceipt<'_> {
                 .collect::<Vec<_>>()
                 .join("; "),
             )),
-        };
-        drop(file_lock);
-        drop(gate);
-        result
+        }
     }
 
     fn recovery_incomplete(error: &Self::Error) -> bool {
@@ -1080,7 +1074,7 @@ mod tests {
 
         let current_fingerprint = live.skill_runtime_fingerprint(&AppType::Claude).unwrap();
         assert_ne!(initial_fingerprint, current_fingerprint);
-        let receipt = live
+        let mut receipt = live
             .apply_skill_recoverable(
                 "Docs",
                 "docs",

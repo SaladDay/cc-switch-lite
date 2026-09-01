@@ -279,7 +279,7 @@ dependencies = [
 [[package]]
 name = "cc-switch-core"
 version = "0.1.0"
-source = "git+https://github.com/SaladDay/cc-switch-core?rev=291900d0f14df9b9d687d71a5fcfc8395799d5a9#291900d0f14df9b9d687d71a5fcfc8395799d5a9"
+source = "git+https://github.com/SaladDay/cc-switch-core?rev=bb75a9be968df6b793bda5f66bf106ac637baae1#bb75a9be968df6b793bda5f66bf106ac637baae1"
 dependencies = [
  "http",
  "json-five",
@@ -305,6 +305,7 @@ dependencies = [
  "json5",
  "libc",
  "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "serde_yaml",

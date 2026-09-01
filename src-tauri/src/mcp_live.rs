@@ -258,12 +258,18 @@ impl McpLiveConfig {
         if read_optional(&path)? != before {
             return Err(OperationError::Conflict.into());
         }
-        atomic_write(&path, &after).map_err(OperationError::from)?;
-        receipt.writes.push(McpFileReceipt {
+        let write = McpFileReceipt {
             path,
             before,
             after,
-        });
+        };
+        if let Err(error) = atomic_write(&write.path, &write.after) {
+            if error.recovery_incomplete() {
+                receipt.writes.push(write);
+            }
+            return Err(OperationError::from(error).into());
+        }
+        receipt.writes.push(write);
         Ok(())
     }
 
@@ -386,6 +392,34 @@ mod tests {
             fs::read_to_string(directory.path().join(".codex/config.toml")).unwrap(),
             "model = \"keep\"\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_visible_write_error_restores_the_attempted_mcp_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join(".codex");
+        let path = root.join("config.toml");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&path, "model = \"keep\"\n").unwrap();
+        let live = config(directory.path());
+        let mut changes = [McpLiveChange::Upsert {
+            app: AppType::Codex,
+            id: "server".to_owned(),
+            previous: None,
+            server: json!({"type":"stdio","command":"npx"}),
+            native_snapshot: None,
+            link_state: McpNativeLinkState::Unowned,
+        }];
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o300)).unwrap();
+
+        let result = live.apply(&mut changes);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(result, Err(LiveError::Recovery(_))));
+        assert_eq!(fs::read_to_string(path).unwrap(), "model = \"keep\"\n");
     }
 
     #[test]
