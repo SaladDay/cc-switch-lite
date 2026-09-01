@@ -744,15 +744,26 @@ impl SkillStore {
             return Ok(());
         }
         let info = journal_schema_info(&shared)?;
-        if !is_owned_embedded_journal(&info) {
+        let Some(schema) = owned_embedded_journal_schema(&info) else {
             return Ok(());
-        }
+        };
+        let runtime_fingerprint = if schema.has_runtime_fingerprint {
+            "runtime_fingerprint"
+        } else {
+            "NULL"
+        };
+        let matching_copy_evidence = if schema.has_matching_copy_evidence {
+            "matching_copy_evidence"
+        } else {
+            "0"
+        };
         let rows = {
-            let mut statement = shared.prepare(
+            let query = format!(
                 "SELECT skill_id, app_id, skill_name, directory, enabled,
-                        runtime_fingerprint, matching_copy_evidence
-                 FROM skill_operation_journal ORDER BY skill_id, app_id",
-            )?;
+                        {runtime_fingerprint}, {matching_copy_evidence}
+                 FROM skill_operation_journal ORDER BY skill_id, app_id"
+            );
+            let mut statement = shared.prepare(&query)?;
             let rows = statement
                 .query_map([], |row| {
                     Ok((
@@ -1383,24 +1394,60 @@ fn verify_journal_info(
     Ok(())
 }
 
-fn is_owned_embedded_journal(info: &[JournalColumnInfo]) -> bool {
-    let expected = [
+#[derive(Clone, Copy)]
+struct EmbeddedJournalSchema {
+    has_runtime_fingerprint: bool,
+    has_matching_copy_evidence: bool,
+}
+
+fn owned_embedded_journal_schema(info: &[JournalColumnInfo]) -> Option<EmbeddedJournalSchema> {
+    let base = [
         ("skill_id", "TEXT", true, None, 1),
         ("app_id", "TEXT", true, None, 2),
         ("skill_name", "TEXT", true, None, 0),
         ("directory", "TEXT", true, None, 0),
         ("enabled", "BOOLEAN", true, None, 0),
-        ("runtime_fingerprint", "TEXT", false, None, 0),
-        ("matching_copy_evidence", "BOOLEAN", true, Some("0"), 0),
     ];
-    info.len() == expected.len()
-        && info.iter().zip(expected).all(|(column, expected)| {
-            column.name == expected.0
-                && column.declared_type.eq_ignore_ascii_case(expected.1)
-                && column.not_null == expected.2
-                && column.default_value.as_deref() == expected.3
-                && column.primary_key == expected.4
-        })
+    if info.len() < base.len()
+        || !info
+            .iter()
+            .zip(base)
+            .all(|(column, expected)| journal_column_matches(column, expected))
+    {
+        return None;
+    }
+    let runtime = ("runtime_fingerprint", "TEXT", false, None, 0);
+    let copy_evidence = ("matching_copy_evidence", "BOOLEAN", true, Some("0"), 0);
+    match info.len() {
+        5 => Some(EmbeddedJournalSchema {
+            has_runtime_fingerprint: false,
+            has_matching_copy_evidence: false,
+        }),
+        6 if journal_column_matches(&info[5], runtime) => Some(EmbeddedJournalSchema {
+            has_runtime_fingerprint: true,
+            has_matching_copy_evidence: false,
+        }),
+        7 if journal_column_matches(&info[5], runtime)
+            && journal_column_matches(&info[6], copy_evidence) =>
+        {
+            Some(EmbeddedJournalSchema {
+                has_runtime_fingerprint: true,
+                has_matching_copy_evidence: true,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn journal_column_matches(
+    column: &JournalColumnInfo,
+    expected: (&str, &str, bool, Option<&str>, usize),
+) -> bool {
+    column.name == expected.0
+        && column.declared_type.eq_ignore_ascii_case(expected.1)
+        && column.not_null == expected.2
+        && column.default_value.as_deref() == expected.3
+        && column.primary_key == expected.4
 }
 
 fn verify_base_columns(columns: &HashSet<String>) -> Result<(), SkillError> {
@@ -1662,6 +1709,83 @@ mod tests {
                 |row| row.get::<_, bool>(0),
             )
             .unwrap());
+    }
+
+    #[test]
+    fn earlier_embedded_journals_move_to_local_state_without_guessing_runtime_identity() {
+        for (extra_column, extra_value, expected_runtime) in [
+            ("", "", None),
+            (
+                ", runtime_fingerprint TEXT",
+                ", runtime_fingerprint",
+                Some("runtime-v0"),
+            ),
+        ] {
+            let (_directory, path, store) = seed_store();
+            drop(store);
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TABLE skill_operation_journal (
+                        skill_id TEXT NOT NULL,
+                        app_id TEXT NOT NULL,
+                        skill_name TEXT NOT NULL,
+                        directory TEXT NOT NULL,
+                        enabled BOOLEAN NOT NULL{extra_column},
+                        PRIMARY KEY (skill_id, app_id)
+                     );
+                     UPDATE skills SET enabled_claude = 1 WHERE id = 'docs';
+                     INSERT INTO skill_operation_journal
+                        (skill_id, app_id, skill_name, directory, enabled{extra_value})
+                     VALUES ('docs', 'claude', 'Docs', 'docs', 1{});",
+                    expected_runtime
+                        .map(|runtime| format!(", '{runtime}'"))
+                        .unwrap_or_default()
+                ))
+                .unwrap();
+
+            let store = SkillStore::open(path.clone()).unwrap();
+            let migrated = Connection::open(&store.journal_path)
+                .unwrap()
+                .query_row(
+                    "SELECT runtime_fingerprint, matching_copy_evidence, phase
+                     FROM skill_operation_journal",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, bool>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(migrated.0.as_deref(), expected_runtime);
+            assert!(!migrated.1);
+            assert_eq!(migrated.2, PendingPhase::LiveStarted.as_str());
+            assert!(!Connection::open(&path)
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_schema
+                        WHERE type = 'table' AND name = 'skill_operation_journal'
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
+
+            if expected_runtime.is_none() {
+                let pending = store.pending_changes().unwrap();
+                assert!(pending.changes.is_empty());
+                assert_eq!(pending.issues.len(), 1);
+                assert!(pending.issues[0].contains("runtime fingerprint"));
+                assert!(store.list().unwrap()[0].apps["claude"]
+                    .issue
+                    .as_deref()
+                    .is_some_and(|issue| issue.contains("read-only")));
+            }
+        }
     }
 
     #[test]
