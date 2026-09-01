@@ -142,16 +142,18 @@ enum PendingCatalogState {
     Diverged,
 }
 
+#[derive(Debug)]
+pub(crate) enum ApplyFailure<E> {
+    NoResidualLiveChange(E),
+    LiveMayHaveChanged(E),
+}
+
 pub(crate) trait RecoverableSkillChange: Sized {
     type Error: Display;
 
     fn verify(&self) -> Result<(), Self::Error>;
     fn commit(&mut self) -> Result<(), Self::Error>;
     fn rollback(&mut self) -> Result<(), Self::Error>;
-
-    fn recovery_incomplete(_error: &Self::Error) -> bool {
-        false
-    }
 }
 
 pub struct SkillStore {
@@ -262,7 +264,7 @@ impl SkillStore {
         app: AppType,
         enabled: bool,
         runtime_fingerprint: String,
-        apply: impl FnOnce(&PendingSkillChange) -> Result<C, C::Error>,
+        apply: impl FnOnce(&PendingSkillChange) -> Result<C, ApplyFailure<C::Error>>,
     ) -> Result<Result<(), C::Error>, SkillError>
     where
         C: RecoverableSkillChange,
@@ -283,45 +285,12 @@ impl SkillStore {
                 pending.app.as_str()
             )));
         }
-        self.advance_pending_phase(&mut pending, PendingPhase::LiveStarted)
-            .map_err(|error| {
-                SkillError::Recovery(format!(
-                    "native configuration was not started because its recovery phase could not be recorded: {error}"
-                ))
-            })?;
-        let mut receipt = match apply(&pending) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                if !C::recovery_incomplete(&error) {
-                    restore_catalog(&transaction, &pending)?;
-                    transaction.commit()?;
-                    self.delete_pending(&pending)?;
-                }
-                return Ok(Err(error));
-            }
-        };
-        if let Err(error) = receipt.verify() {
-            return match receipt.rollback() {
-                Ok(()) => {
-                    restore_catalog(&transaction, &pending)?;
-                    transaction.commit()?;
-                    self.delete_pending(&pending)?;
-                    Ok(Err(error))
-                }
-                Err(live) => Err(SkillError::Recovery(format_recovery(
-                    "live verification",
-                    &error,
-                    None,
-                    Some(live),
-                ))),
-            };
-        }
-        self.finalize_pending(&pending, transaction, receipt)
+        self.drive_pending_with_live(&mut pending, transaction, apply)
     }
 
     pub(crate) fn recover_pending_with_live<C>(
         &self,
-        mut apply: impl FnMut(&PendingSkillChange) -> Result<C, C::Error>,
+        mut apply: impl FnMut(&PendingSkillChange) -> Result<C, ApplyFailure<C::Error>>,
     ) -> Result<Vec<String>, SkillError>
     where
         C: RecoverableSkillChange,
@@ -369,48 +338,30 @@ impl SkillStore {
                     }
                     continue;
                 }
+                Err(SkillError::InvalidSkill(_)) if !pending.phase.live_may_have_started() => {
+                    if let Err(error) = self.cancel_unstarted_pending(&pending, transaction) {
+                        issues.push(error.to_string());
+                    }
+                    continue;
+                }
                 Err(error) => {
                     issues.push(error.to_string());
                     continue;
                 }
             }
-            if !pending.phase.live_may_have_started() {
+            if pending.phase == PendingPhase::Prepared {
                 if let Err(error) =
-                    self.advance_pending_phase(&mut pending, PendingPhase::LiveStarted)
+                    self.advance_pending_phase(&mut pending, PendingPhase::CatalogCommitted)
                 {
                     issues.push(error.to_string());
                     continue;
                 }
             }
-            let mut receipt = match apply(&pending) {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    issues.push(format!(
-                        "could not recover '{}' for '{}': {error}",
-                        pending.skill_id,
-                        pending.app.as_str()
-                    ));
-                    continue;
-                }
-            };
-            if let Err(error) = receipt.verify() {
-                let issue = match receipt.rollback() {
-                    Ok(()) => format!(
-                        "could not verify recovery for '{}' and '{}': {error}",
-                        pending.skill_id,
-                        pending.app.as_str()
-                    ),
-                    Err(rollback) => {
-                        format_recovery("pending live verification", &error, None, Some(rollback))
-                    }
-                };
-                issues.push(issue);
-                continue;
-            }
-            match self.finalize_pending(&pending, transaction, receipt) {
+            match self.drive_pending_with_live(&mut pending, transaction, |pending| apply(pending))
+            {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => issues.push(format!(
-                    "could not finalize recovery for '{}' and '{}': {error}",
+                    "could not recover '{}' for '{}': {error}",
                     pending.skill_id,
                     pending.app.as_str()
                 )),
@@ -418,6 +369,54 @@ impl SkillStore {
             }
         }
         Ok(issues)
+    }
+
+    fn drive_pending_with_live<C>(
+        &self,
+        pending: &mut PendingSkillChange,
+        transaction: rusqlite::Transaction<'_>,
+        apply: impl FnOnce(&PendingSkillChange) -> Result<C, ApplyFailure<C::Error>>,
+    ) -> Result<Result<(), C::Error>, SkillError>
+    where
+        C: RecoverableSkillChange,
+    {
+        // A recovered liveStarted intent may include effects from an earlier process.
+        // A clean result from this attempt cannot disprove that older uncertainty.
+        let live_was_uncertain = pending.phase.live_may_have_started();
+        if !live_was_uncertain {
+            self.advance_pending_phase(pending, PendingPhase::LiveStarted)
+                .map_err(|error| {
+                    SkillError::Recovery(format!(
+                        "native configuration was not started because its recovery phase could not be recorded: {error}"
+                    ))
+                })?;
+        }
+        let mut receipt = match apply(pending) {
+            Ok(receipt) => receipt,
+            Err(ApplyFailure::NoResidualLiveChange(error)) => {
+                if !live_was_uncertain {
+                    self.restore_catalog_and_delete_pending(pending, transaction)?;
+                }
+                return Ok(Err(error));
+            }
+            Err(ApplyFailure::LiveMayHaveChanged(error)) => return Ok(Err(error)),
+        };
+        if let Err(error) = receipt.verify() {
+            return match receipt.rollback() {
+                Ok(()) if !live_was_uncertain => {
+                    self.restore_catalog_and_delete_pending(pending, transaction)?;
+                    Ok(Err(error))
+                }
+                Ok(()) => Ok(Err(error)),
+                Err(live) => Err(SkillError::Recovery(format_recovery(
+                    "live verification",
+                    &error,
+                    None,
+                    Some(live),
+                ))),
+            };
+        }
+        self.finalize_pending(pending, transaction, receipt)
     }
 
     fn begin_toggle(
@@ -528,9 +527,7 @@ impl SkillStore {
         let rows = rows.collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         drop(journal);
-        let connection = self.connect()?;
         let mut changes = Vec::new();
-        let mut stale = Vec::new();
         let mut issues = Vec::new();
         for row in rows {
             let resolved = (|| {
@@ -607,48 +604,7 @@ impl SkillStore {
                     continue;
                 }
             };
-            let catalog_state = match pending_catalog_state(&connection, &pending) {
-                Ok(state) => state,
-                Err(SkillError::InvalidSkill(_)) if !pending.phase.live_may_have_started() => {
-                    PendingCatalogState::Diverged
-                }
-                Err(error) => {
-                    issues.push(error.to_string());
-                    continue;
-                }
-            };
-            match catalog_state {
-                PendingCatalogState::Matches => changes.push(pending),
-                PendingCatalogState::SelectionChanged(_)
-                    if pending.phase.live_may_have_started() =>
-                {
-                    changes.push(pending);
-                }
-                PendingCatalogState::SelectionChanged(_) | PendingCatalogState::Diverged
-                    if pending.phase.live_may_have_started() =>
-                {
-                    issues.push(format!(
-                        "pending Skill change for '{}' and '{}' may have reached native configuration after the catalog changed; recovery state was preserved",
-                        pending.skill_id,
-                        pending.app.as_str()
-                    ));
-                }
-                PendingCatalogState::SelectionChanged(_) | PendingCatalogState::Diverged => {
-                    stale.push(pending);
-                }
-            }
-        }
-        drop(connection);
-        for pending in stale {
-            let mut connection = self.connect()?;
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            self.cancel_unstarted_pending(&pending, transaction)?;
-        }
-        for pending in &mut changes {
-            if pending.phase == PendingPhase::Prepared {
-                self.advance_pending_phase(pending, PendingPhase::CatalogCommitted)?;
-            }
+            changes.push(pending);
         }
         Ok(PendingScan { changes, issues })
     }
@@ -665,6 +621,16 @@ impl SkillStore {
             )));
         }
         rollback_unstarted_catalog(&transaction, pending)?;
+        transaction.commit()?;
+        self.delete_pending(pending)
+    }
+
+    fn restore_catalog_and_delete_pending(
+        &self,
+        pending: &PendingSkillChange,
+        transaction: rusqlite::Transaction<'_>,
+    ) -> Result<(), SkillError> {
+        restore_catalog(&transaction, pending)?;
         transaction.commit()?;
         self.delete_pending(pending)
     }
@@ -1486,10 +1452,6 @@ mod tests {
             self.rolled_back.set(true);
             Ok(())
         }
-
-        fn recovery_incomplete(error: &Self::Error) -> bool {
-            *error == "recovery incomplete"
-        }
     }
 
     fn seed_store() -> (tempfile::TempDir, PathBuf, SkillStore) {
@@ -1894,7 +1856,7 @@ mod tests {
         let issues = store
             .recover_pending_with_live::<FakeReceipt>(|pending| {
                 assert!(!pending.enabled);
-                Err("source unavailable")
+                Err(ApplyFailure::NoResidualLiveChange("source unavailable"))
             })
             .unwrap();
         assert_eq!(issues.len(), 1);
@@ -1972,7 +1934,7 @@ mod tests {
             .recover_pending_with_live::<FakeReceipt>(|pending| {
                 assert!(pending.enabled);
                 assert_eq!(pending.copy_policy(), SkillCopyPolicy::AllowMatching);
-                Err("source unavailable")
+                Err(ApplyFailure::NoResidualLiveChange("source unavailable"))
             })
             .unwrap();
         assert_eq!(issues.len(), 1);
@@ -2008,7 +1970,7 @@ mod tests {
         let issues = store
             .recover_pending_with_live(|pending| {
                 if pending.skill_id == "docs" {
-                    return Err("source unavailable");
+                    return Err(ApplyFailure::NoResidualLiveChange("source unavailable"));
                 }
                 Ok(FakeReceipt {
                     verified: true,
@@ -2020,8 +1982,10 @@ mod tests {
 
         assert_eq!(issues.len(), 1);
         assert!(committed.get());
-        assert_eq!(journal_count(&store), 1);
-        assert!(store.list().unwrap()[0].apps["claude"].issue.is_some());
+        assert_eq!(journal_count(&store), 0);
+        let skills = store.list().unwrap();
+        assert!(!skills[0].apps["claude"].enabled.unwrap());
+        assert!(skills[1].apps["claude"].enabled.unwrap());
     }
 
     #[test]
@@ -2033,7 +1997,7 @@ mod tests {
                 AppType::Claude,
                 true,
                 "runtime-v1".to_owned(),
-                |_| Err("recovery incomplete"),
+                |_| Err(ApplyFailure::LiveMayHaveChanged("recovery incomplete")),
             )
             .unwrap();
 
@@ -2073,6 +2037,37 @@ mod tests {
             .query_row("SELECT enabled_codex FROM skills", [], |row| row
                 .get::<_, bool>(0))
             .unwrap());
+    }
+
+    #[test]
+    fn retry_rollback_keeps_prior_live_uncertainty() {
+        let (_directory, path, store) = seed_store();
+        let mut pending = store
+            .begin_toggle("docs", AppType::Claude, true, "runtime-v1".to_owned())
+            .unwrap();
+        store
+            .advance_pending_phase(&mut pending, PendingPhase::LiveStarted)
+            .unwrap();
+        let rolled_back = Rc::new(Cell::new(false));
+
+        let issues = store
+            .recover_pending_with_live(|_| {
+                Ok(FakeReceipt {
+                    verified: false,
+                    committed: Rc::new(Cell::new(false)),
+                    rolled_back: rolled_back.clone(),
+                })
+            })
+            .unwrap();
+
+        assert_eq!(issues.len(), 1);
+        assert!(rolled_back.get());
+        assert!(Connection::open(path)
+            .unwrap()
+            .query_row("SELECT enabled_claude FROM skills", [], |row| row
+                .get::<_, bool>(0))
+            .unwrap());
+        assert_eq!(journal_count(&store), 1);
     }
 
     #[test]
@@ -2326,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_change_never_replays_against_new_path_settings() {
+    fn catalog_committed_change_aborts_when_runtime_paths_change() {
         let directory = tempdir().unwrap();
         let shared = directory.path().join(".cc-switch");
         let source = shared.join("skills/docs");
@@ -2385,7 +2380,12 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert!(!initial_claude.join("skills/docs").exists());
         assert!(!current_claude.join("skills/docs").exists());
-        assert_eq!(journal_count(&store), 1);
+        assert!(!Connection::open(path)
+            .unwrap()
+            .query_row("SELECT enabled_claude FROM skills", [], |row| row
+                .get::<_, bool>(0))
+            .unwrap());
+        assert_eq!(journal_count(&store), 0);
     }
 
     #[test]

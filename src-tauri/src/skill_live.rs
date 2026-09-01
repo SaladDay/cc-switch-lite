@@ -48,6 +48,39 @@ pub enum SkillLiveError {
     },
 }
 
+impl SkillLiveError {
+    pub(crate) const fn live_may_have_changed(&self) -> bool {
+        match self {
+            Self::Config(SkillConfigError::Recovery { .. }) => true,
+            Self::Unsupported(_)
+            | Self::AppUnavailable(_)
+            | Self::InvalidAppRoot(_, _)
+            | Self::MissingTarget(_)
+            | Self::InvalidTargets(_)
+            | Self::UnifiedDiscovery(_)
+            | Self::UnifiedConflict(_)
+            | Self::Io { .. }
+            | Self::Config(
+                SkillConfigError::InvalidDirectory { .. }
+                | SkillConfigError::RelativeRoot { .. }
+                | SkillConfigError::MissingSource { .. }
+                | SkillConfigError::MissingManifest { .. }
+                | SkillConfigError::InvalidName { .. }
+                | SkillConfigError::InvalidConfig { .. }
+                | SkillConfigError::GloballyDisabled { .. }
+                | SkillConfigError::ExternallyDisabled { .. }
+                | SkillConfigError::RequiredSkill { .. }
+                | SkillConfigError::OverlappingRoots { .. }
+                | SkillConfigError::Conflict { .. }
+                | SkillConfigError::UnsupportedEntry { .. }
+                | SkillConfigError::EntryLimit { .. }
+                | SkillConfigError::ByteLimit { .. }
+                | SkillConfigError::Io { .. },
+            ) => false,
+        }
+    }
+}
+
 pub(crate) struct SkillObservation {
     pub(crate) id: String,
     pub(crate) source_issue: Option<String>,

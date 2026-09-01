@@ -6,10 +6,12 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
+#[cfg(test)]
+use cc_switch_core::SkillConfigError;
 use cc_switch_core::{
     builtin_app_registry, fs::shared_live_config_lock_path, project_skill_config_enabled, AppType,
-    ContentExpectation, PlannedWrite, SkillConfigError, SkillConfigTarget, SkillCopyPolicy,
-    SkillDeploymentReceipt, SkillSyncMethod, MAX_OPERATION_CONTENT_BYTES, OPERATION_CONTRACT_MAJOR,
+    ContentExpectation, PlannedWrite, SkillConfigTarget, SkillCopyPolicy, SkillDeploymentReceipt,
+    SkillSyncMethod, MAX_OPERATION_CONTENT_BYTES, OPERATION_CONTRACT_MAJOR,
 };
 use fs4::{FileExt, TryLockError};
 use serde::Deserialize;
@@ -24,7 +26,7 @@ use crate::{
         OperationReceipt,
     },
     provider::{NativeImport, ProviderRecord},
-    skill::RecoverableSkillChange,
+    skill::{ApplyFailure, RecoverableSkillChange},
     skill_host::skill_host_adapters,
     skill_live::{
         SkillAppResources, SkillConfigDocuments, SkillLiveConfig, SkillLiveError, SkillObservation,
@@ -70,14 +72,25 @@ impl LiveError {
         }
     }
 
-    fn recovery_incomplete(&self) -> bool {
+    fn live_may_have_changed(&self) -> bool {
         match self {
-            Self::Recovery(_)
-            | Self::Operation(OperationError::Rollback(_))
-            | Self::Skill(SkillLiveError::Config(SkillConfigError::Recovery { .. })) => true,
-            Self::Operation(OperationError::File(error)) => error.recovery_incomplete(),
-            _ => false,
+            Self::Operation(error) => error.live_may_have_changed(),
+            Self::Skill(error) => error.live_may_have_changed(),
+            Self::Recovery(_) => true,
+            Self::Missing(_)
+            | Self::InvalidConfig(_)
+            | Self::InvalidProvider(_)
+            | Self::LockUnavailable
+            | Self::Io { .. } => false,
         }
+    }
+}
+
+fn classify_skill_apply_failure(error: LiveError) -> ApplyFailure<LiveError> {
+    if error.live_may_have_changed() {
+        ApplyFailure::LiveMayHaveChanged(error)
+    } else {
+        ApplyFailure::NoResidualLiveChange(error)
     }
 }
 
@@ -218,8 +231,8 @@ impl LiveConfig {
         enabled: bool,
         expected_runtime_fingerprint: &str,
         copy_policy: SkillCopyPolicy,
-    ) -> Result<SkillWriteReceipt<'_>, LiveError> {
-        self.lock_result(|| {
+    ) -> Result<SkillWriteReceipt<'_>, ApplyFailure<LiveError>> {
+        let result = self.lock_result(|| {
             let runtime = self.current_skill_runtime()?;
             if runtime.fingerprint(app)? != expected_runtime_fingerprint {
                 return Err(LiveError::InvalidConfig(
@@ -281,7 +294,8 @@ impl LiveConfig {
                 configuration,
                 deployment,
             })
-        })
+        });
+        result.map_err(classify_skill_apply_failure)
     }
 
     pub(crate) fn observe_skills(
@@ -574,10 +588,6 @@ impl RecoverableSkillChange for SkillWriteReceipt<'_> {
                 .join("; "),
             )),
         }
-    }
-
-    fn recovery_incomplete(error: &Self::Error) -> bool {
-        error.recovery_incomplete()
     }
 }
 
@@ -929,10 +939,10 @@ mod tests {
             },
         ));
 
-        assert!(operation.recovery_incomplete());
-        assert!(deployment.recovery_incomplete());
-        assert!(durability.recovery_incomplete());
-        assert!(!LiveError::LockUnavailable.recovery_incomplete());
+        assert!(operation.live_may_have_changed());
+        assert!(deployment.live_may_have_changed());
+        assert!(durability.live_may_have_changed());
+        assert!(!LiveError::LockUnavailable.live_may_have_changed());
     }
 
     #[test]
@@ -1067,7 +1077,9 @@ mod tests {
                 &initial_fingerprint,
                 SkillCopyPolicy::ManagedOnly,
             ),
-            Err(LiveError::InvalidConfig(_))
+            Err(ApplyFailure::NoResidualLiveChange(
+                LiveError::InvalidConfig(_)
+            ))
         ));
         assert!(!initial_claude.join("skills/docs").exists());
         assert!(!current_claude.join("skills/docs").exists());

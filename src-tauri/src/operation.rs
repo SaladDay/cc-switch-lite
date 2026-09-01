@@ -121,6 +121,25 @@ impl OperationError {
             Self::Rollback(_) => "rollback_failed",
         }
     }
+
+    pub(crate) const fn live_may_have_changed(&self) -> bool {
+        match self {
+            Self::Rollback(_) | Self::File(FileError::Durability { .. }) => true,
+            Self::InvalidPlan(_)
+            | Self::Conflict
+            | Self::InvalidTarget(_)
+            | Self::TooLarge { .. }
+            | Self::File(
+                FileError::NotFound { .. }
+                | FileError::InvalidPath { .. }
+                | FileError::Io { .. }
+                | FileError::AtomicReplace { .. }
+                | FileError::JsonParse { .. }
+                | FileError::JsonSerialize { .. },
+            )
+            | Self::Io { .. } => false,
+        }
+    }
 }
 
 pub struct OperationExecutor<'a> {
