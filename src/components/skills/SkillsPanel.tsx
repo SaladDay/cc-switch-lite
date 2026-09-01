@@ -29,6 +29,8 @@ export function SkillsPanel({
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
   const [pending, setPending] = useState<string | null>(null);
   const writeLock = useRef(false);
 
@@ -52,12 +54,13 @@ export function SkillsPanel({
         if (!ignore) {
           setSkills(items);
           setError(null);
+          setStale(false);
         }
       })
       .catch((reason: unknown) => {
         if (!ignore) {
-          setSkills([]);
           setError(errorMessage(reason));
+          setStale(true);
         }
       })
       .finally(() => {
@@ -66,7 +69,7 @@ export function SkillsPanel({
     return () => {
       ignore = true;
     };
-  }, []);
+  }, [reloadKey]);
 
   const counts = useMemo(
     () =>
@@ -105,9 +108,10 @@ export function SkillsPanel({
       await skillsApi.toggle(skill.id, appId, enabled);
       const refreshed = await skillsApi.list();
       setSkills(refreshed);
+      setStale(false);
     } catch (reason) {
-      setSkills([]);
       setError(errorMessage(reason));
+      setStale(true);
     } finally {
       writeLock.current = false;
       setPending(null);
@@ -166,12 +170,19 @@ export function SkillsPanel({
       </div>
 
       {error && (
-        <p
+        <div
           role="alert"
-          className="mb-4 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-600 dark:text-red-300"
+          className="mb-4 flex items-center gap-3 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-600 dark:text-red-300"
         >
-          {error}
-        </p>
+          <span className="min-w-0 flex-1">{error}</span>
+          <button
+            type="button"
+            onClick={() => setReloadKey((key) => key + 1)}
+            className="shrink-0 rounded-md border border-current/30 px-2.5 py-1 text-xs font-medium hover:bg-red-500/10"
+          >
+            Retry
+          </button>
+        </div>
       )}
 
       <div className="min-h-0 flex-1 overflow-y-auto pb-20">
@@ -277,7 +288,7 @@ export function SkillsPanel({
                           </span>
                         );
                       }
-                      const disabled = pending !== null;
+                      const disabled = pending !== null || stale || loading;
                       return (
                         <button
                           key={app.id}

@@ -448,11 +448,17 @@ describe("App", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("invalidates Skill controls when the post-switch refresh fails", async () => {
+  it("preserves Skills read-only until a failed refresh is retried", async () => {
     const user = userEvent.setup();
     skillApi.list
       .mockResolvedValueOnce([docsSkill])
-      .mockRejectedValueOnce(new Error("Skill refresh failed"));
+      .mockRejectedValueOnce(new Error("Skill refresh failed"))
+      .mockResolvedValueOnce([
+        {
+          ...docsSkill,
+          apps: { ...docsSkill.apps, codex: { enabled: true } },
+        },
+      ]);
     render(<App />);
 
     await screen.findByRole("heading", {
@@ -466,10 +472,15 @@ describe("App", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Skill refresh failed",
     );
-    expect(screen.queryByText("Docs")).not.toBeInTheDocument();
+    expect(screen.getByText("Docs")).toBeVisible();
     expect(
-      screen.queryByRole("heading", { name: "No installed Skills" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "Enable Docs for Codex" }),
+    ).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    expect(
+      await screen.findByRole("button", { name: "Disable Docs for Codex" }),
+    ).toBeEnabled();
   });
 
   it("blocks MCP actions until the initial catalog has loaded", async () => {
