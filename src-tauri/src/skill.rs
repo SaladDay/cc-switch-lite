@@ -135,6 +135,13 @@ struct PendingScan {
     issues: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCatalogState {
+    Matches,
+    SelectionChanged(bool),
+    Diverged,
+}
+
 pub(crate) trait RecoverableSkillChange: Sized {
     type Error: Display;
 
@@ -339,9 +346,17 @@ impl SkillStore {
                         continue;
                     }
                 };
-            match pending_matches_catalog(&transaction, &pending) {
-                Ok(true) => {}
-                Ok(false) => {
+            match pending_catalog_state(&transaction, &pending) {
+                Ok(PendingCatalogState::Matches) => {}
+                Ok(PendingCatalogState::SelectionChanged(enabled))
+                    if pending.phase.live_may_have_started() =>
+                {
+                    if let Err(error) = self.retarget_pending_selection(&mut pending, enabled) {
+                        issues.push(error.to_string());
+                        continue;
+                    }
+                }
+                Ok(PendingCatalogState::SelectionChanged(_) | PendingCatalogState::Diverged) => {
                     if pending.phase.live_may_have_started() {
                         issues.push(format!(
                             "pending Skill change for '{}' and '{}' no longer matches the shared catalog; recovery state was preserved",
@@ -556,8 +571,12 @@ impl SkillStore {
                         ))
                     })?;
                 let copy_policy = if matching_copy_evidence {
+                    // A live disable may be retargeted back to enabled. Keep its
+                    // evidence so Core can finish recovering a matching copy.
+                    let recovering_retargeted_enable =
+                        enabled && phase.live_may_have_started() && previous_enabled != Some(false);
                     if contract.selection() != SkillSelectionMode::HostManaged
-                        || enabled
+                        || (enabled && !recovering_retargeted_enable)
                         || previous_enabled == Some(false)
                     {
                         return Err(SkillError::InvalidStore(format!(
@@ -588,24 +607,35 @@ impl SkillStore {
                     continue;
                 }
             };
-            let catalog_matches = match pending_matches_catalog(&connection, &pending) {
-                Ok(matches) => matches,
-                Err(SkillError::InvalidSkill(_)) if !pending.phase.live_may_have_started() => false,
+            let catalog_state = match pending_catalog_state(&connection, &pending) {
+                Ok(state) => state,
+                Err(SkillError::InvalidSkill(_)) if !pending.phase.live_may_have_started() => {
+                    PendingCatalogState::Diverged
+                }
                 Err(error) => {
                     issues.push(error.to_string());
                     continue;
                 }
             };
-            if catalog_matches {
-                changes.push(pending);
-            } else if pending.phase.live_may_have_started() {
-                issues.push(format!(
-                    "pending Skill change for '{}' and '{}' may have reached native configuration after the catalog changed; recovery state was preserved",
-                    pending.skill_id,
-                    pending.app.as_str()
-                ));
-            } else {
-                stale.push(pending);
+            match catalog_state {
+                PendingCatalogState::Matches => changes.push(pending),
+                PendingCatalogState::SelectionChanged(_)
+                    if pending.phase.live_may_have_started() =>
+                {
+                    changes.push(pending);
+                }
+                PendingCatalogState::SelectionChanged(_) | PendingCatalogState::Diverged
+                    if pending.phase.live_may_have_started() =>
+                {
+                    issues.push(format!(
+                        "pending Skill change for '{}' and '{}' may have reached native configuration after the catalog changed; recovery state was preserved",
+                        pending.skill_id,
+                        pending.app.as_str()
+                    ));
+                }
+                PendingCatalogState::SelectionChanged(_) | PendingCatalogState::Diverged => {
+                    stale.push(pending);
+                }
             }
         }
         drop(connection);
@@ -896,6 +926,50 @@ impl SkillStore {
         Ok(())
     }
 
+    fn retarget_pending_selection(
+        &self,
+        pending: &mut PendingSkillChange,
+        enabled: bool,
+    ) -> Result<(), SkillError> {
+        if !pending.phase.live_may_have_started() || pending.enabled == enabled {
+            return Err(SkillError::Recovery(format!(
+                "pending Skill selection for '{}' cannot be retargeted",
+                pending.skill_id
+            )));
+        }
+        let mut connection = self.connect_journal()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = transaction.execute(
+            "UPDATE skill_operation_journal SET enabled = ?1
+             WHERE skill_id = ?2 AND app_id = ?3 AND skill_name = ?4
+               AND directory = ?5 AND enabled = ?6 AND runtime_fingerprint = ?7
+               AND matching_copy_evidence = ?8 AND previous_enabled IS ?9
+               AND phase = ?10",
+            params![
+                enabled,
+                pending.skill_id,
+                pending.app.as_str(),
+                pending.name,
+                pending.directory,
+                pending.enabled,
+                pending.runtime_fingerprint,
+                pending.copy_policy == SkillCopyPolicy::AllowMatching,
+                pending.previous_enabled,
+                pending.phase.as_str(),
+            ],
+        )?;
+        if updated != 1 {
+            return Err(SkillError::Recovery(format!(
+                "pending Skill selection changed for '{}' and '{}'",
+                pending.skill_id,
+                pending.app.as_str()
+            )));
+        }
+        transaction.commit()?;
+        pending.enabled = enabled;
+        Ok(())
+    }
+
     fn delete_pending(&self, pending: &PendingSkillChange) -> Result<(), SkillError> {
         let mut connection = self.connect_journal()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1080,6 +1154,13 @@ fn pending_matches_catalog(
     connection: &Connection,
     pending: &PendingSkillChange,
 ) -> Result<bool, SkillError> {
+    pending_catalog_state(connection, pending).map(|state| state == PendingCatalogState::Matches)
+}
+
+fn pending_catalog_state(
+    connection: &Connection,
+    pending: &PendingSkillChange,
+) -> Result<PendingCatalogState, SkillError> {
     let contract = builtin_app_registry()
         .for_app(&pending.app)
         .skill_contract()
@@ -1089,7 +1170,8 @@ fn pending_matches_catalog(
                 pending.app.as_str()
             ))
         })?;
-    let query = catalog_column(&pending.app).map_or_else(
+    let column = catalog_column(&pending.app);
+    let query = column.map_or_else(
         || "SELECT name, directory, NULL FROM skills WHERE id = ?1".to_owned(),
         |column| format!("SELECT name, directory, {column} FROM skills WHERE id = ?1"),
     );
@@ -1103,10 +1185,10 @@ fn pending_matches_catalog(
         })
         .optional()?;
     let Some((name, directory, enabled)) = current else {
-        return Ok(false);
+        return Ok(PendingCatalogState::Diverged);
     };
     if name != pending.name || directory != pending.directory {
-        return Ok(false);
+        return Ok(PendingCatalogState::Diverged);
     }
     if count_directory_key(
         connection,
@@ -1114,13 +1196,18 @@ fn pending_matches_catalog(
             .map_err(|error| SkillError::InvalidSkill(error.to_string()))?,
     )? != 1
     {
-        return Ok(false);
+        return Ok(PendingCatalogState::Diverged);
     }
     if contract.config_target().is_some() && validate_unique_native_name(connection, &name).is_err()
     {
-        return Ok(false);
+        return Ok(PendingCatalogState::Diverged);
     }
-    Ok(catalog_column(&pending.app).is_none_or(|_| enabled == Some(pending.enabled)))
+    match (column, enabled) {
+        (None, _) => Ok(PendingCatalogState::Matches),
+        (Some(_), Some(enabled)) if enabled == pending.enabled => Ok(PendingCatalogState::Matches),
+        (Some(_), Some(enabled)) => Ok(PendingCatalogState::SelectionChanged(enabled)),
+        (Some(_), None) => Ok(PendingCatalogState::Diverged),
+    }
 }
 
 fn restore_catalog(
@@ -1791,7 +1878,7 @@ mod tests {
     }
 
     #[test]
-    fn live_started_intent_is_preserved_when_catalog_returns_to_previous_state() {
+    fn live_started_intent_replays_the_catalogs_current_selection() {
         let (_directory, path, store) = seed_store();
         let mut pending = store
             .begin_toggle("docs", AppType::Claude, true, "runtime-v1".to_owned())
@@ -1805,13 +1892,35 @@ mod tests {
             .unwrap();
 
         let issues = store
-            .recover_pending_with_live::<FakeReceipt>(|_| {
-                panic!("a possibly applied intent must not run against a changed catalog")
+            .recover_pending_with_live::<FakeReceipt>(|pending| {
+                assert!(!pending.enabled);
+                Err("source unavailable")
             })
             .unwrap();
-
         assert_eq!(issues.len(), 1);
         assert_eq!(journal_count(&store), 1);
+        let journal_enabled = Connection::open(&store.journal_path)
+            .unwrap()
+            .query_row("SELECT enabled FROM skill_operation_journal", [], |row| {
+                row.get::<_, bool>(0)
+            })
+            .unwrap();
+        assert!(!journal_enabled);
+
+        let committed = Rc::new(Cell::new(false));
+        let issues = store
+            .recover_pending_with_live(|pending| {
+                assert!(!pending.enabled);
+                Ok(FakeReceipt {
+                    verified: true,
+                    committed: committed.clone(),
+                    rolled_back: Rc::new(Cell::new(false)),
+                })
+            })
+            .unwrap();
+        assert!(issues.is_empty());
+        assert!(committed.get());
+        assert_eq!(journal_count(&store), 0);
     }
 
     #[test]
@@ -1835,6 +1944,43 @@ mod tests {
         let recovered = store.pending_changes().unwrap();
         assert!(recovered.issues.is_empty());
         assert_eq!(recovered.changes.len(), 1);
+        assert_eq!(
+            recovered.changes[0].copy_policy(),
+            SkillCopyPolicy::AllowMatching
+        );
+    }
+
+    #[test]
+    fn retargeted_enable_keeps_matching_copy_recovery_evidence() {
+        let (_directory, path, store) = seed_store();
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE skills SET enabled_claude = 1", [])
+            .unwrap();
+        let mut pending = store
+            .begin_toggle("docs", AppType::Claude, false, "runtime-v1".to_owned())
+            .unwrap();
+        store
+            .advance_pending_phase(&mut pending, PendingPhase::LiveStarted)
+            .unwrap();
+        Connection::open(path)
+            .unwrap()
+            .execute("UPDATE skills SET enabled_claude = 1", [])
+            .unwrap();
+
+        let issues = store
+            .recover_pending_with_live::<FakeReceipt>(|pending| {
+                assert!(pending.enabled);
+                assert_eq!(pending.copy_policy(), SkillCopyPolicy::AllowMatching);
+                Err("source unavailable")
+            })
+            .unwrap();
+        assert_eq!(issues.len(), 1);
+
+        let recovered = store.pending_changes().unwrap();
+        assert!(recovered.issues.is_empty());
+        assert_eq!(recovered.changes.len(), 1);
+        assert!(recovered.changes[0].enabled);
         assert_eq!(
             recovered.changes[0].copy_policy(),
             SkillCopyPolicy::AllowMatching
