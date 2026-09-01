@@ -279,7 +279,7 @@ dependencies = [
 [[package]]
 name = "cc-switch-core"
 version = "0.1.0"
-source = "git+https://github.com/SaladDay/cc-switch-core?rev=938e798dc514eba20e05923fe765ffeae62868ac#938e798dc514eba20e05923fe765ffeae62868ac"
+source = "git+https://github.com/SaladDay/cc-switch-core?rev=291900d0f14df9b9d687d71a5fcfc8395799d5a9#291900d0f14df9b9d687d71a5fcfc8395799d5a9"
 dependencies = [
  "http",
  "json-five",
@@ -292,6 +292,7 @@ dependencies = [
  "toml_edit 0.25.13+spec-1.1.0",
  "unicode-casefold",
  "unicode-normalization",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

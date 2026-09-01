@@ -14,6 +14,10 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transactio
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::skill_host::{
+    skill_host_adapter, skill_host_adapters, validate_skill_host_adapters, SkillHostAdapter,
+};
+
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SKILL_SELECT_BASE: &str = "SELECT id, name, description, directory, repo_owner, repo_name";
 
@@ -578,6 +582,7 @@ impl SkillStore {
     }
 
     fn initialize(&self) -> Result<(), SkillError> {
+        validate_skill_host_adapters().map_err(SkillError::InvalidStore)?;
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(
@@ -774,23 +779,15 @@ struct CatalogBinding {
 }
 
 fn catalog_column(app: &AppType) -> Option<&'static str> {
-    match app {
-        AppType::Claude => Some("enabled_claude"),
-        AppType::Codex => Some("enabled_codex"),
-        AppType::Gemini => Some("enabled_gemini"),
-        AppType::GrokBuild => Some("enabled_grokbuild"),
-        AppType::OpenCode => Some("enabled_opencode"),
-        AppType::Hermes => Some("enabled_hermes"),
-        AppType::ClaudeDesktop | AppType::OpenClaw | AppType::Pi => None,
-    }
+    skill_host_adapter(app).and_then(SkillHostAdapter::catalog_column)
 }
 
 fn catalog_bindings() -> Vec<CatalogBinding> {
-    builtin_app_registry()
-        .descriptors()
-        .filter_map(|descriptor| {
-            catalog_column(descriptor.app()).map(|column| CatalogBinding {
-                app_id: descriptor.id(),
+    skill_host_adapters()
+        .iter()
+        .filter_map(|adapter| {
+            adapter.catalog_column().map(|column| CatalogBinding {
+                app_id: adapter.app().as_str(),
                 column,
             })
         })
@@ -798,13 +795,12 @@ fn catalog_bindings() -> Vec<CatalogBinding> {
 }
 
 fn row_to_skill(row: &Row<'_>, bindings: &[CatalogBinding]) -> rusqlite::Result<SkillRecord> {
-    let mut apps = builtin_app_registry()
-        .descriptors()
-        .filter_map(|descriptor| Some((descriptor, descriptor.skill_contract()?)))
-        .map(|(descriptor, _)| {
-            let enabled = catalog_column(descriptor.app()).map(|_| false);
+    let mut apps = skill_host_adapters()
+        .iter()
+        .map(|adapter| {
+            let enabled = adapter.catalog_column().map(|_| false);
             (
-                descriptor.id().to_owned(),
+                adapter.app().as_str().to_owned(),
                 SkillAppState {
                     enabled,
                     issue: None,
@@ -1179,16 +1175,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap()
-    }
-
-    #[test]
-    fn host_catalog_mapping_covers_every_managed_selection() {
-        for descriptor in builtin_app_registry().descriptors() {
-            let managed = descriptor
-                .skill_contract()
-                .is_some_and(|contract| contract.selection() == SkillSelectionMode::HostManaged);
-            assert_eq!(catalog_column(descriptor.app()).is_some(), managed);
-        }
     }
 
     #[test]

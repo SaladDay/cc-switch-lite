@@ -12,6 +12,7 @@ mod native_live;
 mod operation;
 mod provider;
 mod skill;
+mod skill_host;
 mod skill_live;
 mod store;
 
@@ -668,13 +669,7 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let home_dir = app.path().home_dir()?;
-            let database_path = store::shared_database_path(&home_dir, &app.path().data_dir()?)
-                .unwrap_or_else(|error| {
-                    eprintln!(
-                        "CC Switch Lite could not read the full app's custom data path: {error}"
-                    );
-                    store::database_path(&home_dir)
-                });
+            let database_path = store::shared_database_path(&home_dir, &app.path().data_dir()?)?;
             let store = ProviderStore::open(database_path.clone())?;
             let mcp_store = McpStore::open(database_path.clone())?;
             let skill_store = SkillStoreState::open(

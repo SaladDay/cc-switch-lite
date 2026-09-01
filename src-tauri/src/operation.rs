@@ -7,7 +7,7 @@ use std::{
 
 use cc_switch_core::{
     execute_operation_plan,
-    fs::{atomic_write, FileError},
+    fs::{atomic_write, remove_file_durable, FileError},
     CompareExchangeOutcome, ConfigFormat, OperationExecutionError, OperationFailure, OperationHost,
     OperationRead, OperationReceipt as CoreOperationReceipt, OperationRollbackError,
     MAX_OPERATION_CONTENT_BYTES,
@@ -177,17 +177,12 @@ impl OperationHost for FileOperationHost<'_> {
 
         match replacement {
             Some(contents) => atomic_write(resource, contents)?,
-            None => match fs::remove_file(resource) {
+            None => match remove_file_durable(resource) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(FileError::NotFound { .. }) => {
                     return Ok(CompareExchangeOutcome::Conflict);
                 }
-                Err(source) => {
-                    return Err(OperationError::Io {
-                        path: resource.clone(),
-                        source,
-                    });
-                }
+                Err(error) => return Err(error.into()),
             },
         }
         Ok(CompareExchangeOutcome::Applied)

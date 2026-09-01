@@ -37,6 +37,9 @@ its backups. Updates use SQLite transactions and reject stale provider or MCP
 edits made against an older record revision.
 Until the full application adopts Core's shared live-file lock protocol, do not
 write configuration from CC Switch and Lite at the same time.
+Until it also adopts Core's application-home resolution, users of
+`GEMINI_CLI_HOME` or `GROK_HOME` should use Lite as the sole configuration
+writer, or set the matching explicit directory in CC Switch.
 
 The Skills page only switches already-installed Skills between supported
 applications. Installation, discovery, updates, backups, and a marketplace are

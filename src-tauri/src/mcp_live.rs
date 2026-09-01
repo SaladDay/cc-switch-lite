@@ -1,8 +1,9 @@
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 
 use cc_switch_core::{
-    builtin_app_adapter, builtin_app_registry, fs::atomic_write, mcp_servers_equivalent,
-    AppCapability, AppType, McpConfigTarget, McpServerProjection,
+    builtin_app_adapter, builtin_app_registry,
+    fs::{atomic_write, remove_file_durable},
+    mcp_servers_equivalent, AppCapability, AppType, McpConfigTarget, McpServerProjection,
 };
 
 use crate::{
@@ -307,10 +308,9 @@ fn restore_write(write: McpFileReceipt) -> Result<(), LiveError> {
         Some(contents) => atomic_write(&write.path, &contents)
             .map_err(OperationError::from)
             .map_err(Into::into),
-        None => fs::remove_file(&write.path).map_err(|source| LiveError::Io {
-            path: write.path,
-            source,
-        }),
+        None => remove_file_durable(&write.path)
+            .map_err(OperationError::from)
+            .map_err(Into::into),
     }
 }
 
@@ -319,7 +319,7 @@ mod tests {
     use super::*;
     use crate::mcp::{McpApps, McpServer, McpStore};
     use serde_json::{json, Value};
-    use std::path::Path;
+    use std::{fs, path::Path};
     use tempfile::tempdir;
 
     fn config(home: &Path) -> McpLiveConfig {

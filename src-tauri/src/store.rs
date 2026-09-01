@@ -3185,6 +3185,12 @@ requires_openai_auth = true
             shared_database_path(&home, &data).unwrap(),
             fs::canonicalize(configured).unwrap().join("cc-switch.db")
         );
+
+        fs::write(store_dir.join(FULL_APP_PATH_STORE), b"{").unwrap();
+        assert!(matches!(
+            shared_database_path(&home, &data),
+            Err(StoreError::InvalidStore(_))
+        ));
     }
 
     #[test]

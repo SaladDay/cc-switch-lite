@@ -9,8 +9,7 @@ use std::{
 use cc_switch_core::{
     builtin_app_registry, fs::shared_live_config_lock_path, project_skill_config_enabled, AppType,
     ContentExpectation, PlannedWrite, SkillConfigError, SkillConfigTarget, SkillCopyPolicy,
-    SkillDeploymentReceipt, SkillDiscoveryMode, SkillSyncMethod, MAX_OPERATION_CONTENT_BYTES,
-    OPERATION_CONTRACT_MAJOR,
+    SkillDeploymentReceipt, SkillSyncMethod, MAX_OPERATION_CONTENT_BYTES, OPERATION_CONTRACT_MAJOR,
 };
 use fs4::{FileExt, TryLockError};
 use serde::Deserialize;
@@ -26,6 +25,7 @@ use crate::{
     },
     provider::{NativeImport, ProviderRecord},
     skill::RecoverableSkillChange,
+    skill_host::skill_host_adapters,
     skill_live::{
         SkillAppResources, SkillConfigDocuments, SkillLiveConfig, SkillLiveError, SkillObservation,
         SkillObservationRequest,
@@ -71,12 +71,13 @@ impl LiveError {
     }
 
     fn recovery_incomplete(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Recovery(_)
-                | Self::Operation(OperationError::Rollback(_))
-                | Self::Skill(SkillLiveError::Config(SkillConfigError::Recovery { .. }))
-        )
+            | Self::Operation(OperationError::Rollback(_))
+            | Self::Skill(SkillLiveError::Config(SkillConfigError::Recovery { .. })) => true,
+            Self::Operation(OperationError::File(error)) => error.recovery_incomplete(),
+            _ => false,
+        }
     }
 }
 
@@ -319,18 +320,6 @@ impl LiveConfig {
     fn current_skill_runtime(&self) -> Result<SkillRuntime, LiveError> {
         let settings = load_shared_path_settings_strict(&self.home)?;
         let dirs = resolve_config_dirs(&self.home, &settings)?;
-        let roots = vec![
-            (AppType::Claude, dirs.claude.clone()),
-            (AppType::Codex, dirs.codex.clone()),
-            (AppType::Gemini, dirs.gemini.clone()),
-            (AppType::GrokBuild, dirs.grok.clone()),
-            (AppType::OpenCode, dirs.opencode.clone()),
-            (AppType::Hermes, dirs.hermes.clone()),
-            (AppType::Pi, dirs.pi.clone()),
-        ]
-        .into_iter()
-        .map(|(app, root)| absolute_skill_root(&root).map(|root| (app, root)))
-        .collect::<Result<Vec<_>, _>>()?;
         let source_root = absolute_skill_root(&skill_source_root(
             &self.home,
             &self.shared_dir,
@@ -339,27 +328,23 @@ impl LiveConfig {
         let unified_discovery_root = absolute_skill_root(&self.home.join(".agents/skills"))?;
         let sync_method = skill_sync_method(settings.skill_sync_method.as_deref());
         let native = NativeLiveConfig::from_home(&self.home, &dirs)?;
-        let resources = roots
-            .into_iter()
-            .map(|(app, install_root)| {
+        let resources = skill_host_adapters()
+            .iter()
+            .map(|adapter| {
+                let app = adapter.app().clone();
+                let install_root = absolute_skill_root(adapter.install_root(&dirs))?;
                 let config_path = builtin_app_registry()
                     .for_app(&app)
                     .skill_contract()
                     .and_then(|contract| contract.config_target())
                     .map(|target| native.target_path(target.logical_target()).to_owned());
-                let mut resources = SkillAppResources::new(app.clone(), install_root, config_path);
-                if app == AppType::Gemini
-                    && builtin_app_registry()
-                        .for_app(&app)
-                        .skill_contract()
-                        .is_some_and(|contract| contract.discovery() == SkillDiscoveryMode::Unified)
-                {
-                    resources =
-                        resources.with_unified_discovery_root(dirs.gemini_unified_skills.clone());
+                let mut resources = SkillAppResources::new(app, install_root, config_path);
+                if let Some(root) = adapter.unified_discovery_root(&dirs) {
+                    resources = resources.with_unified_discovery_root(absolute_skill_root(root)?);
                 }
-                resources
+                Ok(resources)
             })
-            .collect();
+            .collect::<Result<Vec<_>, LiveError>>()?;
         Ok(SkillRuntime {
             native,
             skill: SkillLiveConfig::new(
@@ -769,7 +754,7 @@ fn hermes_root(
     environment: Option<&OsStr>,
     default: &Path,
 ) -> PathBuf {
-    if let Some(setting) = setting {
+    if let Some(setting) = setting.map(str::trim).filter(|value| !value.is_empty()) {
         return resolve_shared_path(home, setting);
     }
     environment
@@ -943,9 +928,16 @@ mod tests {
         let deployment = LiveError::Skill(SkillLiveError::Config(SkillConfigError::Recovery {
             message: "incomplete".to_owned(),
         }));
+        let durability = LiveError::Operation(OperationError::File(
+            cc_switch_core::fs::FileError::Durability {
+                path: PathBuf::from("config"),
+                source: std::io::Error::other("sync failed"),
+            },
+        ));
 
         assert!(operation.recovery_incomplete());
         assert!(deployment.recovery_incomplete());
+        assert!(durability.recovery_incomplete());
         assert!(!LiveError::LockUnavailable.recovery_incomplete());
     }
 
@@ -1134,6 +1126,16 @@ mod tests {
                 &home.join(".hermes"),
             ),
             home.join("custom-hermes")
+        );
+        assert_eq!(hermes_root(home, Some("   "), None, &default), default);
+        assert_eq!(
+            hermes_root(
+                home,
+                Some("  ~/trimmed-hermes  "),
+                Some(OsStr::new("ignored")),
+                &default,
+            ),
+            home.join("trimmed-hermes")
         );
         assert_eq!(
             absolute_skill_root(Path::new("relative/hermes")).unwrap(),
