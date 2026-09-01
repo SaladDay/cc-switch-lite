@@ -55,7 +55,10 @@ export function SkillsPanel({
         }
       })
       .catch((reason: unknown) => {
-        if (!ignore) setError(errorMessage(reason));
+        if (!ignore) {
+          setSkills([]);
+          setError(errorMessage(reason));
+        }
       })
       .finally(() => {
         if (!ignore) setLoading(false);
@@ -103,6 +106,7 @@ export function SkillsPanel({
       const refreshed = await skillsApi.list();
       setSkills(refreshed);
     } catch (reason) {
+      setSkills([]);
       setError(errorMessage(reason));
     } finally {
       writeLock.current = false;
@@ -175,7 +179,7 @@ export function SkillsPanel({
           <div className="flex justify-center py-12 text-muted-foreground">
             <LoaderCircle className="h-5 w-5 animate-spin" />
           </div>
-        ) : skills.length === 0 ? (
+        ) : error && skills.length === 0 ? null : skills.length === 0 ? (
           <div className="py-12 text-center">
             <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-muted">
               <Sparkles className="h-6 w-6 text-muted-foreground" />

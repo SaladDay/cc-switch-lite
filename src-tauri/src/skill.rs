@@ -74,6 +74,7 @@ pub(crate) struct PendingSkillChange {
     pub(crate) directory: String,
     pub(crate) app: AppType,
     pub(crate) enabled: bool,
+    pub(crate) runtime_fingerprint: String,
     previous_enabled: Option<bool>,
 }
 
@@ -176,12 +177,13 @@ impl SkillStore {
         id: &str,
         app: AppType,
         enabled: bool,
+        runtime_fingerprint: String,
         apply: impl FnOnce(&PendingSkillChange) -> Result<C, C::Error>,
     ) -> Result<Result<(), C::Error>, SkillError>
     where
         C: RecoverableSkillChange,
     {
-        let pending = self.begin_toggle(id, app, enabled)?;
+        let pending = self.begin_toggle(id, app, enabled, runtime_fingerprint)?;
         let receipt = match apply(&pending) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -268,6 +270,7 @@ impl SkillStore {
         id: &str,
         app: AppType,
         enabled: bool,
+        runtime_fingerprint: String,
     ) -> Result<PendingSkillChange, SkillError> {
         let descriptor = builtin_app_registry().for_app(&app);
         let contract = descriptor.skill_contract().ok_or_else(|| {
@@ -303,19 +306,21 @@ impl SkillStore {
             directory: row.1,
             app,
             enabled,
+            runtime_fingerprint,
             previous_enabled: row.2,
         };
         transaction
             .execute(
                 "INSERT INTO skill_operation_journal
-                 (skill_id, app_id, skill_name, directory, enabled)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (skill_id, app_id, skill_name, directory, enabled, runtime_fingerprint)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     pending.skill_id,
                     pending.app.as_str(),
                     pending.name,
                     pending.directory,
-                    pending.enabled
+                    pending.enabled,
+                    pending.runtime_fingerprint
                 ],
             )
             .map_err(|error| match error {
@@ -346,7 +351,7 @@ impl SkillStore {
     fn pending_changes(&self) -> Result<PendingScan, SkillError> {
         let connection = self.connect()?;
         let mut statement = connection.prepare(
-            "SELECT skill_id, app_id, skill_name, directory, enabled
+            "SELECT skill_id, app_id, skill_name, directory, enabled, runtime_fingerprint
              FROM skill_operation_journal ORDER BY skill_id, app_id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -356,6 +361,7 @@ impl SkillStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, bool>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
         let mut changes = Vec::new();
@@ -369,7 +375,14 @@ impl SkillStore {
                 }
             };
             let resolved = (|| {
-                let (skill_id, app_id, name, directory, enabled) = row;
+                let (skill_id, app_id, name, directory, enabled, runtime_fingerprint) = row;
+                let runtime_fingerprint = runtime_fingerprint
+                    .filter(|fingerprint| !fingerprint.is_empty())
+                    .ok_or_else(|| {
+                        SkillError::InvalidStore(format!(
+                            "pending Skill change for '{skill_id}' has no runtime fingerprint"
+                        ))
+                    })?;
                 let app = app_id.parse::<AppType>().map_err(|_| {
                     SkillError::InvalidStore(format!(
                         "pending Skill change uses unknown application '{app_id}'"
@@ -422,6 +435,7 @@ impl SkillStore {
                     directory,
                     app,
                     enabled,
+                    runtime_fingerprint,
                     previous_enabled: None,
                 })
             })();
@@ -520,11 +534,13 @@ impl SkillStore {
                 skill_name TEXT NOT NULL,
                 directory TEXT NOT NULL,
                 enabled BOOLEAN NOT NULL,
+                runtime_fingerprint TEXT,
                 PRIMARY KEY (skill_id, app_id)
             );",
         )?;
         let mut columns = skill_columns(&transaction)?;
         verify_base_columns(&columns)?;
+        ensure_journal_runtime_fingerprint(&transaction)?;
         verify_journal_schema(&transaction)?;
         for binding in catalog_bindings() {
             if columns.insert(binding.column.to_owned()) {
@@ -709,13 +725,14 @@ fn delete_pending(connection: &Connection, pending: &PendingSkillChange) -> Resu
     let deleted = connection.execute(
         "DELETE FROM skill_operation_journal
          WHERE skill_id = ?1 AND app_id = ?2 AND skill_name = ?3
-           AND directory = ?4 AND enabled = ?5",
+           AND directory = ?4 AND enabled = ?5 AND runtime_fingerprint = ?6",
         params![
             pending.skill_id,
             pending.app.as_str(),
             pending.name,
             pending.directory,
-            pending.enabled
+            pending.enabled,
+            pending.runtime_fingerprint
         ],
     )?;
     if deleted != 1 {
@@ -735,13 +752,14 @@ fn delete_pending_if_present(
     connection.execute(
         "DELETE FROM skill_operation_journal
          WHERE skill_id = ?1 AND app_id = ?2 AND skill_name = ?3
-           AND directory = ?4 AND enabled = ?5",
+           AND directory = ?4 AND enabled = ?5 AND runtime_fingerprint = ?6",
         params![
             pending.skill_id,
             pending.app.as_str(),
             pending.name,
             pending.directory,
-            pending.enabled
+            pending.enabled,
+            pending.runtime_fingerprint
         ],
     )?;
     Ok(())
@@ -785,18 +803,49 @@ fn verify_schema(connection: &Connection) -> Result<(), SkillError> {
     Ok(())
 }
 
+fn ensure_journal_runtime_fingerprint(connection: &Connection) -> Result<(), SkillError> {
+    let info = journal_schema_info(connection)?;
+    verify_journal_info(&info, false)?;
+    let columns = info
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<HashSet<_>>();
+    if !columns.contains("runtime_fingerprint") {
+        connection.execute_batch(
+            "ALTER TABLE skill_operation_journal ADD COLUMN runtime_fingerprint TEXT",
+        )?;
+    }
+    Ok(())
+}
+
 fn verify_journal_schema(connection: &Connection) -> Result<(), SkillError> {
+    verify_journal_info(&journal_schema_info(connection)?, true)
+}
+
+fn journal_schema_info(connection: &Connection) -> Result<Vec<(String, usize)>, SkillError> {
     let mut statement = connection.prepare("PRAGMA table_info(skill_operation_journal)")?;
     let info = statement
         .query_map([], |row| {
             Ok((row.get::<_, String>(1)?, row.get::<_, usize>(5)?))
         })?
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(SkillError::from)?;
+    Ok(info)
+}
+
+fn verify_journal_info(
+    info: &[(String, usize)],
+    require_runtime_fingerprint: bool,
+) -> Result<(), SkillError> {
     let columns = info
         .iter()
         .map(|(name, _)| name.as_str())
         .collect::<HashSet<_>>();
-    for required in ["skill_id", "app_id", "skill_name", "directory", "enabled"] {
+    let mut required = vec!["skill_id", "app_id", "skill_name", "directory", "enabled"];
+    if require_runtime_fingerprint {
+        required.push("runtime_fingerprint");
+    }
+    for required in required {
         if !columns.contains(required) {
             return Err(SkillError::InvalidStore(format!(
                 "skill_operation_journal is missing required column '{required}'"
@@ -931,6 +980,47 @@ mod tests {
     }
 
     #[test]
+    fn legacy_journal_rows_without_runtime_identity_stay_read_only() {
+        let (_directory, path, store) = seed_store();
+        drop(store);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE skill_operation_journal;
+                 CREATE TABLE skill_operation_journal (
+                    skill_id TEXT NOT NULL,
+                    app_id TEXT NOT NULL,
+                    skill_name TEXT NOT NULL,
+                    directory TEXT NOT NULL,
+                    enabled BOOLEAN NOT NULL,
+                    PRIMARY KEY (skill_id, app_id)
+                 );
+                 INSERT INTO skill_operation_journal
+                    (skill_id, app_id, skill_name, directory, enabled)
+                 VALUES ('docs', 'claude', 'Docs', 'docs', 1);",
+            )
+            .unwrap();
+
+        let store = SkillStore::open(path.clone()).unwrap();
+        let issues = store
+            .recover_pending_with_live::<FakeReceipt>(|_| {
+                panic!("a legacy row must not run against unbound paths")
+            })
+            .unwrap();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("runtime fingerprint"));
+        assert_eq!(
+            Connection::open(path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn shared_schema_lists_catalog_apps_and_preserves_future_columns() {
         let (_directory, path, store) = seed_store();
         let connection = Connection::open(path).unwrap();
@@ -961,17 +1051,23 @@ mod tests {
         let committed = Rc::new(Cell::new(false));
         let rolled_back = Rc::new(Cell::new(false));
         store
-            .toggle_with_live("docs", AppType::Claude, true, |pending| {
-                assert_eq!(pending.directory, "docs");
-                assert_eq!(pending.name, "Docs");
-                assert_eq!(pending.app, AppType::Claude);
-                assert!(pending.enabled);
-                Ok(FakeReceipt {
-                    verified: true,
-                    committed: committed.clone(),
-                    rolled_back: rolled_back.clone(),
-                })
-            })
+            .toggle_with_live(
+                "docs",
+                AppType::Claude,
+                true,
+                "runtime-v1".to_owned(),
+                |pending| {
+                    assert_eq!(pending.directory, "docs");
+                    assert_eq!(pending.name, "Docs");
+                    assert_eq!(pending.app, AppType::Claude);
+                    assert!(pending.enabled);
+                    Ok(FakeReceipt {
+                        verified: true,
+                        committed: committed.clone(),
+                        rolled_back: rolled_back.clone(),
+                    })
+                },
+            )
             .unwrap()
             .unwrap();
 
@@ -987,7 +1083,9 @@ mod tests {
     #[test]
     fn durable_intent_is_replayed_after_an_interrupted_toggle() {
         let (_directory, path, store) = seed_store();
-        let pending = store.begin_toggle("docs", AppType::Claude, true).unwrap();
+        let pending = store
+            .begin_toggle("docs", AppType::Claude, true, "runtime-v1".to_owned())
+            .unwrap();
         assert!(pending.enabled);
         assert_eq!(
             Connection::open(&path)
@@ -1035,8 +1133,12 @@ mod tests {
                 [],
             )
             .unwrap();
-        store.begin_toggle("docs", AppType::Claude, true).unwrap();
-        store.begin_toggle("tools", AppType::Claude, true).unwrap();
+        store
+            .begin_toggle("docs", AppType::Claude, true, "runtime-v1".to_owned())
+            .unwrap();
+        store
+            .begin_toggle("tools", AppType::Claude, true, "runtime-v1".to_owned())
+            .unwrap();
         let committed = Rc::new(Cell::new(false));
 
         let issues = store
@@ -1070,9 +1172,13 @@ mod tests {
     fn incomplete_apply_recovery_keeps_the_durable_intent() {
         let (_directory, path, store) = seed_store();
         let result = store
-            .toggle_with_live::<FakeReceipt>("docs", AppType::Claude, true, |_| {
-                Err("recovery incomplete")
-            })
+            .toggle_with_live::<FakeReceipt>(
+                "docs",
+                AppType::Claude,
+                true,
+                "runtime-v1".to_owned(),
+                |_| Err("recovery incomplete"),
+            )
             .unwrap();
 
         assert_eq!(result, Err("recovery incomplete"));
@@ -1097,23 +1203,29 @@ mod tests {
             let (_directory, path, store) = seed_store();
             let committed = Rc::new(Cell::new(false));
             let rolled_back = Rc::new(Cell::new(false));
-            let result = store.toggle_with_live("docs", AppType::Claude, true, |_| {
-                let connection = Connection::open(&path).unwrap();
-                if delete {
-                    connection
-                        .execute("DELETE FROM skills WHERE id = 'docs'", [])
-                        .unwrap();
-                } else {
-                    connection
-                        .execute("UPDATE skills SET enabled_claude = 0 WHERE id = 'docs'", [])
-                        .unwrap();
-                }
-                Ok(FakeReceipt {
-                    verified: true,
-                    committed: committed.clone(),
-                    rolled_back: rolled_back.clone(),
-                })
-            });
+            let result = store.toggle_with_live(
+                "docs",
+                AppType::Claude,
+                true,
+                "runtime-v1".to_owned(),
+                |_| {
+                    let connection = Connection::open(&path).unwrap();
+                    if delete {
+                        connection
+                            .execute("DELETE FROM skills WHERE id = 'docs'", [])
+                            .unwrap();
+                    } else {
+                        connection
+                            .execute("UPDATE skills SET enabled_claude = 0 WHERE id = 'docs'", [])
+                            .unwrap();
+                    }
+                    Ok(FakeReceipt {
+                        verified: true,
+                        committed: committed.clone(),
+                        rolled_back: rolled_back.clone(),
+                    })
+                },
+            );
 
             assert!(matches!(result, Err(SkillError::Conflict(_))));
             assert!(!committed.get());
@@ -1135,13 +1247,19 @@ mod tests {
         let (_directory, path, store) = seed_store();
         let rolled_back = Rc::new(Cell::new(false));
         let result = store
-            .toggle_with_live("docs", AppType::Codex, true, |_| {
-                Ok(FakeReceipt {
-                    verified: false,
-                    committed: Rc::new(Cell::new(false)),
-                    rolled_back: rolled_back.clone(),
-                })
-            })
+            .toggle_with_live(
+                "docs",
+                AppType::Codex,
+                true,
+                "runtime-v1".to_owned(),
+                |_| {
+                    Ok(FakeReceipt {
+                        verified: false,
+                        committed: Rc::new(Cell::new(false)),
+                        rolled_back: rolled_back.clone(),
+                    })
+                },
+            )
             .unwrap();
 
         assert_eq!(result, Err("verification failed"));
@@ -1173,9 +1291,13 @@ mod tests {
         assert!(skills.iter().all(|skill| skill.issue.is_some()));
 
         for id in ["docs", "unsafe"] {
-            let result = store.toggle_with_live::<FakeReceipt>(id, AppType::Claude, true, |_| {
-                panic!("invalid catalog rows must not reach live changes")
-            });
+            let result = store.toggle_with_live::<FakeReceipt>(
+                id,
+                AppType::Claude,
+                true,
+                "runtime-v1".to_owned(),
+                |_| panic!("invalid catalog rows must not reach live changes"),
+            );
             assert!(matches!(result, Err(SkillError::InvalidSkill(_))));
         }
     }
@@ -1192,9 +1314,13 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            store.toggle_with_live::<FakeReceipt>("docs", AppType::Gemini, true, |_| panic!(
-                "ambiguous names must not reach native controls"
-            )),
+            store.toggle_with_live::<FakeReceipt>(
+                "docs",
+                AppType::Gemini,
+                true,
+                "runtime-v1".to_owned(),
+                |_| panic!("ambiguous names must not reach native controls")
+            ),
             Err(SkillError::InvalidSkill(_))
         ));
     }
@@ -1222,9 +1348,13 @@ mod tests {
             .filter(|skill| skill.id.starts_with("accent-"))
             .all(|skill| skill.issue.is_some()));
         assert!(matches!(
-            store.toggle_with_live::<FakeReceipt>("accent-a", AppType::Claude, true, |_| panic!(
-                "aliased catalog rows must not reach live changes"
-            )),
+            store.toggle_with_live::<FakeReceipt>(
+                "accent-a",
+                AppType::Claude,
+                true,
+                "runtime-v1".to_owned(),
+                |_| panic!("aliased catalog rows must not reach live changes")
+            ),
             Err(SkillError::InvalidSkill(_))
         ));
     }
@@ -1269,29 +1399,45 @@ mod tests {
         .unwrap()
         .commit()
         .unwrap();
+        let runtime_fingerprint = live.skill_runtime_fingerprint(&AppType::Claude).unwrap();
         store
-            .toggle_with_live("docs", AppType::Claude, false, |pending| {
-                live.apply_skill_recoverable(
-                    &pending.name,
-                    &pending.directory,
-                    &pending.app,
-                    pending.enabled,
-                )
-            })
-            .unwrap()
-            .unwrap();
-        assert!(!residual.exists());
-
-        for enabled in [true, false] {
-            store
-                .toggle_with_live("docs", AppType::Claude, enabled, |pending| {
+            .toggle_with_live(
+                "docs",
+                AppType::Claude,
+                false,
+                runtime_fingerprint,
+                |pending| {
                     live.apply_skill_recoverable(
                         &pending.name,
                         &pending.directory,
                         &pending.app,
                         pending.enabled,
+                        &pending.runtime_fingerprint,
                     )
-                })
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!residual.exists());
+
+        for enabled in [true, false] {
+            let runtime_fingerprint = live.skill_runtime_fingerprint(&AppType::Claude).unwrap();
+            store
+                .toggle_with_live(
+                    "docs",
+                    AppType::Claude,
+                    enabled,
+                    runtime_fingerprint,
+                    |pending| {
+                        live.apply_skill_recoverable(
+                            &pending.name,
+                            &pending.directory,
+                            &pending.app,
+                            pending.enabled,
+                            &pending.runtime_fingerprint,
+                        )
+                    },
+                )
                 .unwrap()
                 .unwrap();
             assert_eq!(
@@ -1314,6 +1460,76 @@ mod tests {
                 })
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn pending_change_never_replays_against_new_path_settings() {
+        let directory = tempdir().unwrap();
+        let shared = directory.path().join(".cc-switch");
+        let source = shared.join("skills/docs");
+        let initial_claude = directory.path().join("claude-initial");
+        let current_claude = directory.path().join("claude-current");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&initial_claude).unwrap();
+        fs::create_dir_all(&current_claude).unwrap();
+        fs::write(source.join("SKILL.md"), "# Docs").unwrap();
+        fs::write(
+            shared.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "claudeConfigDir": initial_claude,
+                "skillSyncMethod": "copy"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let path = shared.join("cc-switch.db");
+        let store = SkillStore::open(path.clone()).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO skills (id, name, directory) VALUES ('docs', 'Docs', 'docs')",
+                [],
+            )
+            .unwrap();
+        let live = LiveConfig::from_home(directory.path()).unwrap();
+        let initial_fingerprint = live.skill_runtime_fingerprint(&AppType::Claude).unwrap();
+        store
+            .begin_toggle("docs", AppType::Claude, true, initial_fingerprint)
+            .unwrap();
+
+        fs::write(
+            shared.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "claudeConfigDir": current_claude,
+                "skillSyncMethod": "copy"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let issues = store
+            .recover_pending_with_live(|pending| {
+                live.apply_skill_recoverable(
+                    &pending.name,
+                    &pending.directory,
+                    &pending.app,
+                    pending.enabled,
+                    &pending.runtime_fingerprint,
+                )
+            })
+            .unwrap();
+
+        assert_eq!(issues.len(), 1);
+        assert!(!initial_claude.join("skills/docs").exists());
+        assert!(!current_claude.join("skills/docs").exists());
+        assert_eq!(
+            Connection::open(path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM skill_operation_journal", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            1
         );
     }
 
@@ -1354,15 +1570,23 @@ mod tests {
         let live = LiveConfig::from_home(directory.path()).unwrap();
 
         for enabled in [true, false] {
+            let runtime_fingerprint = live.skill_runtime_fingerprint(&AppType::Gemini).unwrap();
             store
-                .toggle_with_live("docs", AppType::Gemini, enabled, |pending| {
-                    live.apply_skill_recoverable(
-                        &pending.name,
-                        &pending.directory,
-                        &pending.app,
-                        pending.enabled,
-                    )
-                })
+                .toggle_with_live(
+                    "docs",
+                    AppType::Gemini,
+                    enabled,
+                    runtime_fingerprint,
+                    |pending| {
+                        live.apply_skill_recoverable(
+                            &pending.name,
+                            &pending.directory,
+                            &pending.app,
+                            pending.enabled,
+                            &pending.runtime_fingerprint,
+                        )
+                    },
+                )
                 .unwrap()
                 .unwrap();
             let settings: serde_json::Value =

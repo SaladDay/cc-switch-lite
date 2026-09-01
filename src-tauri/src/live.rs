@@ -7,12 +7,14 @@ use std::{
 };
 
 use cc_switch_core::{
-    builtin_app_registry, fs::shared_live_config_lock_path, project_skill_config_enabled, AppType,
-    ContentExpectation, PlannedWrite, SkillConfigError, SkillConfigTarget, SkillDeploymentReceipt,
-    SkillSyncMethod, MAX_OPERATION_CONTENT_BYTES, OPERATION_CONTRACT_MAJOR,
+    builtin_app_registry, fs::shared_live_config_lock_path, project_skill_config_enabled,
+    skill_path_identity, AppType, ContentExpectation, PlannedWrite, SkillConfigError,
+    SkillConfigTarget, SkillDeploymentReceipt, SkillSyncMethod, MAX_OPERATION_CONTENT_BYTES,
+    OPERATION_CONTRACT_MAJOR,
 };
 use fs4::{FileExt, TryLockError};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -87,6 +89,21 @@ pub struct LiveConfig {
 struct SkillRuntime {
     native: NativeLiveConfig,
     skill: SkillLiveConfig,
+    fingerprints: HashMap<AppType, String>,
+}
+
+impl SkillRuntime {
+    fn fingerprint(&self, app: &AppType) -> Result<&str, LiveError> {
+        self.fingerprints
+            .get(app)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                LiveError::InvalidConfig(format!(
+                    "application '{}' has no Skill runtime",
+                    app.as_str()
+                ))
+            })
+    }
 }
 
 pub(crate) struct LockedLiveReceipt<'a, T> {
@@ -191,9 +208,16 @@ impl LiveConfig {
         directory: &str,
         app: &AppType,
         enabled: bool,
+        expected_runtime_fingerprint: &str,
     ) -> Result<SkillWriteReceipt<'_>, LiveError> {
         self.lock_result(|| {
             let runtime = self.current_skill_runtime()?;
+            if runtime.fingerprint(app)? != expected_runtime_fingerprint {
+                return Err(LiveError::InvalidConfig(
+                    "Skill paths or synchronization settings changed before the operation"
+                        .to_owned(),
+                ));
+            }
             let route = runtime.skill.route(directory, app)?;
             let configuration = if let Some(target) = route.config_target {
                 let logical_target = target.logical_target();
@@ -259,6 +283,14 @@ impl LiveConfig {
         })
     }
 
+    pub(crate) fn skill_runtime_fingerprint(&self, app: &AppType) -> Result<String, LiveError> {
+        self.with_lock(|| {
+            self.current_skill_runtime()?
+                .fingerprint(app)
+                .map(str::to_owned)
+        })
+    }
+
     fn observe_skill_configs(native: &NativeLiveConfig) -> SkillConfigDocuments {
         let targets = builtin_app_registry()
             .descriptors()
@@ -292,17 +324,18 @@ impl LiveConfig {
         .into_iter()
         .map(|(app, root)| absolute_skill_root(&root).map(|root| (app, root)))
         .collect::<Result<Vec<_>, _>>()?;
+        let source_root = absolute_skill_root(&skill_source_root(
+            &self.home,
+            settings.skill_storage_location.as_deref(),
+        ))?;
+        let unified_discovery_root = absolute_skill_root(&self.home.join(".agents/skills"))?;
+        let sync_method = skill_sync_method(settings.skill_sync_method.as_deref());
+        let fingerprints =
+            skill_runtime_fingerprints(&source_root, &unified_discovery_root, sync_method, &roots)?;
         Ok(SkillRuntime {
             native: NativeLiveConfig::from_home(&self.home, &dirs)?,
-            skill: SkillLiveConfig::new(
-                absolute_skill_root(&skill_source_root(
-                    &self.home,
-                    settings.skill_storage_location.as_deref(),
-                ))?,
-                absolute_skill_root(&self.home.join(".agents/skills"))?,
-                skill_sync_method(settings.skill_sync_method.as_deref()),
-                roots,
-            )?,
+            skill: SkillLiveConfig::new(source_root, unified_discovery_root, sync_method, roots)?,
+            fingerprints,
         })
     }
 
@@ -609,6 +642,90 @@ fn skill_sync_method(method: Option<&str>) -> SkillSyncMethod {
         Some("symlink") => SkillSyncMethod::Symlink,
         Some("copy") => SkillSyncMethod::Copy,
         _ => SkillSyncMethod::Auto,
+    }
+}
+
+fn skill_runtime_fingerprints(
+    source_root: &Path,
+    unified_discovery_root: &Path,
+    sync_method: SkillSyncMethod,
+    roots: &[(AppType, PathBuf)],
+) -> Result<HashMap<AppType, String>, LiveError> {
+    let source = skill_identity(source_root)?;
+    let unified = skill_identity(unified_discovery_root)?;
+    roots
+        .iter()
+        .map(|(app, install_root)| {
+            let contract = builtin_app_registry()
+                .for_app(app)
+                .skill_contract()
+                .ok_or_else(|| {
+                    LiveError::InvalidConfig(format!(
+                        "application '{}' does not support Skills",
+                        app.as_str()
+                    ))
+                })?;
+            let mut hasher = Sha256::new();
+            hash_fingerprint_field(&mut hasher, b"cc-switch-lite-skill-runtime-v1");
+            hash_fingerprint_field(&mut hasher, app.as_str().as_bytes());
+            hash_fingerprint_path(&mut hasher, &source);
+            hash_fingerprint_path(&mut hasher, &unified);
+            hash_fingerprint_path(&mut hasher, &skill_identity(install_root)?);
+            hash_fingerprint_path(&mut hasher, &skill_identity(&install_root.join("skills"))?);
+            hash_fingerprint_field(
+                &mut hasher,
+                match sync_method {
+                    SkillSyncMethod::Auto => b"auto",
+                    SkillSyncMethod::Symlink => b"symlink",
+                    SkillSyncMethod::Copy => b"copy",
+                },
+            );
+            if let Some(target) = contract.config_target() {
+                let (label, path) = match target {
+                    SkillConfigTarget::GeminiSettings => (
+                        b"gemini-settings".as_slice(),
+                        install_root.join("settings.json"),
+                    ),
+                    SkillConfigTarget::GrokConfig => {
+                        (b"grok-config".as_slice(), install_root.join("config.toml"))
+                    }
+                    SkillConfigTarget::HermesConfig => (
+                        b"hermes-config".as_slice(),
+                        install_root.join("config.yaml"),
+                    ),
+                };
+                hash_fingerprint_field(&mut hasher, label);
+                hash_fingerprint_path(&mut hasher, &skill_identity(&path)?);
+            }
+            Ok((app.clone(), format!("{:x}", hasher.finalize())))
+        })
+        .collect()
+}
+
+fn skill_identity(path: &Path) -> Result<PathBuf, LiveError> {
+    skill_path_identity(path).map_err(|error| LiveError::Skill(error.into()))
+}
+
+fn hash_fingerprint_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(value);
+}
+
+fn hash_fingerprint_path(hasher: &mut Sha256, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hash_fingerprint_field(hasher, path.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let bytes = path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        hash_fingerprint_field(hasher, &bytes);
     }
 }
 
@@ -959,6 +1076,7 @@ mod tests {
         )
         .unwrap();
         let live = LiveConfig::from_home(directory.path()).unwrap();
+        let initial_fingerprint = live.skill_runtime_fingerprint(&AppType::Claude).unwrap();
 
         let unified = directory.path().join(".agents/skills/docs");
         fs::create_dir_all(&unified).unwrap();
@@ -975,8 +1093,23 @@ mod tests {
         )
         .unwrap();
 
+        assert!(matches!(
+            live.apply_skill_recoverable(
+                "Docs",
+                "docs",
+                &AppType::Claude,
+                true,
+                &initial_fingerprint
+            ),
+            Err(LiveError::InvalidConfig(_))
+        ));
+        assert!(!initial_claude.join("skills/docs").exists());
+        assert!(!current_claude.join("skills/docs").exists());
+
+        let current_fingerprint = live.skill_runtime_fingerprint(&AppType::Claude).unwrap();
+        assert_ne!(initial_fingerprint, current_fingerprint);
         let receipt = live
-            .apply_skill_recoverable("Docs", "docs", &AppType::Claude, true)
+            .apply_skill_recoverable("Docs", "docs", &AppType::Claude, true, &current_fingerprint)
             .unwrap();
         receipt.verify().unwrap();
         receipt.commit().unwrap();

@@ -608,13 +608,15 @@ fn toggle_skill_app(
             "application '{app_id}' is not supported"
         )))
     })?;
+    let runtime_fingerprint = live.skill_runtime_fingerprint(&app)?;
     match store
-        .toggle_with_live(&skill_id, app, enabled, |pending| {
+        .toggle_with_live(&skill_id, app, enabled, runtime_fingerprint, |pending| {
             live.apply_skill_recoverable(
                 &pending.name,
                 &pending.directory,
                 &pending.app,
                 pending.enabled,
+                &pending.runtime_fingerprint,
             )
         })
         .map_err(CommandError::from)?
@@ -639,6 +641,7 @@ pub fn run() {
                     &pending.directory,
                     &pending.app,
                     pending.enabled,
+                    &pending.runtime_fingerprint,
                 )
             })?;
             for issue in recovery_issues {

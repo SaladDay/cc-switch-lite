@@ -45,6 +45,10 @@ use their native disabled lists. Other directly discovered copies are shown as
 externally managed instead of guessing whether the application has enabled them.
 Skill status is the user-level default managed by Lite; project, workspace,
 system, administrator, or plugin layers can still override it at runtime.
+Pending switches are bound to the resolved paths and sync method that started
+them. If those settings change before recovery, Lite leaves the switch read-only
+instead of replaying it against a different directory. Native sections whose
+comments, anchors, or aliases cannot be preserved are also read-only.
 
 Import reads only the API-provider fields that Lite can reproduce. Switching
 uses the shared Core executor with logical configuration targets. Lite updates its

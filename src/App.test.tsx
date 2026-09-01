@@ -430,6 +430,48 @@ describe("App", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("does not present a failed Skill load as an empty catalog", async () => {
+    const user = userEvent.setup();
+    skillApi.list.mockRejectedValue(new Error("Skill catalog unavailable"));
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Add your first Claude Code provider",
+    });
+    await user.click(screen.getByRole("button", { name: "Manage Skills" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Skill catalog unavailable",
+    );
+    expect(
+      screen.queryByRole("heading", { name: "No installed Skills" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("invalidates Skill controls when the post-switch refresh fails", async () => {
+    const user = userEvent.setup();
+    skillApi.list
+      .mockResolvedValueOnce([docsSkill])
+      .mockRejectedValueOnce(new Error("Skill refresh failed"));
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Add your first Claude Code provider",
+    });
+    await user.click(screen.getByRole("button", { name: "Manage Skills" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Enable Docs for Codex" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Skill refresh failed",
+    );
+    expect(screen.queryByText("Docs")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "No installed Skills" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("blocks MCP actions until the initial catalog has loaded", async () => {
     const user = userEvent.setup();
     const initial = deferred<McpServer[]>();

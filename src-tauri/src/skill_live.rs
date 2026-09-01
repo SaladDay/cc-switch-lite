@@ -87,7 +87,7 @@ impl SkillLiveConfig {
                 issue: None,
             })
             .collect::<Vec<_>>();
-        mark_overlapping_targets(&mut targets);
+        mark_overlapping_targets(&mut targets, &unified_discovery_root);
         Ok(Self {
             source_root,
             unified_discovery_root,
@@ -478,7 +478,7 @@ fn validate_targets(app_roots: &[(AppType, PathBuf)]) -> Result<(), SkillLiveErr
     Ok(())
 }
 
-fn mark_overlapping_targets(targets: &mut [SkillTarget]) {
+fn mark_overlapping_targets(targets: &mut [SkillTarget], unified_discovery_root: &std::path::Path) {
     let identities = targets
         .iter()
         .map(|target| skill_path_identity(&target.skills_root).map_err(|error| error.to_string()))
@@ -488,15 +488,25 @@ fn mark_overlapping_targets(targets: &mut [SkillTarget]) {
             append_target_issue(target, issue.clone());
         }
     }
+    if let Ok(unified) = skill_path_identity(unified_discovery_root) {
+        for (target, identity) in targets.iter_mut().zip(&identities) {
+            let Ok(path) = identity else {
+                continue;
+            };
+            if paths_overlap(path, &unified) {
+                append_target_issue(
+                    target,
+                    "native Skill directory overlaps the unified Skill directory".to_owned(),
+                );
+            }
+        }
+    }
     for left in 0..targets.len() {
         for right in (left + 1)..targets.len() {
             let (Ok(left_path), Ok(right_path)) = (&identities[left], &identities[right]) else {
                 continue;
             };
-            if left_path == right_path
-                || left_path.starts_with(right_path)
-                || right_path.starts_with(left_path)
-            {
+            if paths_overlap(left_path, right_path) {
                 let right_app = targets[right].app.as_str().to_owned();
                 let left_app = targets[left].app.as_str().to_owned();
                 let (before_right, from_right) = targets.split_at_mut(right);
@@ -511,6 +521,10 @@ fn mark_overlapping_targets(targets: &mut [SkillTarget]) {
             }
         }
     }
+}
+
+fn paths_overlap(left: &std::path::Path, right: &std::path::Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 fn append_target_issue(target: &mut SkillTarget, issue: String) {
@@ -906,6 +920,38 @@ mod tests {
             Err(SkillLiveError::InvalidTargets(_))
         ));
         assert!(observations[0].app_overrides["hermes"].issue.is_none());
+    }
+
+    #[test]
+    fn application_root_overlapping_unified_discovery_is_read_only() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let unified = directory.path().join(".agents/skills");
+        fs::create_dir_all(source.join("docs")).unwrap();
+        fs::write(source.join("docs/SKILL.md"), "# Docs").unwrap();
+        fs::create_dir_all(&unified).unwrap();
+        let mut roots = app_roots(directory.path());
+        roots
+            .iter_mut()
+            .find(|(app, _)| app == &AppType::Codex)
+            .unwrap()
+            .1 = directory.path().join(".agents");
+        for (_, root) in &roots {
+            fs::create_dir_all(root).unwrap();
+        }
+        let live = SkillLiveConfig::new(source, unified, SkillSyncMethod::Copy, roots).unwrap();
+
+        let observations = live.observe(&skill_request(), &enabled_configs());
+        let codex = &observations[0].app_overrides["codex"];
+        assert_eq!(codex.enabled, None);
+        assert!(codex
+            .issue
+            .as_deref()
+            .is_some_and(|issue| issue.contains("unified Skill directory")));
+        assert!(matches!(
+            live.route("docs", &AppType::Codex),
+            Err(SkillLiveError::InvalidTargets(_))
+        ));
     }
 
     #[test]
