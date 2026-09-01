@@ -108,6 +108,8 @@ pub enum OperationError {
     },
     #[error("switch failed and rollback was incomplete: {0}")]
     Rollback(String),
+    #[error("operation outcome is uncertain: {0}")]
+    Uncertain(String),
 }
 
 impl OperationError {
@@ -119,12 +121,15 @@ impl OperationError {
             Self::TooLarge { .. } => "live_too_large",
             Self::File(_) | Self::Io { .. } => "live_io_error",
             Self::Rollback(_) => "rollback_failed",
+            Self::Uncertain(_) => "operation_uncertain",
         }
     }
 
     pub(crate) const fn live_may_have_changed(&self) -> bool {
         match self {
-            Self::Rollback(_) | Self::File(FileError::Durability { .. }) => true,
+            Self::Rollback(_) | Self::Uncertain(_) | Self::File(FileError::Durability { .. }) => {
+                true
+            }
             Self::InvalidPlan(_)
             | Self::Conflict
             | Self::InvalidTarget(_)
@@ -275,7 +280,7 @@ fn map_execution_error(error: OperationExecutionError<OperationError>) -> Operat
             OperationError::TooLarge { limit }
         }
         OperationFailure::Conflict { .. } => OperationError::Conflict,
-        other => OperationError::InvalidPlan(other.to_string()),
+        other => OperationError::Uncertain(other.to_string()),
     }
 }
 

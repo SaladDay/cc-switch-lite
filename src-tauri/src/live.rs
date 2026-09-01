@@ -71,27 +71,19 @@ impl LiveError {
             Self::Recovery(_) => "rollback_failed",
         }
     }
+}
 
-    fn live_may_have_changed(&self) -> bool {
-        match self {
-            Self::Operation(error) => error.live_may_have_changed(),
-            Self::Skill(error) => error.live_may_have_changed(),
-            Self::Recovery(_) => true,
-            Self::Missing(_)
-            | Self::InvalidConfig(_)
-            | Self::InvalidProvider(_)
-            | Self::LockUnavailable
-            | Self::Io { .. } => false,
-        }
+fn classify_operation_apply_failure(error: OperationError) -> ApplyFailure<LiveError> {
+    if error.live_may_have_changed() {
+        ApplyFailure::LiveMayHaveChanged(error.into())
+    } else {
+        ApplyFailure::NoResidualLiveChange(error.into())
     }
 }
 
-fn classify_skill_apply_failure(error: LiveError) -> ApplyFailure<LiveError> {
-    if error.live_may_have_changed() {
-        ApplyFailure::LiveMayHaveChanged(error)
-    } else {
-        ApplyFailure::NoResidualLiveChange(error)
-    }
+fn classify_deployment_apply_failure(error: SkillLiveError) -> ApplyFailure<LiveError> {
+    // Core may recover an interrupted deployment before returning any later error.
+    ApplyFailure::LiveMayHaveChanged(error.into())
 }
 
 pub struct LiveConfig {
@@ -232,27 +224,44 @@ impl LiveConfig {
         expected_runtime_fingerprint: &str,
         copy_policy: SkillCopyPolicy,
     ) -> Result<SkillWriteReceipt<'_>, ApplyFailure<LiveError>> {
-        let result = self.lock_result(|| {
-            let runtime = self.current_skill_runtime()?;
-            if runtime.fingerprint(app)? != expected_runtime_fingerprint {
-                return Err(LiveError::InvalidConfig(
+        let (gate, file_lock) = self
+            .acquire_lock()
+            .map_err(ApplyFailure::NoResidualLiveChange)?;
+        let runtime = self
+            .current_skill_runtime()
+            .map_err(ApplyFailure::NoResidualLiveChange)?;
+        if runtime
+            .fingerprint(app)
+            .map_err(ApplyFailure::NoResidualLiveChange)?
+            != expected_runtime_fingerprint
+        {
+            return Err(ApplyFailure::NoResidualLiveChange(
+                LiveError::InvalidConfig(
                     "Skill paths or synchronization settings changed before the operation"
                         .to_owned(),
-                ));
-            }
-            let route = runtime.skill.route(directory, app, copy_policy)?;
-            let configuration = if let Some(target) = route.config_target() {
-                let logical_target = target.logical_target();
-                let (paths, current) = runtime.native.observe_target(logical_target)?;
-                if let Some(contents) =
-                    project_skill_config_enabled(target, current.as_deref(), name, enabled)
-                        .map_err(SkillLiveError::from)?
-                {
-                    let receipt = SkillConfigurationReceipt {
-                        path: paths.path_for(logical_target).to_owned(),
-                        contents: contents.as_bytes().to_vec(),
-                        operation: OperationExecutor::new(&paths).execute_recoverable(
-                            &OperationPlan {
+                ),
+            ));
+        }
+        let route = runtime
+            .skill
+            .route(directory, app, copy_policy)
+            .map_err(LiveError::from)
+            .map_err(ApplyFailure::NoResidualLiveChange)?;
+        let configuration = if let Some(target) = route.config_target() {
+            let logical_target = target.logical_target();
+            let (paths, current) = runtime
+                .native
+                .observe_target(logical_target)
+                .map_err(ApplyFailure::NoResidualLiveChange)?;
+            if let Some(contents) =
+                project_skill_config_enabled(target, current.as_deref(), name, enabled)
+                    .map_err(SkillLiveError::from)
+                    .map_err(LiveError::from)
+                    .map_err(ApplyFailure::NoResidualLiveChange)?
+            {
+                let receipt_contents = contents.as_bytes().to_vec();
+                let operation = OperationExecutor::new(&paths)
+                    .execute_recoverable(&OperationPlan {
                         contract_major: OPERATION_CONTRACT_MAJOR,
                         app_id: app.as_str().to_owned(),
                         writes: vec![PlannedWrite {
@@ -260,42 +269,49 @@ impl LiveConfig {
                             expected: ContentExpectation::for_contents(current.as_deref()),
                             contents: Some(contents),
                         }],
-                            },
-                        )?,
-                    };
-                    Some(receipt)
-                } else {
-                    None
-                }
+                    })
+                    .map_err(classify_operation_apply_failure)?;
+                Some(SkillConfigurationReceipt {
+                    path: paths.path_for(logical_target).to_owned(),
+                    contents: receipt_contents,
+                    operation,
+                })
             } else {
                 None
-            };
-            let deployment = if route.deploy_native() {
-                match runtime
-                    .skill
-                    .apply_deployment(directory, app, enabled, copy_policy)
-                {
-                    Ok(receipt) => Some(receipt),
-                    Err(error) => {
-                        if let Some(receipt) = configuration {
-                            if let Err(rollback) = receipt.rollback() {
-                                return Err(LiveError::Recovery(format!(
+            }
+        } else {
+            None
+        };
+        let deployment = if route.deploy_native() {
+            match runtime
+                .skill
+                .apply_deployment(directory, app, enabled, copy_policy)
+            {
+                Ok(receipt) => Some(receipt),
+                Err(error) => {
+                    if let Some(receipt) = configuration {
+                        if let Err(rollback) = receipt.rollback() {
+                            return Err(ApplyFailure::LiveMayHaveChanged(LiveError::Recovery(
+                                format!(
                                     "Skill deployment failed: {error}; configuration rollback: {rollback}"
-                                )));
-                            }
+                                ),
+                            )));
                         }
-                        return Err(error.into());
                     }
+                    return Err(classify_deployment_apply_failure(error));
                 }
-            } else {
-                None
-            };
-            Ok(SkillChangeReceipt {
+            }
+        } else {
+            None
+        };
+        Ok(LockedLiveReceipt {
+            value: SkillChangeReceipt {
                 configuration,
                 deployment,
-            })
-        });
-        result.map_err(classify_skill_apply_failure)
+            },
+            gate,
+            file_lock,
+        })
     }
 
     pub(crate) fn observe_skills(
@@ -927,22 +943,32 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn nested_rollback_failures_keep_the_skill_recovery_intent() {
-        let operation = LiveError::Operation(OperationError::Rollback("incomplete".to_owned()));
-        let deployment = LiveError::Skill(SkillLiveError::Config(SkillConfigError::Recovery {
-            message: "incomplete".to_owned(),
-        }));
-        let durability = LiveError::Operation(OperationError::File(
+    fn possible_write_failures_keep_the_skill_recovery_intent() {
+        let rollback =
+            classify_operation_apply_failure(OperationError::Rollback("incomplete".to_owned()));
+        let uncertain = classify_operation_apply_failure(OperationError::Uncertain(
+            "future Core failure".to_owned(),
+        ));
+        let durability = classify_operation_apply_failure(OperationError::File(
             cc_switch_core::fs::FileError::Durability {
                 path: PathBuf::from("config"),
                 source: std::io::Error::other("sync failed"),
             },
         ));
+        let invalid = classify_operation_apply_failure(OperationError::InvalidPlan(
+            "rejected before execution".to_owned(),
+        ));
+        let deployment =
+            classify_deployment_apply_failure(SkillLiveError::Config(SkillConfigError::Io {
+                path: PathBuf::from("deployment"),
+                source: std::io::Error::other("cleanup failed"),
+            }));
 
-        assert!(operation.live_may_have_changed());
-        assert!(deployment.live_may_have_changed());
-        assert!(durability.live_may_have_changed());
-        assert!(!LiveError::LockUnavailable.live_may_have_changed());
+        assert!(matches!(rollback, ApplyFailure::LiveMayHaveChanged(_)));
+        assert!(matches!(uncertain, ApplyFailure::LiveMayHaveChanged(_)));
+        assert!(matches!(durability, ApplyFailure::LiveMayHaveChanged(_)));
+        assert!(matches!(deployment, ApplyFailure::LiveMayHaveChanged(_)));
+        assert!(matches!(invalid, ApplyFailure::NoResidualLiveChange(_)));
     }
 
     #[test]
