@@ -80,10 +80,13 @@ impl SkillStore {
         self.change(live, skill_id, app, Some(enabled))
     }
 
-    pub fn reconcile_pending(&self, live: &LiveConfig) -> Result<Vec<String>, SkillError> {
-        let pending = self
-            .list(live)?
-            .into_iter()
+    pub fn reconcile_and_list(
+        &self,
+        live: &LiveConfig,
+    ) -> Result<(Vec<InstalledSkillSnapshot>, Vec<String>), SkillError> {
+        let snapshots = self.list(live)?;
+        let pending = snapshots
+            .iter()
             .flat_map(|skill| {
                 let skill_id = skill.id().to_owned();
                 skill
@@ -102,6 +105,9 @@ impl SkillStore {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok((snapshots, Vec::new()));
+        }
         let failures = pending
             .into_iter()
             .filter_map(|(skill_id, app)| {
@@ -109,8 +115,13 @@ impl SkillStore {
                     .err()
                     .map(|error| format!("{skill_id}/{}: {error}", app.as_str()))
             })
-            .collect();
-        Ok(failures)
+            .collect::<Vec<_>>();
+        let snapshots = if failures.is_empty() {
+            self.list(live)?
+        } else {
+            snapshots
+        };
+        Ok((snapshots, failures))
     }
 
     fn change(
@@ -438,8 +449,8 @@ mod tests {
         store.toggle(&live, "demo", AppType::Claude, true).unwrap();
         fs::remove_file(home.path().join(".claude/skills/demo")).unwrap();
 
-        assert!(store.reconcile_pending(&live).unwrap().is_empty());
-        let snapshots = store.list(&live).unwrap();
+        let (snapshots, failures) = store.reconcile_and_list(&live).unwrap();
+        assert!(failures.is_empty());
         let claude = snapshots[0]
             .apps()
             .find(|state| state.app() == &AppType::Claude)

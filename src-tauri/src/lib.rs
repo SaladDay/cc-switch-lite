@@ -551,7 +551,12 @@ fn list_skills(
     store: State<'_, SkillStore>,
     live: State<'_, LiveConfig>,
 ) -> CommandResult<Vec<InstalledSkillSnapshot>> {
-    store.list(&live).map_err(Into::into)
+    let (skills, failures) = store.reconcile_and_list(&live)?;
+    if failures.is_empty() {
+        Ok(skills)
+    } else {
+        Err(SkillError::Recovery(failures.join("; ")).into())
+    }
 }
 
 #[tauri::command]
@@ -582,8 +587,8 @@ pub fn run() {
             let mcp_store = McpStore::open(database_path.clone())?;
             let skill_store = SkillStore::open(database_path)?;
             let live = LiveConfig::from_home(&home_dir)?;
-            match skill_store.reconcile_pending(&live) {
-                Ok(failures) => {
+            match skill_store.reconcile_and_list(&live) {
+                Ok((_, failures)) => {
                     for failure in failures {
                         eprintln!("Skill startup recovery remains pending for {failure}");
                     }
