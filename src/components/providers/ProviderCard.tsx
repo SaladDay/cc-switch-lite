@@ -1,6 +1,7 @@
 import type { Ref } from "react";
 
 import { appDefinition } from "../../lib/apps";
+import { resolveProviderIcon } from "../../lib/provider-icon";
 import type { AppId, ProviderRecord } from "../../lib/provider-types";
 import { cn } from "../../lib/utils";
 import { ProviderIcon } from "../ProviderIcon";
@@ -54,8 +55,16 @@ export function ProviderCard({
   onEdit,
   onDelete,
 }: ProviderCardProps) {
+  const providerIcon = resolveProviderIcon(
+    appId,
+    provider.icon,
+    provider.iconColor,
+  );
   const displayEndpoint = adapterAvailable
-    ? endpoint || "Default endpoint"
+    ? provider.notes?.trim() ||
+      provider.websiteUrl?.trim() ||
+      endpoint ||
+      "Default endpoint"
     : "Adapter unavailable";
   const currentAriaLabel = isAdditive
     ? `${provider.name} is in ${appDefinition(appId).label}`
@@ -81,10 +90,14 @@ export function ProviderCard({
       />
       <div className="relative flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex min-w-0 flex-1 items-center gap-2">
-          <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg border border-border bg-muted transition-transform duration-300 group-hover:scale-105">
+          <div
+            data-provider-icon={providerIcon ?? "fallback"}
+            className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg border border-border bg-muted transition-transform duration-300 group-hover:scale-105"
+          >
             <ProviderIcon
-              icon={appDefinition(appId).icon}
+              icon={providerIcon}
               name={provider.name}
+              color={provider.iconColor}
               size={20}
             />
           </div>

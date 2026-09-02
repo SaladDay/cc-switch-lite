@@ -99,6 +99,14 @@ pub struct SimpleProviderDraft {
     pub app_id: String,
     pub name: String,
     pub values: SimpleProviderValues,
+    #[serde(default)]
+    pub preset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderPresentation {
+    pub website_url: Option<String>,
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

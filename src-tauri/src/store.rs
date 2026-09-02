@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use crate::provider::{
     adapter_for_reference, is_lite_simple_editable, is_lite_writable, native_adapter_reference,
-    validate_name, AdapterReference, CurrentProvider, NativeImport, ProviderDraft, ProviderRecord,
-    BUILTIN_PLUGIN_ID,
+    validate_name, AdapterReference, CurrentProvider, NativeImport, ProviderDraft,
+    ProviderPresentation, ProviderRecord, BUILTIN_PLUGIN_ID,
 };
 #[cfg(test)]
 use crate::provider::{validate_settings, AdapterDescriptor, ProviderUpdate};
@@ -343,7 +343,16 @@ impl ProviderStore {
         Ok(Ok(created))
     }
 
+    #[cfg(test)]
     pub fn create_native(&self, draft: ProviderDraft) -> Result<ProviderRecord, StoreError> {
+        self.create_native_with_presentation(draft, ProviderPresentation::default())
+    }
+
+    pub fn create_native_with_presentation(
+        &self,
+        draft: ProviderDraft,
+        presentation: ProviderPresentation,
+    ) -> Result<ProviderRecord, StoreError> {
         let app = parse_app(&draft.app_id)?;
         if !draft.adapter.same_identity(&native_adapter_reference(&app)) {
             return Err(StoreError::InvalidProvider(
@@ -366,6 +375,22 @@ impl ProviderStore {
             },
             false,
         )?;
+        if presentation.website_url.is_some() || presentation.icon.is_some() {
+            transaction.execute(
+                "UPDATE providers SET website_url = ?1, icon = ?2
+                 WHERE id = ?3 AND app_type = ?4",
+                params![
+                    presentation.website_url,
+                    presentation.icon,
+                    created.id,
+                    app.as_str(),
+                ],
+            )?;
+        }
+        let created = self
+            .stored_provider(&transaction, &app, &created.id)?
+            .ok_or_else(|| StoreError::NotFound(created.id))?
+            .record;
         transaction.commit()?;
         Ok(created)
     }
@@ -1102,6 +1127,8 @@ impl ProviderStore {
             "record_extensions_json",
             "TEXT NOT NULL DEFAULT '{}'",
         )?;
+        ensure_column(&connection, "providers", "website_url", "TEXT")?;
+        ensure_column(&connection, "providers", "icon", "TEXT")?;
         self.verify_provider_schema(&connection)?;
         drop(connection);
 
@@ -1270,6 +1297,17 @@ impl ProviderStore {
                 })?,
             None => Map::new(),
         };
+        for (field, column) in [
+            ("websiteUrl", "website_url"),
+            ("notes", "notes"),
+            ("icon", "icon"),
+            ("iconColor", "icon_color"),
+        ] {
+            extensions.remove(field);
+            if let Ok(Some(value)) = row.get::<_, Option<String>>(column) {
+                extensions.insert(field.to_owned(), Value::String(value));
+            }
+        }
         extensions.remove("simpleValues");
         if let Ok(values) =
             builtin_app_adapter(&app).extract_simple_provider_values(&native_settings)
@@ -1856,6 +1894,50 @@ mod tests {
     }
 
     #[test]
+    fn native_creation_can_preserve_core_preset_presentation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cc-switch.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE providers (
+                    id TEXT NOT NULL,
+                    app_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    settings_config TEXT NOT NULL,
+                    category TEXT,
+                    created_at INTEGER,
+                    sort_index INTEGER,
+                    notes TEXT,
+                    icon_color TEXT,
+                    meta TEXT NOT NULL DEFAULT '{}',
+                    is_current BOOLEAN NOT NULL DEFAULT 0,
+                    in_failover_queue BOOLEAN NOT NULL DEFAULT 0,
+                    PRIMARY KEY (id, app_type)
+                );",
+            )
+            .unwrap();
+        drop(connection);
+        let store = ProviderStore::open(path).unwrap();
+
+        let created = store
+            .create_native_with_presentation(
+                draft(&AppType::Claude, "Kimi", "secret"),
+                ProviderPresentation {
+                    website_url: Some("https://platform.kimi.com".to_owned()),
+                    icon: Some("kimi".to_owned()),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            created.extensions["websiteUrl"],
+            "https://platform.kimi.com"
+        );
+        assert_eq!(created.extensions["icon"], "kimi");
+    }
+
+    #[test]
     fn initializes_only_the_compatible_provider_schema_without_claiming_a_version() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join(".cc-switch/cc-switch.db");
@@ -2032,6 +2114,10 @@ mod tests {
         let refreshed = store.list("claude").unwrap().pop().unwrap();
         assert_eq!(refreshed.category.as_deref(), Some("custom"));
         assert_eq!(refreshed.metadata["keep"], true);
+        assert_eq!(refreshed.extensions["websiteUrl"], "https://example.com");
+        assert_eq!(refreshed.extensions["notes"], "keep");
+        assert_eq!(refreshed.extensions["icon"], "anthropic");
+        assert_eq!(refreshed.extensions["iconColor"], "#123456");
         let updated = store
             .update_from(
                 "claude",

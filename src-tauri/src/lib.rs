@@ -20,7 +20,7 @@ use mcp::{McpError, McpImportReport, McpServer, McpStore};
 use provider::{
     built_in_adapters, is_lite_simple_editable, is_lite_writable, native_adapter_reference,
     native_adapters, validate_simple_provider_values, AdapterDescriptor, CurrentProvider,
-    ProviderDraft, ProviderRecord, SimpleProviderDraft, SimpleProviderUpdate,
+    ProviderDraft, ProviderPresentation, ProviderRecord, SimpleProviderDraft, SimpleProviderUpdate,
 };
 use serde::Serialize;
 use skill::{SkillError, SkillStore};
@@ -181,8 +181,27 @@ fn create_simple_provider(
             )))
         })?;
     let adapter = builtin_app_adapter(&app);
-    validate_simple_provider_values(adapter.simple_provider_form(), &provider.values)
-        .map_err(StoreError::InvalidProvider)?;
+    let form = adapter.simple_provider_form();
+    validate_simple_provider_values(form, &provider.values).map_err(StoreError::InvalidProvider)?;
+    let presentation = match provider.preset_id.as_deref() {
+        Some(preset_id) => {
+            let preset = form
+                .presets
+                .iter()
+                .find(|preset| preset.id == preset_id)
+                .ok_or_else(|| {
+                    StoreError::InvalidProvider(format!(
+                        "provider preset '{preset_id}' is not registered for '{}'",
+                        provider.app_id
+                    ))
+                })?;
+            ProviderPresentation {
+                website_url: Some(preset.website_url.to_owned()),
+                icon: Some(preset.brand_key.to_owned()),
+            }
+        }
+        None => ProviderPresentation::default(),
+    };
     let settings = adapter
         .project_simple_provider_settings(&provider.name, &provider.values, None)
         .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
@@ -192,12 +211,15 @@ fn create_simple_provider(
         )
     })?;
     let mut created = store
-        .create_native(ProviderDraft {
-            app_id: provider.app_id,
-            adapter: native_adapter_reference(&app),
-            name: provider.name,
-            settings,
-        })
+        .create_native_with_presentation(
+            ProviderDraft {
+                app_id: provider.app_id,
+                adapter: native_adapter_reference(&app),
+                name: provider.name,
+                settings,
+            },
+            presentation,
+        )
         .map_err(CommandError::from)?;
     decorate_provider(&mut created);
     Ok(created)

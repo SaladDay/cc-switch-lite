@@ -552,6 +552,7 @@ export default function App() {
           appId: activeApp,
           name: update.name,
           values: update.values,
+          ...(update.presetId ? { presetId: update.presetId } : {}),
         });
         setProviders((current) => [...current, created]);
       } else {
@@ -868,6 +869,7 @@ export default function App() {
                       onClick={() => openEditor("new")}
                       className={`ml-2 ${addActionButtonClass}`}
                       aria-label={`Add ${definition.label} provider`}
+                      title="Add new provider"
                     >
                       <Plus className="h-5 w-5" />
                     </Button>

@@ -246,10 +246,10 @@ function simpleForms(appIds: AppId[]): SimpleProviderFormDescriptor[] {
             {
               id: "kimi",
               name: "Kimi",
-              websiteUrl: "https://platform.moonshot.cn",
+              websiteUrl: "https://platform.kimi.com",
               brandKey: "kimi",
               baseUrl: "https://api.moonshot.cn/anthropic",
-              model: "kimi-k2.5",
+              model: "kimi-k2.7-code",
             },
           ]
         : [
@@ -791,12 +791,10 @@ describe("App", () => {
     await user.click(
       await screen.findByRole("button", { name: "Add Claude Code provider" }),
     );
-    const dialog = screen.getByRole("dialog", { name: "Add provider" });
+    const dialog = screen.getByRole("dialog", { name: "Add New Provider" });
     await user.type(within(dialog).getByLabelText("Provider name"), "Work");
     await user.type(within(dialog).getByLabelText("API key"), "secret");
-    await user.click(
-      within(dialog).getByRole("button", { name: "Save provider" }),
-    );
+    await user.click(within(dialog).getByRole("button", { name: "Add" }));
 
     await waitFor(() =>
       expect(api.createSimple).toHaveBeenCalledWith({
@@ -819,7 +817,7 @@ describe("App", () => {
     );
     expect(screen.getByText("Provider preset")).toBeVisible();
     expect(screen.getByLabelText("API key")).toBeVisible();
-    expect(screen.getByText(/Anthropic Messages/)).toBeVisible();
+    expect(screen.queryByLabelText(/Protocol/)).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Adapter")).not.toBeInTheDocument();
     expect(
       screen.queryByLabelText("Configuration JSON"),
@@ -828,12 +826,13 @@ describe("App", () => {
 
   it("fills public preset values without replacing an entered API key", async () => {
     const user = userEvent.setup();
+    api.createSimple.mockResolvedValue(workProvider);
     render(<App />);
 
     await user.click(
       await screen.findByRole("button", { name: "Add Claude Code provider" }),
     );
-    const dialog = screen.getByRole("dialog", { name: "Add provider" });
+    const dialog = screen.getByRole("dialog", { name: "Add New Provider" });
     await user.type(within(dialog).getByLabelText("API key"), "private-key");
     await user.click(within(dialog).getByRole("button", { name: "Kimi" }));
 
@@ -843,6 +842,19 @@ describe("App", () => {
     );
     expect(within(dialog).getByLabelText("API key")).toHaveValue("private-key");
     expect(within(dialog).queryByLabelText(/Protocol/)).not.toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Add" }));
+    await waitFor(() =>
+      expect(api.createSimple).toHaveBeenCalledWith({
+        appId: "claude",
+        name: "Kimi",
+        presetId: "kimi",
+        values: {
+          baseUrl: "https://api.moonshot.cn/anthropic",
+          apiKey: "private-key",
+          model: "kimi-k2.7-code",
+        },
+      }),
+    );
   });
 
   it("keeps an existing Grok environment credential when the API key is empty", async () => {
@@ -870,14 +882,12 @@ describe("App", () => {
     await user.click(
       await screen.findByRole("button", { name: "Edit Grok environment" }),
     );
-    const dialog = screen.getByRole("dialog", { name: "Edit provider" });
+    const dialog = screen.getByRole("dialog", { name: "Edit Provider" });
     expect(within(dialog).getByLabelText(/^API key/)).not.toBeRequired();
     expect(
       within(dialog).getByText(/keep the existing environment credential/i),
     ).toBeVisible();
-    await user.click(
-      within(dialog).getByRole("button", { name: "Save provider" }),
-    );
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
 
     await waitFor(() =>
       expect(api.updateSimple).toHaveBeenCalledWith("grokbuild", "grok-env", {
@@ -903,15 +913,14 @@ describe("App", () => {
     render(<App />);
 
     await user.click(await screen.findByRole("button", { name: "Edit Work" }));
-    const editDialog = screen.getByRole("dialog", { name: "Edit provider" });
+    const editDialog = screen.getByRole("dialog", { name: "Edit Provider" });
+    expect(within(editDialog).queryByText("Provider preset")).toBeNull();
     await user.clear(within(editDialog).getByLabelText("Provider name"));
     await user.type(
       within(editDialog).getByLabelText("Provider name"),
       "Primary",
     );
-    await user.click(
-      within(editDialog).getByRole("button", { name: "Save provider" }),
-    );
+    await user.click(within(editDialog).getByRole("button", { name: "Save" }));
 
     expect(
       await screen.findByRole("heading", { name: "Primary" }),
@@ -977,12 +986,10 @@ describe("App", () => {
       }),
     ).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "Edit Work" }));
-    const dialog = screen.getByRole("dialog", { name: "Edit provider" });
+    const dialog = screen.getByRole("dialog", { name: "Edit Provider" });
     await user.clear(within(dialog).getByLabelText("Provider name"));
     await user.type(within(dialog).getByLabelText("Provider name"), "Primary");
-    await user.click(
-      within(dialog).getByRole("button", { name: "Save provider" }),
-    );
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
 
     expect(
       await screen.findByRole("button", { name: "Switch to Primary" }),
@@ -1041,6 +1048,90 @@ describe("App", () => {
     expect(screen.getByRole("status")).toHaveTextContent(
       "Work is now the Claude Code user default. Project, local, or managed settings can override it.",
     );
+  });
+
+  it("searches provider presentation fields with the full-app shortcut", async () => {
+    const user = userEvent.setup();
+    const docsProvider: ProviderRecord = {
+      ...workProvider,
+      id: "provider-2",
+      name: "Reference",
+      notes: "Documentation account",
+      websiteUrl: "https://docs.example.com",
+      icon: "deepseek",
+      iconColor: "#4D6BFE",
+    };
+    api.list.mockResolvedValue([workProvider, docsProvider]);
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Work" });
+    await user.keyboard("{Control>}f{/Control}");
+    const search = screen.getByRole("textbox", { name: "Search providers" });
+    await waitFor(() => expect(search).toHaveFocus());
+    await user.type(search, "documentation");
+
+    expect(screen.queryByRole("heading", { name: "Work" })).toBeNull();
+    const reference = screen.getByRole("heading", { name: "Reference" });
+    expect(reference).toBeVisible();
+    expect(
+      reference
+        .closest(".group")
+        ?.querySelector('[data-provider-icon="deepseek"] path[fill="#4D6BFE"]'),
+    ).not.toBeNull();
+  });
+
+  it("does not open provider search while a form field owns Cmd/Ctrl+F", async () => {
+    const user = userEvent.setup();
+    api.list.mockResolvedValue([workProvider]);
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Edit Work" }));
+    const name = screen.getByLabelText("Provider name");
+    name.focus();
+    await user.keyboard("{Control>}f{/Control}");
+
+    expect(
+      screen.queryByRole("textbox", { name: "Search providers" }),
+    ).toBeNull();
+  });
+
+  it("keeps provider search closed behind a modal button", async () => {
+    const user = userEvent.setup();
+    api.list.mockResolvedValue([workProvider]);
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Edit Work" }));
+    const close = screen.getByRole("button", { name: "Close provider dialog" });
+    close.focus();
+    await user.keyboard("{Control>}f{/Control}");
+    await user.click(close);
+
+    expect(
+      screen.queryByRole("textbox", { name: "Search providers" }),
+    ).toBeNull();
+  });
+
+  it("clears provider filtering and restores focus when search closes", async () => {
+    const user = userEvent.setup();
+    const second = { ...workProvider, id: "provider-2", name: "Reference" };
+    api.list.mockResolvedValue([workProvider, second]);
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Edit Work" });
+    const settings = screen.getByRole("button", { name: "Open settings" });
+    settings.focus();
+    await user.keyboard("{Control>}f{/Control}");
+    const search = screen.getByRole("textbox", { name: "Search providers" });
+    await user.type(search, "missing");
+    expect(screen.getByText("No providers match your search.")).toBeVisible();
+    await user.keyboard("{Escape}");
+
+    await waitFor(() => expect(settings).toHaveFocus());
+    expect(
+      screen.queryByRole("textbox", { name: "Search providers" }),
+    ).toBeNull();
+    expect(screen.getByRole("heading", { name: "Work" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Reference" })).toBeVisible();
   });
 
   it("does not mark a different provider revision as current", async () => {
@@ -1191,7 +1282,7 @@ describe("App", () => {
     );
     await user.type(screen.getByLabelText("API key"), "secret");
     await user.type(screen.getByLabelText(/Model/), "gemini-test");
-    await user.click(screen.getByRole("button", { name: "Save provider" }));
+    await user.click(screen.getByRole("button", { name: "Add" }));
 
     await waitFor(() =>
       expect(api.createSimple).toHaveBeenCalledWith({
@@ -1323,12 +1414,10 @@ describe("App", () => {
     });
     await user.click(trigger);
     const providerDialog = screen.getByRole("dialog", {
-      name: "Add provider",
+      name: "Add New Provider",
     });
     expect(providerDialog).toHaveAttribute("aria-modal", "true");
-    expect(providerDialog).toHaveAccessibleDescription(
-      /Simple direct configuration · Anthropic Messages/,
-    );
+    expect(providerDialog).not.toHaveAttribute("aria-describedby");
     expect(document.querySelector("header")).toHaveAttribute("inert");
     expect(document.querySelector("main")).toHaveAttribute(
       "aria-hidden",
@@ -1339,7 +1428,7 @@ describe("App", () => {
 
     await waitFor(() =>
       expect(
-        screen.queryByRole("dialog", { name: "Add provider" }),
+        screen.queryByRole("dialog", { name: "Add New Provider" }),
       ).not.toBeInTheDocument(),
     );
     expect(document.querySelector("header")).not.toHaveAttribute("inert");

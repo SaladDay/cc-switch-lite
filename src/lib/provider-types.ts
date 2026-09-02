@@ -26,6 +26,10 @@ export interface ProviderRecord {
   appId: string;
   adapter: AdapterReference;
   name: string;
+  websiteUrl?: string;
+  notes?: string;
+  icon?: string;
+  iconColor?: string;
   settings: Record<string, JsonValue>;
   liteConfigWritable?: boolean;
   liteSimpleEditable?: boolean;
@@ -95,12 +99,14 @@ export interface SimpleProviderValues {
 export interface ProviderChanges {
   name: string;
   values: SimpleProviderValues;
+  presetId?: string;
 }
 
 export interface SimpleProviderDraft {
   appId: string;
   name: string;
   values: SimpleProviderValues;
+  presetId?: string;
 }
 
 export interface SimpleProviderUpdate {
