@@ -1,27 +1,29 @@
-use std::{collections::HashSet, fmt, path::PathBuf, time::Duration};
+use std::{collections::HashSet, fmt, path::PathBuf};
 
 use cc_switch_core::{
     builtin_app_adapter, builtin_app_registry, mcp_servers_equivalent, validate_mcp_server,
     validate_mcp_server_for_app, AppCapability, AppType, McpNativeSnapshot,
 };
+use cc_switch_store::{
+    read_mcp_server_row, read_mcp_server_rows, McpServerRow as SharedMcpServerRow, SharedDatabase,
+    SharedStoreError,
+};
 use hmac::{Hmac, Mac};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use thiserror::Error;
 use uuid::Uuid;
 
-const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SAFE_JS_INTEGER_MASK: u64 = (1_u64 << 53) - 1;
-const MCP_SELECT: &str = "SELECT id, name, server_config, description, homepage, docs, tags,
-    enabled_claude, enabled_codex, enabled_gemini, enabled_grokbuild, enabled_opencode,
-    enabled_hermes FROM mcp_servers";
 
 #[derive(Debug, Error)]
 pub enum McpError {
     #[error("shared MCP database failed: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error(transparent)]
+    SharedStore(SharedStoreError),
     #[error("shared MCP data is invalid: {0}")]
     InvalidStore(String),
     #[error("MCP server is invalid: {0}")]
@@ -37,12 +39,22 @@ pub enum McpError {
 impl McpError {
     pub fn code(&self) -> &'static str {
         match self {
-            Self::Database(_) => "storage_error",
+            Self::Database(_) | Self::SharedStore(_) => "storage_error",
             Self::InvalidStore(_) => "invalid_store",
             Self::InvalidServer(_) => "invalid_mcp_server",
             Self::NotFound(_) => "not_found",
             Self::Conflict => "conflict",
             Self::Recovery(_) => "recovery_failed",
+        }
+    }
+}
+
+impl From<SharedStoreError> for McpError {
+    fn from(error: SharedStoreError) -> Self {
+        match error {
+            SharedStoreError::Database(error) => Self::Database(error),
+            SharedStoreError::InvalidDatabase(message) => Self::InvalidStore(message),
+            other => Self::SharedStore(other),
         }
     }
 }
@@ -190,14 +202,14 @@ pub struct McpImportReport {
 pub type McpImportsByApp = Vec<(AppType, Result<Vec<cc_switch_core::McpImport>, String>)>;
 
 pub struct McpStore {
-    path: PathBuf,
+    database: SharedDatabase,
     revision_key: [u8; 16],
 }
 
 impl McpStore {
     pub fn open(path: PathBuf) -> Result<Self, McpError> {
         let store = Self {
-            path,
+            database: SharedDatabase::open(path)?,
             revision_key: *Uuid::new_v4().as_bytes(),
         };
         store.initialize()?;
@@ -206,14 +218,10 @@ impl McpStore {
 
     pub fn list(&self) -> Result<Vec<McpServer>, McpError> {
         let connection = self.connect()?;
-        let mut statement = connection.prepare(&format!("{MCP_SELECT} ORDER BY name, id"))?;
-        let rows = statement.query_map([], row_to_server)?;
-        rows.map(|row| {
-            let mut server = row.map_err(McpError::from)?;
-            server.revision = server_revision(&server, &self.revision_key)?;
-            Ok(server)
-        })
-        .collect()
+        read_mcp_server_rows(&connection)?
+            .into_iter()
+            .map(|row| row_to_server(row, &self.revision_key))
+            .collect()
     }
 
     pub fn upsert_with_live<T, E>(
@@ -358,24 +366,10 @@ impl McpStore {
     }
 
     fn initialize(&self) -> Result<(), McpError> {
+        self.database.ensure_mcp_server_schema()?;
         let connection = self.connect()?;
         connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS mcp_servers (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                server_config TEXT NOT NULL,
-                description TEXT,
-                homepage TEXT,
-                docs TEXT,
-                tags TEXT NOT NULL DEFAULT '[]',
-                enabled_claude BOOLEAN NOT NULL DEFAULT 0,
-                enabled_codex BOOLEAN NOT NULL DEFAULT 0,
-                enabled_gemini BOOLEAN NOT NULL DEFAULT 0,
-                enabled_grokbuild BOOLEAN NOT NULL DEFAULT 0,
-                enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
-                enabled_hermes BOOLEAN NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS mcp_native_links (
+            "CREATE TABLE IF NOT EXISTS mcp_native_links (
                 server_id TEXT NOT NULL,
                 app_id TEXT NOT NULL,
                 native_snapshot TEXT,
@@ -386,33 +380,11 @@ impl McpStore {
                 SELECT 1 FROM mcp_servers WHERE mcp_servers.id = mcp_native_links.server_id
              );",
         )?;
-        for (column, definition) in [
-            ("description", "TEXT"),
-            ("homepage", "TEXT"),
-            ("docs", "TEXT"),
-            ("tags", "TEXT NOT NULL DEFAULT '[]'"),
-            ("enabled_claude", "BOOLEAN NOT NULL DEFAULT 0"),
-            ("enabled_codex", "BOOLEAN NOT NULL DEFAULT 0"),
-            ("enabled_gemini", "BOOLEAN NOT NULL DEFAULT 0"),
-            ("enabled_grokbuild", "BOOLEAN NOT NULL DEFAULT 0"),
-            ("enabled_opencode", "BOOLEAN NOT NULL DEFAULT 0"),
-            ("enabled_hermes", "BOOLEAN NOT NULL DEFAULT 0"),
-        ] {
-            ensure_column(&connection, column, definition)?;
-        }
-        verify_schema(&connection)
+        verify_native_link_schema(&connection)
     }
 
     fn connect(&self) -> Result<Connection, McpError> {
-        let connection = Connection::open_with_flags(
-            &self.path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "foreign_keys", true)?;
-        Ok(connection)
+        self.database.connect().map_err(McpError::from)
     }
 }
 
@@ -495,31 +467,30 @@ fn merge_imports(
     Ok(report)
 }
 
-fn row_to_server(row: &Row<'_>) -> rusqlite::Result<McpServer> {
-    let raw_server: String = row.get(2)?;
-    let raw_tags: String = row.get(6)?;
-    let server = serde_json::from_str(&raw_server).map_err(|error| {
+fn row_to_server(row: SharedMcpServerRow, revision_key: &[u8; 16]) -> Result<McpServer, McpError> {
+    let server = serde_json::from_str(&row.server_config).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
     })?;
-    let tags = serde_json::from_str(&raw_tags).map_err(|error| {
+    let tags = serde_json::from_str(&row.tags).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
     })?;
+    let revision = server_revision(row.source_fingerprint(), revision_key);
     Ok(McpServer {
-        id: row.get(0)?,
-        name: row.get(1)?,
+        id: row.id,
+        name: row.name,
         server,
-        description: row.get(3)?,
-        homepage: row.get(4)?,
-        docs: row.get(5)?,
+        description: row.description,
+        homepage: row.homepage,
+        docs: row.docs,
         tags,
-        revision: 0,
+        revision,
         apps: McpApps {
-            claude: row.get(7)?,
-            codex: row.get(8)?,
-            gemini: row.get(9)?,
-            grokbuild: row.get(10)?,
-            opencode: row.get(11)?,
-            hermes: row.get(12)?,
+            claude: row.enabled_claude != 0,
+            codex: row.enabled_codex != 0,
+            gemini: row.enabled_gemini != 0,
+            grokbuild: row.enabled_grokbuild != 0,
+            opencode: row.enabled_opencode != 0,
+            hermes: row.enabled_hermes != 0,
         },
     })
 }
@@ -529,14 +500,9 @@ fn get_server(
     id: &str,
     revision_key: &[u8; 16],
 ) -> Result<Option<McpServer>, McpError> {
-    let mut server = connection
-        .query_row(&format!("{MCP_SELECT} WHERE id = ?1"), [id], row_to_server)
-        .optional()
-        .map_err(McpError::from)?;
-    if let Some(server) = &mut server {
-        server.revision = server_revision(server, revision_key)?;
-    }
-    Ok(server)
+    read_mcp_server_row(connection, id)?
+        .map(|row| row_to_server(row, revision_key))
+        .transpose()
 }
 
 fn ensure_expected_revision(
@@ -550,23 +516,12 @@ fn ensure_expected_revision(
     }
 }
 
-fn server_revision(server: &McpServer, key: &[u8; 16]) -> Result<u64, McpError> {
-    let snapshot = serde_json::to_vec(&(
-        &server.id,
-        &server.name,
-        &server.server,
-        &server.apps,
-        &server.description,
-        &server.homepage,
-        &server.docs,
-        &server.tags,
-    ))
-    .map_err(|error| McpError::InvalidStore(error.to_string()))?;
+fn server_revision(source_fingerprint: &[u8; 32], key: &[u8; 16]) -> u64 {
     let mut hasher = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts a 16-byte key");
-    hasher.update(&snapshot);
+    hasher.update(source_fingerprint);
     let bytes = hasher.finalize().into_bytes();
     let revision = u64::from_be_bytes(bytes[..8].try_into().expect("SHA-256 has eight bytes"));
-    Ok((revision & SAFE_JS_INTEGER_MASK).max(1))
+    (revision & SAFE_JS_INTEGER_MASK).max(1)
 }
 
 fn save_server(connection: &Connection, server: &McpServer) -> Result<(), McpError> {
@@ -838,46 +793,7 @@ fn recover_on_failure<T>(
     Ok(())
 }
 
-fn ensure_column(connection: &Connection, column: &str, definition: &str) -> Result<(), McpError> {
-    let mut statement = connection.prepare("PRAGMA table_info(mcp_servers)")?;
-    let exists = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<HashSet<_>, _>>()?
-        .contains(column);
-    if !exists {
-        connection.execute_batch(&format!(
-            "ALTER TABLE mcp_servers ADD COLUMN {column} {definition}"
-        ))?;
-    }
-    Ok(())
-}
-
-fn verify_schema(connection: &Connection) -> Result<(), McpError> {
-    let mut statement = connection.prepare("PRAGMA table_info(mcp_servers)")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<HashSet<_>, _>>()?;
-    for required in [
-        "id",
-        "name",
-        "server_config",
-        "description",
-        "homepage",
-        "docs",
-        "tags",
-        "enabled_claude",
-        "enabled_codex",
-        "enabled_gemini",
-        "enabled_grokbuild",
-        "enabled_opencode",
-        "enabled_hermes",
-    ] {
-        if !columns.contains(required) {
-            return Err(McpError::InvalidStore(format!(
-                "mcp_servers is missing required column '{required}'"
-            )));
-        }
-    }
+fn verify_native_link_schema(connection: &Connection) -> Result<(), McpError> {
     let mut statement = connection.prepare("PRAGMA table_info(mcp_native_links)")?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))?
@@ -1014,6 +930,47 @@ mod tests {
         let current = store.list().unwrap().remove(0);
         assert_eq!(current.name, "Context7");
         assert!(current.apps.codex);
+    }
+
+    #[test]
+    fn external_extension_edit_rejects_a_stale_update() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cc-switch.db");
+        let store = McpStore::open(path.clone()).unwrap();
+        store
+            .upsert_with_live(server(), |_| Ok::<_, ()>(()), |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE mcp_servers ADD COLUMN host_extension TEXT;
+                 UPDATE mcp_servers SET host_extension = 'first' WHERE id = 'context7';",
+            )
+            .unwrap();
+        let mut stale = store.list().unwrap().remove(0);
+        Connection::open(path)
+            .unwrap()
+            .execute(
+                "UPDATE mcp_servers SET host_extension = 'second' WHERE id = 'context7'",
+                [],
+            )
+            .unwrap();
+        stale.name = "Stale edit".to_owned();
+        let applied = std::cell::Cell::new(false);
+
+        let result = store.upsert_with_live(
+            stale,
+            |_| {
+                applied.set(true);
+                Ok::<_, ()>(())
+            },
+            |_| Ok(()),
+        );
+
+        assert!(matches!(result, Err(McpError::Conflict)));
+        assert!(!applied.get());
+        assert_eq!(store.list().unwrap().remove(0).name, "Context7");
     }
 
     #[test]
