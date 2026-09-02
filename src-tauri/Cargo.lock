@@ -279,7 +279,7 @@ dependencies = [
 [[package]]
 name = "cc-switch-core"
 version = "0.1.0"
-source = "git+https://github.com/SaladDay/cc-switch-core?rev=465a55e8be25ba6dc030c41122b75e66bdd6a58b#465a55e8be25ba6dc030c41122b75e66bdd6a58b"
+source = "git+https://github.com/SaladDay/cc-switch-core?rev=fef203a9feade13874f33b84743948fbd3f646c9#fef203a9feade13874f33b84743948fbd3f646c9"
 dependencies = [
  "http",
  "json-five",
