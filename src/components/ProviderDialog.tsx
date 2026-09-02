@@ -69,31 +69,45 @@ export function ProviderDialog({
   const [name, setName] = useState(provider?.name ?? "");
   const [values, setValues] = useState(() => initialValues(provider));
   const [selectedPresetId, setSelectedPresetId] = useState("custom");
-  const title = provider ? "Edit provider" : "Add provider";
+  const title = provider ? "Edit Provider" : "Add New Provider";
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    onSave({ name, values });
+    onSave({
+      name,
+      values,
+      ...(!provider && selectedPresetId !== "custom"
+        ? { presetId: selectedPresetId }
+        : {}),
+    });
   };
 
   return (
     <FullScreenPanel
       title={title}
       titleId="provider-dialog-title"
-      description={
-        form.protocolLocked
-          ? "Simple direct configuration · Anthropic Messages"
-          : "Simple direct provider configuration"
-      }
       closeLabel="Close provider dialog"
       busy={busy}
       onClose={onCancel}
-      contentClassName="pt-3"
+      contentClassName={provider ? undefined : "pt-3"}
       footer={
         <>
-          <Button variant="outline" onClick={onCancel} disabled={busy}>
-            Cancel
-          </Button>
+          {!provider && (
+            <>
+              <span className="mr-auto min-w-0 truncate text-xs text-muted-foreground">
+                💡 After choosing a preset, fill in the fields below (e.g. API
+                Key)
+              </span>
+              <Button
+                variant="outline"
+                onClick={onCancel}
+                disabled={busy}
+                className="border-border/20 hover:bg-accent hover:text-accent-foreground"
+              >
+                Cancel
+              </Button>
+            </>
+          )}
           <Button
             type="submit"
             form="provider-form"
@@ -107,7 +121,7 @@ export function ProviderDialog({
             ) : (
               <Plus className="mr-2 h-4 w-4" />
             )}
-            {busy ? "Saving…" : "Save provider"}
+            {busy ? "Saving…" : provider ? "Save" : "Add"}
           </Button>
         </>
       }
@@ -117,20 +131,22 @@ export function ProviderDialog({
         onSubmit={submit}
         className="glass space-y-6 rounded-xl border border-white/10 p-6"
       >
-        <SimpleProviderPresetSelector
-          presets={form.presets}
-          selectedId={selectedPresetId}
-          onSelect={(preset) => {
-            setSelectedPresetId(preset?.id ?? "custom");
-            if (!preset) return;
-            setName(preset.name);
-            setValues((current) => ({
-              baseUrl: preset.baseUrl,
-              apiKey: current.apiKey,
-              model: preset.model,
-            }));
-          }}
-        />
+        {!provider && (
+          <SimpleProviderPresetSelector
+            presets={form.presets}
+            selectedId={selectedPresetId}
+            onSelect={(preset) => {
+              setSelectedPresetId(preset?.id ?? "custom");
+              if (!preset) return;
+              setName(preset.name);
+              setValues((current) => ({
+                baseUrl: preset.baseUrl,
+                apiKey: current.apiKey,
+                model: preset.model,
+              }));
+            }}
+          />
+        )}
 
         <label className="block space-y-2 text-sm font-medium">
           <span>Provider name</span>

@@ -246,10 +246,10 @@ function simpleForms(appIds: AppId[]): SimpleProviderFormDescriptor[] {
             {
               id: "kimi",
               name: "Kimi",
-              websiteUrl: "https://platform.moonshot.cn",
+              websiteUrl: "https://platform.kimi.com",
               brandKey: "kimi",
               baseUrl: "https://api.moonshot.cn/anthropic",
-              model: "kimi-k2.5",
+              model: "kimi-k2.7-code",
             },
           ]
         : [
@@ -337,18 +337,25 @@ describe("App", () => {
       name: "Add your first Claude Code provider",
     });
     await user.click(screen.getByRole("button", { name: "Manage Skills" }));
-    expect(screen.getByRole("heading", { name: "Skills" })).toBeVisible();
     expect(
-      await screen.findByRole("heading", { name: "No installed Skills" }),
+      screen.getByRole("heading", { name: "Skills Management" }),
     ).toBeVisible();
+    expect(
+      await screen.findByRole("heading", { name: "No skills installed" }),
+    ).toBeVisible();
+    expect(screen.getByText("0 installed")).toBeVisible();
+    expect(screen.queryByRole("button", { name: /discover/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /install/i })).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Back to providers" }));
     await user.click(
       screen.getByRole("button", { name: "Manage MCP servers" }),
     );
-    expect(screen.getByRole("heading", { name: "MCP Servers" })).toBeVisible();
     expect(
-      await screen.findByRole("heading", { name: "No MCP servers" }),
+      screen.getByRole("heading", { name: "MCP Server Management" }),
+    ).toBeVisible();
+    expect(
+      await screen.findByRole("heading", { name: "No servers yet" }),
     ).toBeVisible();
   });
 
@@ -362,6 +369,7 @@ describe("App", () => {
     });
     await user.click(screen.getByRole("button", { name: "Manage Skills" }));
     expect(await screen.findByText("Demo Skill")).toBeVisible();
+    expect(screen.getByText("1 installed")).toBeVisible();
 
     const claude = screen.getByRole("button", {
       name: "Disable Demo Skill for Claude Code",
@@ -395,7 +403,7 @@ describe("App", () => {
     await waitFor(() => expect(add).toBeDisabled());
     await user.click(add);
     expect(
-      screen.queryByRole("heading", { name: "Add MCP server" }),
+      screen.queryByRole("heading", { name: "Add MCP" }),
     ).not.toBeInTheDocument();
 
     initial.resolve([]);
@@ -421,6 +429,11 @@ describe("App", () => {
       screen.getByRole("button", { name: "Manage MCP servers" }),
     );
     expect(await screen.findByText("Context7")).toBeVisible();
+    expect(
+      screen
+        .getByRole("button", { name: "Edit Context7" })
+        .closest(".hover-reveal-actions"),
+    ).toBeInTheDocument();
 
     await user.click(
       screen.getByRole("button", { name: "Enable Context7 for Codex" }),
@@ -429,9 +442,21 @@ describe("App", () => {
       expect(mcp.toggle).toHaveBeenCalledWith("context7", "codex", true, 1),
     );
     await waitFor(() => expect(mcp.list).toHaveBeenCalledTimes(2));
-    expect(
-      screen.getByRole("button", { name: "Disable Context7 for Codex" }),
-    ).toHaveAttribute("aria-pressed", "true");
+    const codex = screen.getByRole("button", {
+      name: "Disable Context7 for Codex",
+    });
+    expect(codex).toHaveAttribute("aria-pressed", "true");
+    expect(codex).toHaveClass("bg-green-500/10");
+    expect(screen.getByText("1 MCP server configured")).toBeVisible();
+
+    const search = screen.getByRole("textbox", {
+      name: "Search managed MCP servers",
+    });
+    await user.type(search, "missing");
+    expect(screen.getByText("No MCP servers match your search")).toBeVisible();
+    await user.keyboard("{Escape}");
+    expect(search).toHaveValue("");
+    expect(screen.getByText("Context7")).toBeVisible();
   });
 
   it("adds an MCP preset without exposing a raw configuration editor", async () => {
@@ -444,15 +469,23 @@ describe("App", () => {
     await user.click(
       screen.getByRole("button", { name: "Manage MCP servers" }),
     );
-    await screen.findByRole("heading", { name: "No MCP servers" });
+    await screen.findByRole("heading", { name: "No servers yet" });
     await user.click(screen.getByRole("button", { name: "Add MCP" }));
-    expect(
-      screen.getByRole("heading", { name: "Add MCP server" }),
-    ).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Add MCP" })).toBeVisible();
     expect(screen.queryByText("JSON configuration")).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "context7" }));
-    await user.click(screen.getByRole("button", { name: "Add server" }));
+    expect(screen.getByRole("button", { name: "Custom" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByRole("button", { name: "stdio" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    const preset = screen.getByRole("button", { name: "context7" });
+    await user.click(preset);
+    expect(preset).toHaveAttribute("aria-pressed", "true");
+    await user.click(screen.getByRole("button", { name: "Add" }));
     await waitFor(() => expect(mcp.upsert).toHaveBeenCalledTimes(1));
     expect(mcp.upsert.mock.calls[0][0]).toMatchObject({
       id: "context7",
@@ -528,7 +561,9 @@ describe("App", () => {
     expect(
       screen.getByRole("button", { name: "Add Claude Code provider" }),
     ).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Edit Work" })).toBeEnabled();
+    const editButton = screen.getByRole("button", { name: "Edit Work" });
+    expect(editButton).toBeEnabled();
+    expect(editButton.closest(".hover-reveal-actions")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Delete Work" })).toBeEnabled();
     expect(
       screen.getByRole("button", {
@@ -610,7 +645,7 @@ describe("App", () => {
       "catalog unavailable",
     );
     expect(
-      screen.queryByRole("heading", { name: "MCP Servers" }),
+      screen.queryByRole("heading", { name: "MCP Server Management" }),
     ).not.toBeInTheDocument();
     expect(
       screen.queryByLabelText("MCP Servers placeholder"),
@@ -791,12 +826,10 @@ describe("App", () => {
     await user.click(
       await screen.findByRole("button", { name: "Add Claude Code provider" }),
     );
-    const dialog = screen.getByRole("dialog", { name: "Add provider" });
+    const dialog = screen.getByRole("dialog", { name: "Add New Provider" });
     await user.type(within(dialog).getByLabelText("Provider name"), "Work");
     await user.type(within(dialog).getByLabelText("API key"), "secret");
-    await user.click(
-      within(dialog).getByRole("button", { name: "Save provider" }),
-    );
+    await user.click(within(dialog).getByRole("button", { name: "Add" }));
 
     await waitFor(() =>
       expect(api.createSimple).toHaveBeenCalledWith({
@@ -819,7 +852,7 @@ describe("App", () => {
     );
     expect(screen.getByText("Provider preset")).toBeVisible();
     expect(screen.getByLabelText("API key")).toBeVisible();
-    expect(screen.getByText(/Anthropic Messages/)).toBeVisible();
+    expect(screen.queryByLabelText(/Protocol/)).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Adapter")).not.toBeInTheDocument();
     expect(
       screen.queryByLabelText("Configuration JSON"),
@@ -828,14 +861,21 @@ describe("App", () => {
 
   it("fills public preset values without replacing an entered API key", async () => {
     const user = userEvent.setup();
+    api.createSimple.mockResolvedValue(workProvider);
     render(<App />);
 
     await user.click(
       await screen.findByRole("button", { name: "Add Claude Code provider" }),
     );
-    const dialog = screen.getByRole("dialog", { name: "Add provider" });
+    const dialog = screen.getByRole("dialog", { name: "Add New Provider" });
     await user.type(within(dialog).getByLabelText("API key"), "private-key");
-    await user.click(within(dialog).getByRole("button", { name: "Kimi" }));
+    const customPreset = within(dialog).getByRole("button", { name: "Custom" });
+    const kimiPreset = within(dialog).getByRole("button", { name: "Kimi" });
+    expect(customPreset).toHaveAttribute("aria-pressed", "true");
+    await user.click(kimiPreset);
+    expect(customPreset).toHaveAttribute("aria-pressed", "false");
+    expect(kimiPreset).toHaveAttribute("aria-pressed", "true");
+    expect(kimiPreset).toHaveClass("bg-blue-600");
 
     expect(within(dialog).getByLabelText("Provider name")).toHaveValue("Kimi");
     expect(within(dialog).getByLabelText(/Base URL/)).toHaveValue(
@@ -843,6 +883,19 @@ describe("App", () => {
     );
     expect(within(dialog).getByLabelText("API key")).toHaveValue("private-key");
     expect(within(dialog).queryByLabelText(/Protocol/)).not.toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Add" }));
+    await waitFor(() =>
+      expect(api.createSimple).toHaveBeenCalledWith({
+        appId: "claude",
+        name: "Kimi",
+        presetId: "kimi",
+        values: {
+          baseUrl: "https://api.moonshot.cn/anthropic",
+          apiKey: "private-key",
+          model: "kimi-k2.7-code",
+        },
+      }),
+    );
   });
 
   it("keeps an existing Grok environment credential when the API key is empty", async () => {
@@ -870,14 +923,12 @@ describe("App", () => {
     await user.click(
       await screen.findByRole("button", { name: "Edit Grok environment" }),
     );
-    const dialog = screen.getByRole("dialog", { name: "Edit provider" });
+    const dialog = screen.getByRole("dialog", { name: "Edit Provider" });
     expect(within(dialog).getByLabelText(/^API key/)).not.toBeRequired();
     expect(
       within(dialog).getByText(/keep the existing environment credential/i),
     ).toBeVisible();
-    await user.click(
-      within(dialog).getByRole("button", { name: "Save provider" }),
-    );
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
 
     await waitFor(() =>
       expect(api.updateSimple).toHaveBeenCalledWith("grokbuild", "grok-env", {
@@ -903,15 +954,14 @@ describe("App", () => {
     render(<App />);
 
     await user.click(await screen.findByRole("button", { name: "Edit Work" }));
-    const editDialog = screen.getByRole("dialog", { name: "Edit provider" });
+    const editDialog = screen.getByRole("dialog", { name: "Edit Provider" });
+    expect(within(editDialog).queryByText("Provider preset")).toBeNull();
     await user.clear(within(editDialog).getByLabelText("Provider name"));
     await user.type(
       within(editDialog).getByLabelText("Provider name"),
       "Primary",
     );
-    await user.click(
-      within(editDialog).getByRole("button", { name: "Save provider" }),
-    );
+    await user.click(within(editDialog).getByRole("button", { name: "Save" }));
 
     expect(
       await screen.findByRole("heading", { name: "Primary" }),
@@ -977,12 +1027,10 @@ describe("App", () => {
       }),
     ).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "Edit Work" }));
-    const dialog = screen.getByRole("dialog", { name: "Edit provider" });
+    const dialog = screen.getByRole("dialog", { name: "Edit Provider" });
     await user.clear(within(dialog).getByLabelText("Provider name"));
     await user.type(within(dialog).getByLabelText("Provider name"), "Primary");
-    await user.click(
-      within(dialog).getByRole("button", { name: "Save provider" }),
-    );
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
 
     expect(
       await screen.findByRole("button", { name: "Switch to Primary" }),
@@ -1041,6 +1089,90 @@ describe("App", () => {
     expect(screen.getByRole("status")).toHaveTextContent(
       "Work is now the Claude Code user default. Project, local, or managed settings can override it.",
     );
+  });
+
+  it("searches provider presentation fields with the full-app shortcut", async () => {
+    const user = userEvent.setup();
+    const docsProvider: ProviderRecord = {
+      ...workProvider,
+      id: "provider-2",
+      name: "Reference",
+      notes: "Documentation account",
+      websiteUrl: "https://docs.example.com",
+      icon: "deepseek",
+      iconColor: "#4D6BFE",
+    };
+    api.list.mockResolvedValue([workProvider, docsProvider]);
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Work" });
+    await user.keyboard("{Control>}f{/Control}");
+    const search = screen.getByRole("textbox", { name: "Search providers" });
+    await waitFor(() => expect(search).toHaveFocus());
+    await user.type(search, "documentation");
+
+    expect(screen.queryByRole("heading", { name: "Work" })).toBeNull();
+    const reference = screen.getByRole("heading", { name: "Reference" });
+    expect(reference).toBeVisible();
+    expect(
+      reference
+        .closest(".group")
+        ?.querySelector('[data-provider-icon="deepseek"] path[fill="#4D6BFE"]'),
+    ).not.toBeNull();
+  });
+
+  it("does not open provider search while a form field owns Cmd/Ctrl+F", async () => {
+    const user = userEvent.setup();
+    api.list.mockResolvedValue([workProvider]);
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Edit Work" }));
+    const name = screen.getByLabelText("Provider name");
+    name.focus();
+    await user.keyboard("{Control>}f{/Control}");
+
+    expect(
+      screen.queryByRole("textbox", { name: "Search providers" }),
+    ).toBeNull();
+  });
+
+  it("keeps provider search closed behind a modal button", async () => {
+    const user = userEvent.setup();
+    api.list.mockResolvedValue([workProvider]);
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Edit Work" }));
+    const close = screen.getByRole("button", { name: "Close provider dialog" });
+    close.focus();
+    await user.keyboard("{Control>}f{/Control}");
+    await user.click(close);
+
+    expect(
+      screen.queryByRole("textbox", { name: "Search providers" }),
+    ).toBeNull();
+  });
+
+  it("clears provider filtering and restores focus when search closes", async () => {
+    const user = userEvent.setup();
+    const second = { ...workProvider, id: "provider-2", name: "Reference" };
+    api.list.mockResolvedValue([workProvider, second]);
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Edit Work" });
+    const settings = screen.getByRole("button", { name: "Open settings" });
+    settings.focus();
+    await user.keyboard("{Control>}f{/Control}");
+    const search = screen.getByRole("textbox", { name: "Search providers" });
+    await user.type(search, "missing");
+    expect(screen.getByText("No providers match your search.")).toBeVisible();
+    await user.keyboard("{Escape}");
+
+    await waitFor(() => expect(settings).toHaveFocus());
+    expect(
+      screen.queryByRole("textbox", { name: "Search providers" }),
+    ).toBeNull();
+    expect(screen.getByRole("heading", { name: "Work" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Reference" })).toBeVisible();
   });
 
   it("does not mark a different provider revision as current", async () => {
@@ -1191,7 +1323,7 @@ describe("App", () => {
     );
     await user.type(screen.getByLabelText("API key"), "secret");
     await user.type(screen.getByLabelText(/Model/), "gemini-test");
-    await user.click(screen.getByRole("button", { name: "Save provider" }));
+    await user.click(screen.getByRole("button", { name: "Add" }));
 
     await waitFor(() =>
       expect(api.createSimple).toHaveBeenCalledWith({
@@ -1323,12 +1455,10 @@ describe("App", () => {
     });
     await user.click(trigger);
     const providerDialog = screen.getByRole("dialog", {
-      name: "Add provider",
+      name: "Add New Provider",
     });
     expect(providerDialog).toHaveAttribute("aria-modal", "true");
-    expect(providerDialog).toHaveAccessibleDescription(
-      /Simple direct configuration · Anthropic Messages/,
-    );
+    expect(providerDialog).not.toHaveAttribute("aria-describedby");
     expect(document.querySelector("header")).toHaveAttribute("inert");
     expect(document.querySelector("main")).toHaveAttribute(
       "aria-hidden",
@@ -1339,7 +1469,7 @@ describe("App", () => {
 
     await waitFor(() =>
       expect(
-        screen.queryByRole("dialog", { name: "Add provider" }),
+        screen.queryByRole("dialog", { name: "Add New Provider" }),
       ).not.toBeInTheDocument(),
     );
     expect(document.querySelector("header")).not.toHaveAttribute("inert");
@@ -1362,9 +1492,16 @@ describe("App", () => {
     });
     await user.click(settingsButton);
     expect(screen.getByRole("heading", { name: "Settings" })).toBeVisible();
-    expect(screen.getByRole("tab", { name: "General" })).toHaveFocus();
+    const generalTab = screen.getByRole("tab", { name: "General" });
+    expect(generalTab).toHaveFocus();
+    expect(generalTab).toHaveClass("bg-blue-600", "text-white");
+    expect(screen.getByRole("tab", { name: "About" })).not.toHaveClass(
+      "opacity-60",
+    );
 
-    await user.click(screen.getByRole("button", { name: "Dark" }));
+    const darkThemeButton = screen.getByRole("button", { name: "Dark" });
+    await user.click(darkThemeButton);
+    expect(darkThemeButton).toHaveClass("bg-blue-600", "text-white");
     expect(document.documentElement).toHaveClass("dark");
     expect(window.localStorage.getItem("cc-switch-lite:theme")).toBe("dark");
 
@@ -1377,7 +1514,16 @@ describe("App", () => {
     expect(
       screen.getByRole("heading", { name: "CC Switch Lite" }),
     ).toBeVisible();
-    expect(screen.getByText("Version 0.1.0-alpha.1")).toBeVisible();
+    expect(screen.getByText("v0.1.0-alpha.1")).toBeVisible();
+    expect(
+      screen.queryByRole("tab", { name: "Proxy" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("tab", { name: "Advanced" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /update/i }),
+    ).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Back to providers" }));
     await waitFor(() =>

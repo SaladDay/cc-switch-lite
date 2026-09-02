@@ -1,10 +1,18 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type CSSProperties,
+  type ReactNode,
 } from "react";
+import {
+  AnimatePresence,
+  motion,
+  useIsPresent,
+  useReducedMotion,
+} from "framer-motion";
 import {
   ArrowLeft,
   Check,
@@ -58,6 +66,45 @@ const VIEW_STORAGE_KEY = "cc-switch-lite:last-view";
 const DRAG_BAR_HEIGHT = 28;
 const HEADER_HEIGHT = 64;
 type View = "providers" | "mcp" | "skills" | "settings";
+
+function FadePanel({
+  children,
+  className,
+  duration,
+}: {
+  children: ReactNode;
+  className: string;
+  duration: number;
+}) {
+  const elementRef = useRef<HTMLDivElement>(null);
+  const isPresent = useIsPresent();
+  const reduceMotion = useReducedMotion();
+
+  useLayoutEffect(() => {
+    const element = elementRef.current;
+    if (!element) return;
+    if (isPresent) {
+      element.removeAttribute("inert");
+      element.removeAttribute("aria-hidden");
+    } else {
+      element.setAttribute("inert", "");
+      element.setAttribute("aria-hidden", "true");
+    }
+  }, [isPresent]);
+
+  return (
+    <motion.div
+      ref={elementRef}
+      className={className}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: reduceMotion ? 0 : duration }}
+    >
+      {children}
+    </motion.div>
+  );
+}
 
 function initialApp(): AppId {
   const stored = window.localStorage.getItem(APP_STORAGE_KEY);
@@ -505,6 +552,7 @@ export default function App() {
           appId: activeApp,
           name: update.name,
           values: update.values,
+          ...(update.presetId ? { presetId: update.presetId } : {}),
         });
         setProviders((current) => [...current, created]);
       } else {
@@ -674,9 +722,9 @@ export default function App() {
   });
   const viewTitle =
     currentView === "mcp"
-      ? "MCP Servers"
+      ? "MCP Server Management"
       : currentView === "skills"
-        ? "Skills"
+        ? "Skills Management"
         : "Settings";
 
   return (
@@ -821,6 +869,7 @@ export default function App() {
                       onClick={() => openEditor("new")}
                       className={`ml-2 ${addActionButtonClass}`}
                       aria-label={`Add ${definition.label} provider`}
+                      title="Add new provider"
                     >
                       <Plus className="h-5 w-5" />
                     </Button>
@@ -856,103 +905,117 @@ export default function App() {
         </div>
       </header>
 
-      <main className="flex min-h-0 flex-1 flex-col overflow-y-auto animate-fade-in">
-        {currentView === "providers" ? (
-          <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-6">
-            <div className="flex-1 overflow-y-auto overflow-x-hidden px-1 pb-12">
-              <div className="space-y-4">
-                {(catalogError ||
-                  adapterError ||
-                  simpleFormError ||
-                  liveError ||
-                  loadError ||
-                  currentError) && (
-                  <div
-                    role="alert"
-                    className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-600 dark:text-red-300"
-                  >
-                    {catalogError ||
-                      adapterError ||
-                      simpleFormError ||
-                      liveError ||
-                      loadError ||
-                      currentError}
-                  </div>
-                )}
+      <main className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+        <AnimatePresence mode="wait">
+          <FadePanel
+            key={currentView}
+            className="flex min-h-0 flex-1 flex-col"
+            duration={0.2}
+          >
+            {currentView === "providers" ? (
+              <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-6">
+                <div className="flex-1 overflow-y-auto overflow-x-hidden px-1 pb-12">
+                  <AnimatePresence mode="wait">
+                    <FadePanel
+                      key={activeApp}
+                      className="space-y-4"
+                      duration={0.15}
+                    >
+                      {(catalogError ||
+                        adapterError ||
+                        simpleFormError ||
+                        liveError ||
+                        loadError ||
+                        currentError) && (
+                        <div
+                          role="alert"
+                          className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-600 dark:text-red-300"
+                        >
+                          {catalogError ||
+                            adapterError ||
+                            simpleFormError ||
+                            liveError ||
+                            loadError ||
+                            currentError}
+                        </div>
+                      )}
 
-                {notice && (
-                  <div
-                    role="status"
-                    className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300"
-                  >
-                    <Check className="size-4" aria-hidden="true" />
-                    {notice}
-                  </div>
-                )}
+                      {notice && (
+                        <div
+                          role="status"
+                          className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300"
+                        >
+                          <Check className="size-4" aria-hidden="true" />
+                          {notice}
+                        </div>
+                      )}
 
-                <ProviderList
-                  appId={activeApp}
-                  items={providerItems}
-                  isLoading={loading}
-                  emptyTitle={definition.emptyTitle}
-                  currentLabel={currentLabel}
-                  importLabel={
-                    isClaude ? "Import user default" : "Import current"
-                  }
-                  disabled={
-                    !providerActionsReady ||
-                    !adapter ||
-                    !simpleForm ||
-                    mutationBusy ||
-                    liveBusy !== null
-                  }
-                  importDisabled={
-                    !liveActionsReady ||
-                    !nativeLiveAdapter ||
-                    mutationBusy ||
-                    liveBusy !== null
-                  }
-                  busy={mutationBusy || liveBusy !== null}
-                  importing={liveBusy === "import"}
-                  switchingId={liveBusy}
-                  onCreate={() => openEditor("new")}
-                  onImport={beginImport}
-                  onSwitch={switchProvider}
-                  onRemove={removeProviderFromLive}
-                  onEdit={openEditor}
-                  onDelete={(provider) => {
-                    setMutationError(null);
-                    setDeleting(provider);
-                  }}
-                  setDeleteButtonRef={(providerId, element) => {
-                    if (element)
-                      deleteButtonRefs.current.set(providerId, element);
-                    else deleteButtonRefs.current.delete(providerId);
-                  }}
-                />
+                      <ProviderList
+                        appId={activeApp}
+                        items={providerItems}
+                        isLoading={loading}
+                        emptyTitle={definition.emptyTitle}
+                        currentLabel={currentLabel}
+                        importLabel={
+                          isClaude ? "Import user default" : "Import current"
+                        }
+                        disabled={
+                          !providerActionsReady ||
+                          !adapter ||
+                          !simpleForm ||
+                          mutationBusy ||
+                          liveBusy !== null
+                        }
+                        importDisabled={
+                          !liveActionsReady ||
+                          !nativeLiveAdapter ||
+                          mutationBusy ||
+                          liveBusy !== null
+                        }
+                        busy={mutationBusy || liveBusy !== null}
+                        importing={liveBusy === "import"}
+                        switchingId={liveBusy}
+                        onCreate={() => openEditor("new")}
+                        onImport={beginImport}
+                        onSwitch={switchProvider}
+                        onRemove={removeProviderFromLive}
+                        onEdit={openEditor}
+                        onDelete={(provider) => {
+                          setMutationError(null);
+                          setDeleting(provider);
+                        }}
+                        setDeleteButtonRef={(providerId, element) => {
+                          if (element)
+                            deleteButtonRefs.current.set(providerId, element);
+                          else deleteButtonRefs.current.delete(providerId);
+                        }}
+                      />
+                    </FadePanel>
+                  </AnimatePresence>
+                </div>
               </div>
-            </div>
-          </div>
-        ) : currentView === "mcp" ? (
-          <McpPanel
-            ref={mcpPanelRef}
-            apps={mcpApps}
-            onInteractionBlockedChange={setMcpManagementBusy}
-          />
-        ) : currentView === "skills" ? (
-          <SkillsPanel
-            apps={appCatalog}
-            onInteractionBlockedChange={setSkillsManagementBusy}
-          />
-        ) : (
-          <SettingsPanel
-            apps={appCatalog}
-            theme={theme}
-            appVisibility={appVisibility}
-            onThemeChange={setTheme}
-            onAppVisibilityChange={setAppVisibility}
-          />
-        )}
+            ) : currentView === "mcp" ? (
+              <McpPanel
+                ref={mcpPanelRef}
+                apps={mcpApps}
+                onInteractionBlockedChange={setMcpManagementBusy}
+              />
+            ) : currentView === "skills" ? (
+              <SkillsPanel
+                apps={appCatalog}
+                onInteractionBlockedChange={setSkillsManagementBusy}
+              />
+            ) : (
+              <SettingsPanel
+                apps={appCatalog}
+                theme={theme}
+                appVisibility={appVisibility}
+                onThemeChange={setTheme}
+                onAppVisibilityChange={setAppVisibility}
+              />
+            )}
+          </FadePanel>
+        </AnimatePresence>
       </main>
 
       {editing && editingAdapter && editingForm && (

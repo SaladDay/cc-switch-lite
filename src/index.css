@@ -187,6 +187,24 @@ dialog::backdrop {
   user-select: none;
 }
 
+.hover-reveal-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (hover: hover) {
+  .group .hover-reveal-actions {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .group:hover .hover-reveal-actions,
+  .group:focus-within .hover-reveal-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
