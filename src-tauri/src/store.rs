@@ -9,13 +9,14 @@ use std::fs;
 
 use cc_switch_core::{builtin_app_adapter, AppType};
 use cc_switch_store::{
-    read_provider_row, read_provider_rows, ProviderRow as SharedProviderRow, SharedDatabase,
-    SharedStoreError,
+    begin_immediate_transaction, delete_provider as delete_provider_row,
+    insert_provider as insert_provider_row, read_provider_row, read_provider_rows,
+    set_provider_current, update_provider_configuration, update_provider_details,
+    update_provider_metadata, ProviderInsert, ProviderRow as SharedProviderRow,
+    ProviderWriteOutcome, SharedDatabase, SharedStoreError,
 };
 use hmac::{Hmac, Mac};
-use rusqlite::{
-    params, types::ValueRef, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
-};
+use rusqlite::{params, types::ValueRef, Connection, OptionalExtension, Row, Transaction};
 use serde_json::{Map, Value};
 use sha2::Sha256;
 use thiserror::Error;
@@ -43,6 +44,8 @@ pub enum StoreError {
     },
     #[error("shared provider database failed: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error(transparent)]
+    SharedWrite(SharedStoreError),
     #[error("shared provider data is invalid: {0}")]
     InvalidStore(String),
     #[error("provider is invalid: {0}")]
@@ -60,7 +63,7 @@ pub enum StoreError {
 impl StoreError {
     pub fn code(&self) -> &'static str {
         match self {
-            Self::Io { .. } | Self::Database(_) => "storage_error",
+            Self::Io { .. } | Self::Database(_) | Self::SharedWrite(_) => "storage_error",
             Self::InvalidStore(_) => "invalid_store",
             Self::InvalidProvider(_) => "invalid_provider",
             Self::NotFound(_) => "not_found",
@@ -76,6 +79,7 @@ impl From<SharedStoreError> for StoreError {
         match error {
             SharedStoreError::Io { path, source } => Self::Io { path, source },
             SharedStoreError::Database(error) => Self::Database(error),
+            error @ SharedStoreError::ProviderWrite { .. } => Self::SharedWrite(error),
             SharedStoreError::InvalidDatabase(message) => Self::InvalidStore(message),
             other => Self::InvalidStore(other.to_string()),
         }
@@ -103,6 +107,27 @@ struct NewProvider {
     settings: Value,
     category: Option<String>,
     metadata: Value,
+    presentation: ProviderPresentation,
+}
+
+fn new_provider(
+    app: &AppType,
+    name: String,
+    settings: Value,
+    presentation: ProviderPresentation,
+) -> NewProvider {
+    let mut metadata = Map::new();
+    if app.is_additive_mode() {
+        metadata.insert("liveConfigManaged".to_owned(), Value::Bool(false));
+    }
+    NewProvider {
+        id: Uuid::new_v4().to_string(),
+        name,
+        settings,
+        category: None,
+        metadata: Value::Object(metadata),
+        presentation,
+    }
 }
 
 #[derive(Default)]
@@ -134,6 +159,124 @@ fn provider_for_live_action(
         ))
     })?;
     Ok(provider)
+}
+
+fn replace_exclusive_current(
+    transaction: &mut Transaction<'_>,
+    app: &AppType,
+    id: &str,
+) -> Result<(), StoreError> {
+    for provider in read_provider_rows(transaction, Some(app.as_str()))?
+        .into_iter()
+        .filter(|provider| provider.is_current != 0)
+    {
+        if set_provider_current(transaction, &provider.id, &provider.app_type, false)?
+            != ProviderWriteOutcome::Applied
+        {
+            return Err(StoreError::Conflict(id.to_owned()));
+        }
+    }
+    if set_provider_current(transaction, id, app.as_str(), true)? != ProviderWriteOutcome::Applied {
+        return Err(StoreError::Conflict(id.to_owned()));
+    }
+
+    ensure_exclusive_current(transaction, app, Some(id), id)
+}
+
+fn ensure_exclusive_current(
+    transaction: &Transaction<'_>,
+    app: &AppType,
+    expected_id: Option<&str>,
+    conflict_id: &str,
+) -> Result<(), StoreError> {
+    let providers = read_provider_rows(transaction, Some(app.as_str()))?;
+    let target_exists = expected_id.is_none_or(|id| {
+        providers
+            .iter()
+            .any(|provider| provider.id == id && provider.app_type == app.as_str())
+    });
+    let valid = providers.iter().all(|provider| {
+        let expected = i64::from(
+            expected_id == Some(provider.id.as_str()) && provider.app_type == app.as_str(),
+        );
+        provider.is_current == expected
+    });
+    if !target_exists || !valid {
+        return Err(StoreError::Conflict(conflict_id.to_owned()));
+    }
+    Ok(())
+}
+
+fn ensure_lite_metadata(
+    transaction: &Transaction<'_>,
+    app: &AppType,
+    id: &str,
+    expected: &Map<String, Value>,
+) -> Result<(), StoreError> {
+    let provider = read_provider_row(transaction, id, app.as_str())?
+        .ok_or_else(|| StoreError::Conflict(id.to_owned()))?;
+    if !lite_metadata_matches(&provider.meta, id, expected)? {
+        return Err(StoreError::Conflict(id.to_owned()));
+    }
+    Ok(())
+}
+
+fn lite_metadata_matches(
+    raw: &str,
+    id: &str,
+    expected: &Map<String, Value>,
+) -> Result<bool, StoreError> {
+    let actual = serde_json::from_str::<Value>(raw)
+        .map_err(|_| StoreError::InvalidStore(format!("provider '{id}' has invalid metadata")))?;
+    let actual = actual.as_object().ok_or_else(|| {
+        StoreError::InvalidStore(format!("provider '{id}' metadata is not an object"))
+    })?;
+    Ok(expected
+        .iter()
+        .all(|(key, value)| actual.get(key) == Some(value))
+        && ["liveConfigManaged", "liveConfigStale"]
+            .into_iter()
+            .all(|key| actual.get(key) == expected.get(key)))
+}
+
+fn write_lite_metadata(
+    transaction: &mut Transaction<'_>,
+    app: &AppType,
+    id: &str,
+    metadata: &Map<String, Value>,
+) -> Result<(), StoreError> {
+    let raw = serde_json::to_string(metadata)
+        .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
+    if update_provider_metadata(transaction, id, app.as_str(), &raw)?
+        != ProviderWriteOutcome::Applied
+    {
+        return Err(StoreError::Conflict(id.to_owned()));
+    }
+    ensure_lite_metadata(transaction, app, id, metadata)
+}
+
+fn ensure_provider_absent(
+    transaction: &Transaction<'_>,
+    app: &AppType,
+    id: &str,
+) -> Result<(), StoreError> {
+    if read_provider_row(transaction, id, app.as_str())?.is_some() {
+        return Err(StoreError::Conflict(id.to_owned()));
+    }
+    Ok(())
+}
+
+fn same_live_input(expected: &ProviderRecord, actual: &ProviderRecord) -> bool {
+    let normalize = |provider: &ProviderRecord| {
+        let mut provider = provider.clone();
+        provider.revision = 0;
+        if let Some(metadata) = provider.metadata.as_object_mut() {
+            metadata.remove("liveConfigManaged");
+            metadata.remove("liveConfigStale");
+        }
+        provider
+    };
+    normalize(expected) == normalize(actual)
 }
 
 pub struct ProviderStore {
@@ -180,11 +323,16 @@ impl ProviderStore {
     ) -> Result<Result<(), E>, StoreError> {
         let app = parse_app(app_id)?;
         let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut transaction = begin_immediate_transaction(&mut connection)?;
         let provider = self
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
         ensure_revision(&provider.record, expected_revision)?;
+        if !provider.lite_writable {
+            return Err(StoreError::InvalidProvider(
+                "this provider is read-only in Lite".to_owned(),
+            ));
+        }
         let has_settings_table = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'settings'
@@ -226,30 +374,16 @@ impl ProviderStore {
                         })?;
                 metadata.insert("liveConfigManaged".to_owned(), Value::Bool(true));
                 metadata.remove("liveConfigStale");
-                let changed = transaction.execute(
-                    "UPDATE providers SET meta = ?1 WHERE id = ?2 AND app_type = ?3",
-                    params![
-                        serde_json::to_string(&Value::Object(metadata))
-                            .map_err(|error| StoreError::InvalidProvider(error.to_string()))?,
-                        id,
-                        app.as_str(),
-                    ],
-                )?;
-                if changed != 1 {
-                    return Err(StoreError::Conflict(id.to_owned()));
-                }
+                write_lite_metadata(&mut transaction, &app, id, &metadata)?;
             } else {
-                transaction.execute(
-                    "UPDATE providers SET is_current = 0 WHERE app_type = ?1",
-                    [app.as_str()],
-                )?;
-                let changed = transaction.execute(
-                    "UPDATE providers SET is_current = 1 WHERE id = ?1 AND app_type = ?2",
-                    params![id, app.as_str()],
-                )?;
-                if changed != 1 {
-                    return Err(StoreError::Conflict(id.to_owned()));
-                }
+                replace_exclusive_current(&mut transaction, &app, id)?;
+            }
+            let final_provider = self
+                .stored_provider(&transaction, &app, id)?
+                .ok_or_else(|| StoreError::Conflict(id.to_owned()))?;
+            let final_live_provider = provider_for_live_action(&final_provider, &app)?;
+            if !same_live_input(&live_provider, &final_live_provider) {
+                return Err(StoreError::Conflict(id.to_owned()));
             }
             transaction.commit()?;
             Ok(())
@@ -281,11 +415,16 @@ impl ProviderStore {
             )));
         }
         let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut transaction = begin_immediate_transaction(&mut connection)?;
         let provider = self
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
         ensure_revision(&provider.record, expected_revision)?;
+        if !provider.lite_writable {
+            return Err(StoreError::InvalidProvider(
+                "this provider is read-only in Lite".to_owned(),
+            ));
+        }
 
         let mut metadata = provider
             .record
@@ -310,16 +449,11 @@ impl ProviderStore {
         metadata.insert("liveConfigManaged".to_owned(), Value::Bool(false));
         metadata.remove("liveConfigStale");
         let finalize = (|| -> Result<(), StoreError> {
-            let changed = transaction.execute(
-                "UPDATE providers SET meta = ?1 WHERE id = ?2 AND app_type = ?3",
-                params![
-                    serde_json::to_string(&Value::Object(metadata))
-                        .map_err(|error| StoreError::InvalidProvider(error.to_string()))?,
-                    id,
-                    app.as_str(),
-                ],
-            )?;
-            if changed != 1 {
+            write_lite_metadata(&mut transaction, &app, id, &metadata)?;
+            let final_provider = self
+                .stored_provider(&transaction, &app, id)?
+                .ok_or_else(|| StoreError::Conflict(id.to_owned()))?;
+            if !same_live_input(&provider.record, &final_provider.record) {
                 return Err(StoreError::Conflict(id.to_owned()));
             }
             transaction.commit()?;
@@ -345,18 +479,17 @@ impl ProviderStore {
     ) -> Result<Result<ProviderRecord, E>, StoreError> {
         let app = parse_app(app_id)?;
         let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut transaction = begin_immediate_transaction(&mut connection)?;
         let (draft, descriptor) = match provider_factory() {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
         let (name, settings, adapter, compatibility_settings) =
             validate_draft(&app, &draft, &descriptor)?;
-        let created = self.insert_provider(
-            &transaction,
+        let created = self.insert_provider_with_id(
+            &mut transaction,
             &app,
-            name,
-            settings,
+            new_provider(&app, name, settings, ProviderPresentation::default()),
             ProviderBinding {
                 adapter: &adapter,
                 extensions: &Map::new(),
@@ -387,12 +520,11 @@ impl ProviderStore {
         let name = validate_name(&draft.name).map_err(StoreError::InvalidProvider)?;
         validate_native_settings(&draft.settings)?;
         let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let created = self.insert_provider(
-            &transaction,
+        let mut transaction = begin_immediate_transaction(&mut connection)?;
+        let created = self.insert_provider_with_id(
+            &mut transaction,
             &app,
-            name,
-            Value::Object(draft.settings),
+            new_provider(&app, name, Value::Object(draft.settings), presentation),
             ProviderBinding {
                 adapter: &draft.adapter,
                 extensions: &Map::new(),
@@ -400,22 +532,6 @@ impl ProviderStore {
             },
             false,
         )?;
-        if presentation.website_url.is_some() || presentation.icon.is_some() {
-            transaction.execute(
-                "UPDATE providers SET website_url = ?1, icon = ?2
-                 WHERE id = ?3 AND app_type = ?4",
-                params![
-                    presentation.website_url,
-                    presentation.icon,
-                    created.id,
-                    app.as_str(),
-                ],
-            )?;
-        }
-        let created = self
-            .stored_provider(&transaction, &app, &created.id)?
-            .ok_or_else(|| StoreError::NotFound(created.id))?
-            .record;
         transaction.commit()?;
         Ok(created)
     }
@@ -430,7 +546,7 @@ impl ProviderStore {
     ) -> Result<Result<ProviderRecord, E>, StoreError> {
         let app = parse_app(app_id)?;
         let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut transaction = begin_immediate_transaction(&mut connection)?;
         let current = self
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
@@ -456,18 +572,16 @@ impl ProviderStore {
         })?;
         validate_native_settings(settings_object)?;
         let name = validate_name(name).map_err(StoreError::InvalidProvider)?;
-        let changed = transaction.execute(
-            "UPDATE providers SET name = ?1, settings_config = ?2
-             WHERE id = ?3 AND app_type = ?4",
-            params![
-                name,
-                serde_json::to_string(&settings)
-                    .map_err(|error| StoreError::InvalidProvider(error.to_string()))?,
-                id,
-                app.as_str(),
-            ],
-        )?;
-        if changed != 1 {
+        let settings_config = serde_json::to_string(&settings)
+            .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
+        if update_provider_configuration(
+            &mut transaction,
+            id,
+            app.as_str(),
+            &name,
+            &settings_config,
+        )? != ProviderWriteOutcome::Applied
+        {
             return Err(StoreError::Conflict(id.to_owned()));
         }
         if app.is_additive_mode() {
@@ -481,22 +595,15 @@ impl ProviderStore {
                 })?;
             if metadata.get("liveConfigManaged").and_then(Value::as_bool) != Some(false) {
                 metadata.insert("liveConfigStale".to_owned(), Value::Bool(true));
-                transaction.execute(
-                    "UPDATE providers SET meta = ?1 WHERE id = ?2 AND app_type = ?3",
-                    params![
-                        serde_json::to_string(&Value::Object(metadata))
-                            .map_err(|error| StoreError::InvalidProvider(error.to_string()))?,
-                        id,
-                        app.as_str(),
-                    ],
-                )?;
+                write_lite_metadata(&mut transaction, &app, id, &metadata)?;
             }
         }
-        if current.is_current && !app.is_additive_mode() {
-            transaction.execute(
-                "UPDATE providers SET is_current = 0 WHERE id = ?1 AND app_type = ?2",
-                params![id, app.as_str()],
-            )?;
+        if current.is_current
+            && !app.is_additive_mode()
+            && set_provider_current(&mut transaction, id, app.as_str(), false)?
+                != ProviderWriteOutcome::Applied
+        {
+            return Err(StoreError::Conflict(id.to_owned()));
         }
         if migrate_builtin_binding {
             let changed = transaction.execute(
@@ -518,8 +625,15 @@ impl ProviderStore {
         }
         let updated = self
             .stored_provider(&transaction, &app, id)?
-            .ok_or_else(|| StoreError::NotFound(id.to_owned()))?
-            .record;
+            .ok_or_else(|| StoreError::Conflict(id.to_owned()))?;
+        let expected_current = current.is_current && app.is_additive_mode();
+        if updated.record.name != name
+            || updated.native_settings != settings
+            || updated.is_current != expected_current
+        {
+            return Err(StoreError::Conflict(id.to_owned()));
+        }
+        let updated = updated.record;
         transaction.commit()?;
         Ok(Ok(updated))
     }
@@ -531,7 +645,7 @@ impl ProviderStore {
     ) -> Result<Result<Vec<ProviderRecord>, E>, StoreError> {
         let app = parse_app(app_id)?;
         let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut transaction = begin_immediate_transaction(&mut connection)?;
         let drafts = match provider_factory() {
             Ok(drafts) => drafts,
             Err(error) => {
@@ -611,32 +725,48 @@ impl ProviderStore {
                     .unwrap_or_default();
                 merged_metadata.extend(imported_metadata.clone());
                 merged_metadata.remove("liveConfigStale");
-                transaction.execute(
-                    "UPDATE providers
-                     SET name = CASE WHEN ?1 THEN ?2 ELSE name END,
-                         settings_config = ?3, category = ?4, meta = ?5
-                     WHERE id = ?6 AND app_type = ?7",
-                    params![
-                        name_is_explicit,
-                        name,
-                        serde_json::to_string(&Value::Object(draft.settings))
-                            .map_err(|error| { StoreError::InvalidProvider(error.to_string()) })?,
-                        category.or(current.record.category),
-                        serde_json::to_string(&Value::Object(merged_metadata))
-                            .map_err(|error| { StoreError::InvalidProvider(error.to_string()) })?,
-                        id,
-                        app.as_str(),
-                    ],
-                )?;
-                imported.push(
-                    self.stored_provider(&transaction, &app, &id)?
-                        .ok_or_else(|| StoreError::NotFound(id.clone()))?
-                        .record,
-                );
+                let next_name = if name_is_explicit {
+                    name.as_str()
+                } else {
+                    current.record.name.as_str()
+                };
+                let settings = Value::Object(draft.settings);
+                let settings_config = serde_json::to_string(&settings)
+                    .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
+                let category = category.or(current.record.category);
+                let metadata = serde_json::to_string(&Value::Object(merged_metadata.clone()))
+                    .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
+                if update_provider_details(
+                    &mut transaction,
+                    &id,
+                    app.as_str(),
+                    next_name,
+                    &settings_config,
+                    category.as_deref(),
+                    &metadata,
+                )? != ProviderWriteOutcome::Applied
+                {
+                    return Err(StoreError::Conflict(id));
+                }
+                let updated = read_provider_row(&transaction, &id, app.as_str())?
+                    .ok_or_else(|| StoreError::Conflict(id.clone()))?;
+                let stored_settings = serde_json::from_str::<Value>(&updated.settings_config)
+                    .map_err(|_| {
+                        StoreError::InvalidStore(format!("provider '{id}' has invalid settings"))
+                    })?;
+                if updated.name != next_name
+                    || stored_settings != settings
+                    || updated.category != category
+                    || updated.is_current != i64::from(current.is_current)
+                    || !lite_metadata_matches(&updated.meta, &id, &merged_metadata)?
+                {
+                    return Err(StoreError::Conflict(id));
+                }
+                imported.push(self.stored_from_row(&transaction, updated)?.record);
                 continue;
             }
             imported.push(self.insert_provider_with_id(
-                &transaction,
+                &mut transaction,
                 &app,
                 NewProvider {
                     id,
@@ -644,6 +774,7 @@ impl ProviderStore {
                     settings: Value::Object(draft.settings),
                     category,
                     metadata: Value::Object(imported_metadata),
+                    presentation: ProviderPresentation::default(),
                 },
                 ProviderBinding {
                     adapter: &draft.adapter,
@@ -657,38 +788,9 @@ impl ProviderStore {
         Ok(Ok(imported))
     }
 
-    fn insert_provider(
-        &self,
-        transaction: &Transaction<'_>,
-        app: &AppType,
-        name: String,
-        settings: Value,
-        binding: ProviderBinding<'_>,
-        make_current_if_empty: bool,
-    ) -> Result<ProviderRecord, StoreError> {
-        let id = Uuid::new_v4().to_string();
-        let mut metadata = Map::new();
-        if app.is_additive_mode() {
-            metadata.insert("liveConfigManaged".to_owned(), Value::Bool(false));
-        }
-        self.insert_provider_with_id(
-            transaction,
-            app,
-            NewProvider {
-                id,
-                name,
-                settings,
-                category: None,
-                metadata: Value::Object(metadata),
-            },
-            binding,
-            make_current_if_empty,
-        )
-    }
-
     fn insert_provider_with_id(
         &self,
-        transaction: &Transaction<'_>,
+        transaction: &mut Transaction<'_>,
         app: &AppType,
         provider: NewProvider,
         binding: ProviderBinding<'_>,
@@ -700,47 +802,84 @@ impl ProviderStore {
             settings,
             category,
             metadata,
+            presentation,
         } = provider;
         let created_at = now_millis()?;
         let sort_index: i64 = transaction.query_row(
-            "SELECT COALESCE(MAX(sort_index) + 1, 0) FROM providers WHERE app_type = ?1",
+            "SELECT COALESCE(MAX(sort_index) + 1, 0) FROM main.providers
+             WHERE app_type COLLATE BINARY = ?1",
             [app.as_str()],
             |row| row.get(0),
         )?;
-        let make_current = if make_current_if_empty && !app.is_additive_mode() {
-            transaction.query_row(
-                "SELECT COUNT(*) = 0 FROM providers
-                 WHERE app_type = ?1 AND is_current = 1",
-                [app.as_str()],
-                |row| row.get(0),
-            )?
+        let existing_current = if app.is_additive_mode() {
+            None
         } else {
-            false
+            let current = read_provider_rows(transaction, Some(app.as_str()))?
+                .into_iter()
+                .filter(|provider| provider.is_current != 0)
+                .collect::<Vec<_>>();
+            if current.len() > 1 || current.first().is_some_and(|row| row.is_current != 1) {
+                return Err(StoreError::Conflict(id));
+            }
+            current.first().map(|provider| provider.id.clone())
         };
-        transaction.execute(
-            "INSERT INTO providers
-             (id, app_type, name, settings_config, category, created_at, sort_index, meta, is_current, in_failover_queue)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
-            params![
-                id,
-                app.as_str(),
-                name,
-                serde_json::to_string(&settings)
-                    .map_err(|error| StoreError::InvalidProvider(error.to_string()))?,
-                category,
-                created_at,
-                sort_index,
-                serde_json::to_string(&metadata)
-                    .map_err(|error| StoreError::InvalidProvider(error.to_string()))?,
-                make_current,
-            ],
-        )?;
+        let make_current =
+            make_current_if_empty && !app.is_additive_mode() && existing_current.is_none();
+        let expected_current = if make_current {
+            Some(id.clone())
+        } else {
+            existing_current
+        };
+        let settings_config = serde_json::to_string(&settings)
+            .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
+        let metadata_config = serde_json::to_string(&metadata)
+            .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
+        if insert_provider_row(
+            transaction,
+            &ProviderInsert {
+                id: &id,
+                app_type: app.as_str(),
+                name: &name,
+                settings_config: &settings_config,
+                website_url: presentation.website_url.as_deref(),
+                category: category.as_deref(),
+                created_at: Some(created_at),
+                sort_index: Some(sort_index),
+                notes: None,
+                icon: presentation.icon.as_deref(),
+                icon_color: None,
+                meta: &metadata_config,
+                is_current: i64::from(make_current),
+                in_failover_queue: 0,
+            },
+        )? != ProviderWriteOutcome::Applied
+        {
+            return Err(StoreError::Conflict(id));
+        }
         self.save_adapter_binding(transaction, &id, app, created_at, binding)?;
-        let created = self
-            .stored_provider(transaction, app, &id)?
-            .ok_or_else(|| StoreError::NotFound(id.clone()))?
-            .record;
-        Ok(created)
+        let inserted = read_provider_row(transaction, &id, app.as_str())?
+            .ok_or_else(|| StoreError::Conflict(id.clone()))?;
+        let stored_settings =
+            serde_json::from_str::<Value>(&inserted.settings_config).map_err(|_| {
+                StoreError::InvalidStore(format!("provider '{id}' has invalid settings"))
+            })?;
+        let expected_metadata = metadata.as_object().ok_or_else(|| {
+            StoreError::InvalidProvider("provider metadata must be an object".to_owned())
+        })?;
+        if inserted.name != name
+            || stored_settings != settings
+            || inserted.website_url != presentation.website_url
+            || inserted.category != category
+            || inserted.icon != presentation.icon
+            || inserted.is_current != i64::from(make_current)
+            || !lite_metadata_matches(&inserted.meta, &id, expected_metadata)?
+        {
+            return Err(StoreError::Conflict(id));
+        }
+        if !app.is_additive_mode() {
+            ensure_exclusive_current(transaction, app, expected_current.as_deref(), &id)?;
+        }
+        Ok(self.stored_from_row(transaction, inserted)?.record)
     }
 
     #[cfg(test)]
@@ -756,7 +895,7 @@ impl ProviderStore {
     ) -> Result<Result<ProviderRecord, E>, StoreError> {
         let app = parse_app(app_id)?;
         let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut transaction = begin_immediate_transaction(&mut connection)?;
         let current = self
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
@@ -815,17 +954,18 @@ impl ProviderStore {
             }
         };
         let name = validate_name(&update.name).map_err(StoreError::InvalidProvider)?;
-        transaction.execute(
-            "UPDATE providers SET name = ?1, settings_config = ?2
-             WHERE id = ?3 AND app_type = ?4",
-            params![
-                name,
-                serde_json::to_string(&settings)
-                    .map_err(|error| StoreError::InvalidProvider(error.to_string()))?,
-                id,
-                current.record.app_id,
-            ],
-        )?;
+        let settings_config = serde_json::to_string(&settings)
+            .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
+        if update_provider_configuration(
+            &mut transaction,
+            id,
+            &current.record.app_id,
+            &name,
+            &settings_config,
+        )? != ProviderWriteOutcome::Applied
+        {
+            return Err(StoreError::Conflict(id.to_owned()));
+        }
         if let Some(compatibility_settings) = compatibility_settings {
             transaction.execute(
                 &format!(
@@ -842,8 +982,14 @@ impl ProviderStore {
         }
         let updated = self
             .stored_provider(&transaction, &app, id)?
-            .ok_or_else(|| StoreError::NotFound(id.to_owned()))?
-            .record;
+            .ok_or_else(|| StoreError::Conflict(id.to_owned()))?;
+        if updated.record.name != name
+            || updated.native_settings != settings
+            || updated.is_current != current.is_current
+        {
+            return Err(StoreError::Conflict(id.to_owned()));
+        }
+        let updated = updated.record;
         transaction.commit()?;
         Ok(Ok(updated))
     }
@@ -851,7 +997,7 @@ impl ProviderStore {
     pub fn delete(&self, app_id: &str, id: &str, expected_revision: u64) -> Result<(), StoreError> {
         let app = parse_app(app_id)?;
         let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut transaction = begin_immediate_transaction(&mut connection)?;
         let current = self
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
@@ -870,13 +1016,11 @@ impl ProviderStore {
             ),
             params![id, app.as_str()],
         )?;
-        let changed = transaction.execute(
-            "DELETE FROM providers WHERE id = ?1 AND app_type = ?2",
-            params![id, app.as_str()],
-        )?;
-        if changed != 1 {
+        if delete_provider_row(&mut transaction, id, app.as_str())? != ProviderWriteOutcome::Applied
+        {
             return Err(StoreError::Conflict(id.to_owned()));
         }
+        ensure_provider_absent(&transaction, &app, id)?;
         transaction.commit()?;
         Ok(())
     }
@@ -897,7 +1041,7 @@ impl ProviderStore {
             )));
         }
         let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut transaction = begin_immediate_transaction(&mut connection)?;
         let current = self
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
@@ -921,13 +1065,12 @@ impl ProviderStore {
                 ),
                 params![id, app.as_str()],
             )?;
-            let changed = transaction.execute(
-                "DELETE FROM providers WHERE id = ?1 AND app_type = ?2",
-                params![id, app.as_str()],
-            )?;
-            if changed != 1 {
+            if delete_provider_row(&mut transaction, id, app.as_str())?
+                != ProviderWriteOutcome::Applied
+            {
                 return Err(StoreError::Conflict(id.to_owned()));
             }
+            ensure_provider_absent(&transaction, &app, id)?;
             transaction.commit()?;
             Ok(())
         })();
@@ -1035,22 +1178,12 @@ impl ProviderStore {
             )));
         }
         let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut transaction = begin_immediate_transaction(&mut connection)?;
         let provider = self
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?;
         ensure_revision(&provider.record, expected_revision)?;
-        transaction.execute(
-            "UPDATE providers SET is_current = 0 WHERE app_type = ?1",
-            [app.as_str()],
-        )?;
-        let changed = transaction.execute(
-            "UPDATE providers SET is_current = 1 WHERE id = ?1 AND app_type = ?2",
-            params![id, app.as_str()],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::Conflict(id.to_owned()));
-        }
+        replace_exclusive_current(&mut transaction, &app, id)?;
         let current = self
             .stored_provider(&transaction, &app, id)?
             .ok_or_else(|| StoreError::NotFound(id.to_owned()))?
@@ -1072,7 +1205,7 @@ impl ProviderStore {
                 PRIMARY KEY (provider_id, app_type)
             );
             CREATE TRIGGER IF NOT EXISTS cc_switch_lite_provider_adapter_delete
-            AFTER DELETE ON providers
+            AFTER DELETE ON main.providers
             BEGIN
                 DELETE FROM {ADAPTER_BINDINGS_TABLE}
                 WHERE provider_id = OLD.id AND app_type = OLD.app_type;
@@ -1832,6 +1965,27 @@ mod tests {
     }
 
     #[test]
+    fn suppressed_provider_insert_is_a_conflict() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
+        store
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER ignore_provider_insert
+                 BEFORE INSERT ON main.providers
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.create_native(draft(&AppType::Claude, "Claude", "secret")),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(store.list("claude").unwrap().is_empty());
+    }
+
+    #[test]
     fn native_creation_can_preserve_core_preset_presentation() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("cc-switch.db");
@@ -1873,6 +2027,28 @@ mod tests {
             "https://platform.kimi.com"
         );
         assert_eq!(created.extensions["icon"], "kimi");
+
+        store
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER rewrite_inserted_provider
+                 AFTER INSERT ON main.providers
+                 WHEN NEW.name = 'Blocked'
+                 BEGIN
+                     UPDATE providers SET name = 'Rewritten'
+                     WHERE id = NEW.id AND app_type = NEW.app_type;
+                 END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.create_native_with_presentation(
+                draft(&AppType::Claude, "Blocked", "secret"),
+                ProviderPresentation::default(),
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(store.list("claude").unwrap().len(), 1);
     }
 
     #[test]
@@ -2184,6 +2360,58 @@ mod tests {
             Err(StoreError::Conflict(_))
         ));
 
+        let connection = store.connect().unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE main.providers
+                 ADD COLUMN future_full_field TEXT NOT NULL DEFAULT 'keep';
+                 CREATE TRIGGER rewrite_host_extension
+                 AFTER UPDATE OF settings_config ON main.providers
+                 BEGIN
+                     UPDATE providers
+                     SET future_full_field = 'lost'
+                     WHERE id = NEW.id AND app_type = NEW.app_type;
+                 END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.update_simple_from(
+                app.as_str(),
+                &updated.id,
+                updated.revision,
+                "Suppressed",
+                |stored_app, existing| {
+                    builtin_app_adapter(stored_app).project_simple_provider_settings(
+                        "Suppressed",
+                        &SimpleProviderValues::new(
+                            "https://suppressed.example/v1",
+                            "suppressed-key",
+                            "suppressed-model",
+                        ),
+                        Some(existing),
+                    )
+                },
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+        let unchanged = store.list(app.as_str()).unwrap().pop().unwrap();
+        assert_eq!(unchanged.name, "Primary");
+        assert_eq!(unchanged.extensions["simpleValues"]["apiKey"], "new-key");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT future_full_field FROM main.providers
+                     WHERE id = ?1 AND app_type = 'codex'",
+                    [&created.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "keep"
+        );
+        connection
+            .execute("DROP TRIGGER rewrite_host_extension", [])
+            .unwrap();
+
         store
             .connect()
             .unwrap()
@@ -2479,6 +2707,75 @@ requires_openai_auth = true
             .unwrap();
         assert_eq!(renamed[0].name, "Explicit name");
 
+        store
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER ignore_imported_settings_update
+                 BEFORE UPDATE OF settings_config ON main.providers
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.import_native_batch_from(app.as_str(), || {
+                Ok::<_, StoreError>(vec![native_import(
+                    &app,
+                    "custom",
+                    "Suppressed",
+                    "suppressed",
+                )])
+            }),
+            Err(StoreError::Conflict(_))
+        ));
+        let unchanged = store
+            .list(app.as_str())
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.id == "custom")
+            .unwrap();
+        assert_eq!(unchanged.name, "Explicit name");
+        assert_eq!(unchanged.settings["env"]["API_KEY"], "again");
+        store
+            .connect()
+            .unwrap()
+            .execute("DROP TRIGGER ignore_imported_settings_update", [])
+            .unwrap();
+
+        store
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER drop_imported_metadata
+                 AFTER UPDATE OF meta ON main.providers
+                 BEGIN
+                     UPDATE providers
+                     SET meta = '{\"keep\":true,\"liveConfigManaged\":true}'
+                     WHERE id = NEW.id AND app_type = NEW.app_type;
+                 END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.import_native_batch_from(app.as_str(), || {
+                let mut imported = native_import(&app, "custom", "Custom", "metadata");
+                imported.metadata = json!({"imported": true});
+                Ok::<_, StoreError>(vec![imported])
+            }),
+            Err(StoreError::Conflict(_))
+        ));
+        let unchanged = store
+            .list(app.as_str())
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.id == "custom")
+            .unwrap();
+        assert!(unchanged.metadata.get("imported").is_none());
+        assert_eq!(unchanged.settings["env"]["API_KEY"], "again");
+        store
+            .connect()
+            .unwrap()
+            .execute("DROP TRIGGER drop_imported_metadata", [])
+            .unwrap();
+
         let duplicate = store.import_native_batch_from(app.as_str(), || {
             Ok::<_, StoreError>(vec![
                 native_import(&app, "duplicate", "One", "one"),
@@ -2620,6 +2917,45 @@ requires_openai_auth = true
         let provider = store.list("opencode").unwrap().pop().unwrap();
 
         store
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER rewrite_live_provider
+                 AFTER UPDATE OF meta ON main.providers
+                 BEGIN
+                     UPDATE providers SET name = 'Rewritten'
+                     WHERE id = NEW.id AND app_type = NEW.app_type;
+                 END;",
+            )
+            .unwrap();
+        let live_applied = std::cell::Cell::new(false);
+        assert!(store
+            .switch_with_provider(
+                "opencode",
+                &provider.id,
+                provider.revision,
+                |_, _| {
+                    live_applied.set(true);
+                    Ok::<(), &str>(())
+                },
+                |_| {
+                    live_applied.set(false);
+                    Ok(())
+                },
+            )
+            .is_err());
+        assert!(!live_applied.get());
+        assert_eq!(
+            store.list("opencode").unwrap()[0].metadata["liveConfigManaged"],
+            false
+        );
+        store
+            .connect()
+            .unwrap()
+            .execute("DROP TRIGGER rewrite_live_provider", [])
+            .unwrap();
+
+        store
             .switch_with_provider(
                 "opencode",
                 &provider.id,
@@ -2698,6 +3034,72 @@ requires_openai_auth = true
             .unwrap()
             .unwrap();
         let active = store.list(app.as_str()).unwrap().pop().unwrap();
+        store
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER ignore_live_metadata_update
+                 BEFORE UPDATE OF meta ON main.providers
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        let blocked =
+            SimpleProviderValues::new("https://blocked.example.com/v1", "blocked-key", "blocked");
+        assert!(matches!(
+            store.update_simple_from(
+                app.as_str(),
+                &active.id,
+                active.revision,
+                "Pi blocked",
+                |stored_app, existing| {
+                    builtin_app_adapter(stored_app).project_simple_provider_settings(
+                        "Pi blocked",
+                        &blocked,
+                        Some(existing),
+                    )
+                },
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+        store
+            .connect()
+            .unwrap()
+            .execute("DROP TRIGGER ignore_live_metadata_update", [])
+            .unwrap();
+        store
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER restore_live_metadata_update
+                 AFTER UPDATE OF meta ON main.providers
+                 BEGIN
+                     UPDATE providers SET meta = OLD.meta
+                     WHERE id = NEW.id AND app_type = NEW.app_type;
+                 END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.update_simple_from(
+                app.as_str(),
+                &active.id,
+                active.revision,
+                "Pi restored",
+                |stored_app, existing| {
+                    builtin_app_adapter(stored_app).project_simple_provider_settings(
+                        "Pi restored",
+                        &blocked,
+                        Some(existing),
+                    )
+                },
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(store.list(app.as_str()).unwrap()[0].name, "Pi");
+        store
+            .connect()
+            .unwrap()
+            .execute("DROP TRIGGER restore_live_metadata_update", [])
+            .unwrap();
         let replacement =
             SimpleProviderValues::new("https://new.example.com/v1", "new-key", "new-model");
         let updated = store
@@ -2772,6 +3174,44 @@ requires_openai_auth = true
         let action_called = std::cell::Cell::new(false);
 
         store
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER restore_removed_metadata
+                 AFTER UPDATE OF meta ON main.providers
+                 BEGIN
+                     UPDATE providers SET meta = OLD.meta
+                     WHERE id = NEW.id AND app_type = NEW.app_type;
+                 END;",
+            )
+            .unwrap();
+        assert!(store
+            .remove_from_live_with_provider(
+                app.as_str(),
+                &provider.id,
+                provider.revision,
+                |_| {
+                    action_called.set(true);
+                    Ok::<_, &str>("receipt")
+                },
+                |_| {
+                    action_called.set(false);
+                    Ok(())
+                },
+            )
+            .is_err());
+        assert!(!action_called.get());
+        assert_eq!(
+            store.list(app.as_str()).unwrap()[0].metadata["liveConfigManaged"],
+            true
+        );
+        store
+            .connect()
+            .unwrap()
+            .execute("DROP TRIGGER restore_removed_metadata", [])
+            .unwrap();
+
+        store
             .remove_from_live_with_provider(
                 app.as_str(),
                 &provider.id,
@@ -2806,6 +3246,60 @@ requires_openai_auth = true
             .unwrap()
             .unwrap();
         assert!(!action_called.get());
+    }
+
+    #[test]
+    fn additive_delete_rolls_back_when_a_trigger_restores_the_row() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ProviderStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let app = AppType::Pi;
+        let provider = store
+            .import_native_batch_from(app.as_str(), || {
+                Ok::<_, StoreError>(vec![native_import(&app, "restored", "Restored", "secret")])
+            })
+            .unwrap()
+            .unwrap()
+            .pop()
+            .unwrap();
+        store
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER restore_deleted_provider
+                 AFTER DELETE ON main.providers
+                 BEGIN
+                     INSERT INTO providers
+                         (id, app_type, name, settings_config, website_url, category,
+                          created_at, sort_index, notes, icon, icon_color, meta,
+                          is_current, in_failover_queue)
+                     VALUES
+                         (OLD.id, OLD.app_type, OLD.name, OLD.settings_config,
+                          OLD.website_url, OLD.category, OLD.created_at, OLD.sort_index,
+                          OLD.notes, OLD.icon, OLD.icon_color, OLD.meta,
+                          OLD.is_current, OLD.in_failover_queue);
+                 END;",
+            )
+            .unwrap();
+        let live_applied = std::cell::Cell::new(false);
+
+        assert!(matches!(
+            store.delete_additive_with_provider(
+                app.as_str(),
+                &provider.id,
+                provider.revision,
+                |_| {
+                    live_applied.set(true);
+                    Ok::<_, &str>("receipt")
+                },
+                |_| {
+                    live_applied.set(false);
+                    Ok(())
+                },
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(!live_applied.get());
+        assert_eq!(store.list(app.as_str()).unwrap()[0].id, provider.id);
     }
 
     #[test]
@@ -2909,9 +3403,9 @@ requires_openai_auth = true
             .unwrap()
             .execute_batch(
                 "CREATE TRIGGER reject_current_update
-                 BEFORE UPDATE OF is_current ON providers
-                 WHEN NEW.is_current = 1
-                 BEGIN SELECT RAISE(ABORT, 'current rejected'); END;",
+                 BEFORE UPDATE OF is_current ON main.providers
+                 WHEN NEW.is_current = 0
+                 BEGIN SELECT RAISE(IGNORE); END;",
             )
             .unwrap();
         let live_applied = std::cell::Cell::new(false);
@@ -2938,6 +3432,41 @@ requires_openai_auth = true
             .execute("DROP TRIGGER reject_current_update", [])
             .unwrap();
         store
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER rewrite_current_value
+                 AFTER UPDATE OF is_current ON main.providers
+                 WHEN NEW.is_current = 1
+                 BEGIN
+                     UPDATE providers SET is_current = 2
+                     WHERE id = NEW.id AND app_type = NEW.app_type;
+                 END;",
+            )
+            .unwrap();
+        assert!(store
+            .switch_with_provider(
+                "claude",
+                &alternate.id,
+                alternate.revision,
+                |_, _| {
+                    live_applied.set(true);
+                    Ok::<(), &str>(())
+                },
+                |_| {
+                    live_applied.set(false);
+                    Ok(())
+                },
+            )
+            .is_err());
+        assert!(!live_applied.get());
+        assert_eq!(store.current("claude").unwrap()[0].id, claude.id);
+        store
+            .connect()
+            .unwrap()
+            .execute("DROP TRIGGER rewrite_current_value", [])
+            .unwrap();
+        store
             .switch_with_provider(
                 "claude",
                 &alternate.id,
@@ -2961,6 +3490,36 @@ requires_openai_auth = true
             .unwrap()
             .unwrap();
         assert_eq!(store.current("codex").unwrap()[0].id, imported.id);
+        store
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER rewrite_existing_current_on_insert
+                 AFTER INSERT ON main.providers
+                 WHEN NEW.app_type = 'codex' AND NEW.name = 'Blocked'
+                 BEGIN
+                     UPDATE providers SET is_current = 2
+                     WHERE app_type = 'codex' AND is_current = 1;
+                 END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.create_resolved_from("codex", true, || {
+                let mut blocked = draft(&codex, "Blocked", "blocked-secret");
+                blocked
+                    .settings
+                    .insert("env".to_owned(), Value::String("blocked-secret".to_owned()));
+                Ok::<_, StoreError>((blocked, native_descriptor(&codex)))
+            }),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(store.list("codex").unwrap().len(), 1);
+        assert_eq!(store.current("codex").unwrap()[0].id, imported.id);
+        store
+            .connect()
+            .unwrap()
+            .execute("DROP TRIGGER rewrite_existing_current_on_insert", [])
+            .unwrap();
         let later = store
             .create_resolved_from("codex", true, || {
                 let mut later = draft(&codex, "Later", "later-secret");
@@ -3062,15 +3621,17 @@ requires_openai_auth = true
         let store = ProviderStore::open(path.clone()).unwrap();
         let aggregator = create_native(&store, &AppType::Claude, "Aggregator");
         let managed = create_native(&store, &AppType::Codex, "Managed OAuth");
+        let omo = create_native(&store, &AppType::OpenCode, "OMO");
         let connection = Connection::open(&path).unwrap();
         connection
             .execute(
                 &format!(
                     "DELETE FROM {ADAPTER_BINDINGS_TABLE}
                      WHERE (provider_id = ?1 AND app_type = 'claude')
-                        OR (provider_id = ?2 AND app_type = 'codex')"
+                        OR (provider_id = ?2 AND app_type = 'codex')
+                        OR (provider_id = ?3 AND app_type = 'opencode')"
                 ),
-                params![aggregator.id, managed.id],
+                params![aggregator.id, managed.id, omo.id],
             )
             .unwrap();
         connection
@@ -3088,8 +3649,15 @@ requires_openai_auth = true
                 [&managed.id],
             )
             .unwrap();
+        connection
+            .execute(
+                "UPDATE providers SET category = 'omo'
+                 WHERE id = ?1 AND app_type = 'opencode'",
+                [&omo.id],
+            )
+            .unwrap();
 
-        for app in [AppType::Claude, AppType::Codex] {
+        for app in [AppType::Claude, AppType::Codex, AppType::OpenCode] {
             let provider = store.list(app.as_str()).unwrap().pop().unwrap();
             assert!(!is_lite_writable(&provider));
             assert!(matches!(
@@ -3111,5 +3679,36 @@ requires_openai_auth = true
             ));
             assert_eq!(store.list(app.as_str()).unwrap()[0].name, provider.name);
         }
+
+        let action_called = std::cell::Cell::new(false);
+        let managed = store.list("codex").unwrap().pop().unwrap();
+        assert!(matches!(
+            store.switch_with_provider(
+                "codex",
+                &managed.id,
+                managed.revision,
+                |_, _| {
+                    action_called.set(true);
+                    Ok::<(), &str>(())
+                },
+                |_| Ok(()),
+            ),
+            Err(StoreError::InvalidProvider(_))
+        ));
+        let omo = store.list("opencode").unwrap().pop().unwrap();
+        assert!(matches!(
+            store.remove_from_live_with_provider(
+                "opencode",
+                &omo.id,
+                omo.revision,
+                |_| {
+                    action_called.set(true);
+                    Ok::<(), &str>(())
+                },
+                |_| Ok(()),
+            ),
+            Err(StoreError::InvalidProvider(_))
+        ));
+        assert!(!action_called.get());
     }
 }
