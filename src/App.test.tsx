@@ -1479,9 +1479,16 @@ describe("App", () => {
     });
     await user.click(settingsButton);
     expect(screen.getByRole("heading", { name: "Settings" })).toBeVisible();
-    expect(screen.getByRole("tab", { name: "General" })).toHaveFocus();
+    const generalTab = screen.getByRole("tab", { name: "General" });
+    expect(generalTab).toHaveFocus();
+    expect(generalTab).toHaveClass("bg-blue-600", "text-white");
+    expect(screen.getByRole("tab", { name: "About" })).not.toHaveClass(
+      "opacity-60",
+    );
 
-    await user.click(screen.getByRole("button", { name: "Dark" }));
+    const darkThemeButton = screen.getByRole("button", { name: "Dark" });
+    await user.click(darkThemeButton);
+    expect(darkThemeButton).toHaveClass("bg-blue-600", "text-white");
     expect(document.documentElement).toHaveClass("dark");
     expect(window.localStorage.getItem("cc-switch-lite:theme")).toBe("dark");
 
@@ -1494,7 +1501,16 @@ describe("App", () => {
     expect(
       screen.getByRole("heading", { name: "CC Switch Lite" }),
     ).toBeVisible();
-    expect(screen.getByText("Version 0.1.0-alpha.1")).toBeVisible();
+    expect(screen.getByText("v0.1.0-alpha.1")).toBeVisible();
+    expect(
+      screen.queryByRole("tab", { name: "Proxy" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("tab", { name: "Advanced" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /update/i }),
+    ).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Back to providers" }));
     await waitFor(() =>
