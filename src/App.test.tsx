@@ -1346,17 +1346,51 @@ describe("App", () => {
     expect(trigger).toHaveFocus();
   });
 
-  it("does not expose settings or a plugin marketplace", async () => {
+  it("provides minimal local settings without a plugin marketplace", async () => {
+    const user = userEvent.setup();
+    api.list.mockResolvedValue([workProvider]);
     render(<App />);
 
-    expect(
-      await screen.findByRole("heading", {
-        name: "Add your first Claude Code provider",
+    await user.click(
+      await screen.findByRole("button", { name: "Switch to Work" }),
+    );
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Work is now the Claude Code user default",
+    );
+    const settingsButton = screen.getByRole("button", {
+      name: "Open settings",
+    });
+    await user.click(settingsButton);
+    expect(screen.getByRole("heading", { name: "Settings" })).toBeVisible();
+    expect(screen.getByRole("tab", { name: "General" })).toHaveFocus();
+
+    await user.click(screen.getByRole("button", { name: "Dark" }));
+    expect(document.documentElement).toHaveClass("dark");
+    expect(window.localStorage.getItem("cc-switch-lite:theme")).toBe("dark");
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Hide Claude Code in application switcher",
       }),
-    ).toBeVisible();
+    );
+    await user.click(screen.getByRole("tab", { name: "About" }));
     expect(
-      screen.queryByRole("button", { name: "Open settings" }),
+      screen.getByRole("heading", { name: "CC Switch Lite" }),
+    ).toBeVisible();
+    expect(screen.getByText("Version 0.1.0-alpha.1")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Back to providers" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Open settings" }),
+      ).toHaveFocus(),
+    );
+    expect(
+      within(
+        screen.getByRole("navigation", { name: "Applications" }),
+      ).queryByRole("button", { name: "Claude Code" }),
     ).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Open plugin marketplace" }),
     ).not.toBeInTheDocument();

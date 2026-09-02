@@ -12,6 +12,8 @@ The project is in pre-alpha development. The first release is intentionally
 limited to provider switching, MCP configuration, and Skill configuration.
 Proxy routing, managed OAuth, usage tracking, prompts, and common configuration
 management remain in the full CC Switch application.
+Appearance and application visibility are local Lite preferences and do not
+write the shared CC Switch settings file.
 
 ## Development
 
