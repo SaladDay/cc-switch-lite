@@ -429,6 +429,11 @@ describe("App", () => {
       screen.getByRole("button", { name: "Manage MCP servers" }),
     );
     expect(await screen.findByText("Context7")).toBeVisible();
+    expect(
+      screen
+        .getByRole("button", { name: "Edit Context7" })
+        .closest(".hover-reveal-actions"),
+    ).toBeInTheDocument();
 
     await user.click(
       screen.getByRole("button", { name: "Enable Context7 for Codex" }),
@@ -556,7 +561,9 @@ describe("App", () => {
     expect(
       screen.getByRole("button", { name: "Add Claude Code provider" }),
     ).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Edit Work" })).toBeEnabled();
+    const editButton = screen.getByRole("button", { name: "Edit Work" });
+    expect(editButton).toBeEnabled();
+    expect(editButton.closest(".hover-reveal-actions")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Delete Work" })).toBeEnabled();
     expect(
       screen.getByRole("button", {
@@ -862,7 +869,13 @@ describe("App", () => {
     );
     const dialog = screen.getByRole("dialog", { name: "Add New Provider" });
     await user.type(within(dialog).getByLabelText("API key"), "private-key");
-    await user.click(within(dialog).getByRole("button", { name: "Kimi" }));
+    const customPreset = within(dialog).getByRole("button", { name: "Custom" });
+    const kimiPreset = within(dialog).getByRole("button", { name: "Kimi" });
+    expect(customPreset).toHaveAttribute("aria-pressed", "true");
+    await user.click(kimiPreset);
+    expect(customPreset).toHaveAttribute("aria-pressed", "false");
+    expect(kimiPreset).toHaveAttribute("aria-pressed", "true");
+    expect(kimiPreset).toHaveClass("bg-blue-600");
 
     expect(within(dialog).getByLabelText("Provider name")).toHaveValue("Kimi");
     expect(within(dialog).getByLabelText(/Base URL/)).toHaveValue(

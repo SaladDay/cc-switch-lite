@@ -307,7 +307,7 @@ export const McpPanel = forwardRef<McpPanelHandle, McpPanelProps>(
                       }
                       disabled={blocked}
                     />
-                    <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+                    <div className="hover-reveal-actions flex shrink-0 items-center gap-0.5 transition-opacity">
                       <Button
                         variant="ghost"
                         size="icon"

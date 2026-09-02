@@ -35,7 +35,7 @@ export function SimpleProviderPresetSelector({
   const presetClass = (active: boolean) =>
     `inline-flex w-full items-center justify-start gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
       active
-        ? "bg-blue-500 text-white dark:bg-blue-600"
+        ? "bg-blue-600 text-white dark:bg-blue-600"
         : "bg-accent text-muted-foreground hover:bg-accent/80"
     }`;
 
@@ -82,10 +82,15 @@ export function SimpleProviderPresetSelector({
         </div>
       </div>
 
-      <div className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-2">
+      <div
+        role="group"
+        aria-label="Provider presets"
+        className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-2"
+      >
         <button
           type="button"
           className={presetClass(selectedId === "custom")}
+          aria-pressed={selectedId === "custom"}
           onClick={() => onSelect(null)}
         >
           <span className="size-4" aria-hidden="true" />
@@ -96,6 +101,7 @@ export function SimpleProviderPresetSelector({
             key={preset.id}
             type="button"
             className={presetClass(selectedId === preset.id)}
+            aria-pressed={selectedId === preset.id}
             title={preset.name}
             onClick={() => onSelect(preset)}
           >
