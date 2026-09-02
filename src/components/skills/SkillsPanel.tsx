@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, LoaderCircle, Search, Sparkles, X } from "lucide-react";
+import { LoaderCircle, Search, Sparkles } from "lucide-react";
 
-import { appDefinition } from "../../lib/apps";
 import { errorMessage } from "../../lib/providers";
 import { skillsApi } from "../../lib/skills";
 import type {
@@ -10,8 +9,10 @@ import type {
   SkillControlReason,
 } from "../../lib/skill-types";
 import type { CoreAppDescriptor } from "../../lib/provider-types";
-import { ProviderIcon } from "../ProviderIcon";
-import { Input } from "../ui/input";
+import { AppCountBar } from "../common/AppCountBar";
+import { AppToggleGroup } from "../common/AppToggleGroup";
+import { ListItemRow } from "../common/ListItemRow";
+import { ManagementListSearch } from "../common/ManagementListSearch";
 
 interface SkillsPanelProps {
   apps: CoreAppDescriptor[];
@@ -139,51 +140,19 @@ export function SkillsPanel({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-6">
-      <div className="mb-4 flex flex-shrink-0 items-center gap-4 rounded-xl border border-white/10 px-6 py-4 glass">
-        <span className="h-7 shrink-0 rounded-full border border-border-default bg-background/50 px-3 py-1 text-xs font-medium">
-          {skills.length} installed
-        </span>
-        <div className="ml-auto flex min-w-0 gap-2 overflow-x-auto">
-          {skillApps.map((app) => {
-            const definition = appDefinition(app.id, [app]);
-            return (
-              <span
-                key={app.id}
-                className="flex shrink-0 items-center gap-1.5 rounded-full bg-muted px-2.5 py-1 text-xs text-muted-foreground"
-              >
-                <ProviderIcon
-                  icon={definition.icon}
-                  name={definition.label}
-                  size={14}
-                />
-                {definition.label}:{" "}
-                <strong className="text-foreground">{counts[app.id]}</strong>
-              </span>
-            );
-          })}
-        </div>
-      </div>
+      <AppCountBar
+        totalLabel={`${skills.length} installed`}
+        counts={counts}
+        apps={skillApps}
+      />
 
-      <div className="relative mb-4 flex-shrink-0" role="search">
-        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-        <Input
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          placeholder="Search installed Skills…"
-          aria-label="Search installed Skills"
-          className="pl-9 pr-9"
-        />
-        {search && (
-          <button
-            type="button"
-            onClick={() => setSearch("")}
-            aria-label="Clear Skill search"
-            className="absolute right-2 top-1/2 flex h-7 w-7 -translate-y-1/2 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        )}
-      </div>
+      <ManagementListSearch
+        value={search}
+        onValueChange={setSearch}
+        placeholder="Search installed skill name, description, or repo..."
+        ariaLabel="Search installed skills"
+        clearLabel="Clear Skill search"
+      />
 
       {error && (
         <p
@@ -194,100 +163,78 @@ export function SkillsPanel({
         </p>
       )}
 
-      <div className="min-h-0 flex-1 overflow-y-auto pb-20">
-        {loading ? (
-          <div className="flex justify-center py-12 text-muted-foreground">
-            <LoaderCircle className="h-5 w-5 animate-spin" />
-          </div>
-        ) : skills.length === 0 ? (
-          <div className="py-12 text-center">
-            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-muted">
-              <Sparkles className="h-6 w-6 text-muted-foreground" />
+      <div className="-mr-3 min-h-0 flex-1 overflow-y-auto">
+        <div className="pb-24 pr-3">
+          {loading ? (
+            <div className="flex justify-center py-12 text-muted-foreground">
+              <LoaderCircle className="h-5 w-5 animate-spin" />
             </div>
-            <h2 className="text-lg font-medium">No installed Skills</h2>
-            <p className="mt-2 text-sm text-muted-foreground">
-              Install Skills in CC Switch, then choose which applications use
-              them here.
-            </p>
-          </div>
-        ) : filtered.length === 0 ? (
-          <div className="py-12 text-center text-sm text-muted-foreground">
-            No matching Skills.
-          </div>
-        ) : (
-          <div className="overflow-hidden rounded-xl border border-border-default">
-            {filtered.map((skill, index) => (
-              <div
-                key={skill.id}
-                className={`group flex items-center gap-3 px-4 py-2.5 transition-colors hover:bg-muted/50 ${
-                  index < filtered.length - 1
-                    ? "border-b border-border-default"
-                    : ""
-                }`}
-              >
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-medium">{skill.name}</p>
-                  <p
-                    className="truncate text-xs text-muted-foreground"
-                    title={skill.description || skill.directory}
-                  >
-                    {skill.description || skill.directory}
-                  </p>
-                </div>
-                <div className="flex shrink-0 items-center gap-1.5">
-                  {skillApps.map((app) => {
-                    const definition = appDefinition(app.id, [app]);
-                    const state = stateFor(skill, app.id);
-                    const selected = state?.selected === true;
-                    const drift =
-                      state?.enabled === null ||
-                      (state?.enabled !== undefined &&
-                        state.enabled !== state.selected);
-                    const canToggle =
-                      state?.selected !== null &&
-                      (selected ? state?.canDisable : state?.canEnable);
-                    const key = `${skill.id}:${app.id}`;
-                    const title = stateTitle(state);
-                    return (
-                      <button
-                        key={app.id}
-                        type="button"
-                        disabled={blocked || !canToggle}
-                        onClick={() => state && void toggle(skill, app, state)}
-                        aria-label={`${selected ? "Disable" : "Enable"} ${skill.name} for ${definition.label}${title ? `. ${title}` : ""}`}
-                        aria-pressed={selected}
-                        title={title || definition.label}
-                        className={`relative flex h-7 w-7 cursor-pointer items-center justify-center rounded-lg transition-all disabled:cursor-not-allowed ${
-                          drift
-                            ? "bg-amber-500/15 opacity-100"
-                            : selected
-                              ? "bg-emerald-500/15 opacity-100"
-                              : "opacity-35 hover:opacity-70"
-                        }`}
-                      >
-                        {busyKey === key ? (
-                          <LoaderCircle className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <ProviderIcon
-                            icon={definition.icon}
-                            name={definition.label}
-                            size={17}
-                          />
-                        )}
-                        {drift && busyKey !== key && (
-                          <AlertTriangle
-                            className="absolute -right-1 -top-1 h-3 w-3 text-amber-500"
-                            aria-hidden="true"
-                          />
-                        )}
-                      </button>
-                    );
-                  })}
-                </div>
+          ) : skills.length === 0 ? (
+            <div className="py-12 text-center">
+              <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-muted">
+                <Sparkles className="h-6 w-6 text-muted-foreground" />
               </div>
-            ))}
-          </div>
-        )}
+              <h2 className="text-lg font-medium">No skills installed</h2>
+              <p className="mt-2 text-sm text-muted-foreground">
+                Skills already present in the shared catalog will appear here.
+              </p>
+            </div>
+          ) : filtered.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-12 text-center text-muted-foreground">
+              <Search className="mb-4 h-10 w-10 opacity-40" />
+              <p className="text-sm">No installed skills match your search</p>
+            </div>
+          ) : (
+            <div className="overflow-hidden rounded-xl border border-border-default">
+              {filtered.map((skill, index) => (
+                <ListItemRow
+                  key={skill.id}
+                  isLast={index === filtered.length - 1}
+                >
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium">{skill.name}</p>
+                    <p
+                      className="truncate text-xs text-muted-foreground"
+                      title={skill.description || skill.directory}
+                    >
+                      {skill.description || skill.directory}
+                    </p>
+                  </div>
+                  <AppToggleGroup
+                    apps={skillApps}
+                    stateFor={(appId) => {
+                      const state = stateFor(skill, appId);
+                      const enabled = state?.selected === true;
+                      const warning =
+                        state?.enabled === null ||
+                        (state?.enabled !== undefined &&
+                          state.enabled !== state.selected);
+                      const canToggle =
+                        state?.selected !== null &&
+                        (enabled ? state?.canDisable : state?.canEnable);
+                      return {
+                        enabled,
+                        warning,
+                        disabled: !canToggle,
+                        pending: busyKey === `${skill.id}:${appId}`,
+                        title: stateTitle(state),
+                      };
+                    }}
+                    onToggle={(appId) => {
+                      const app = skillApps.find((item) => item.id === appId);
+                      const state = stateFor(skill, appId);
+                      if (app && state) void toggle(skill, app, state);
+                    }}
+                    ariaLabel={(_, state, label) =>
+                      `${state.enabled ? "Disable" : "Enable"} ${skill.name} for ${label}${state.title ? `. ${state.title}` : ""}`
+                    }
+                    disabled={blocked}
+                  />
+                </ListItemRow>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

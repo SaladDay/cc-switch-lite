@@ -13,17 +13,17 @@ import {
   Search,
   Server,
   Trash2,
-  X,
 } from "lucide-react";
 
-import { appDefinition } from "../../lib/apps";
 import { errorMessage } from "../../lib/providers";
 import { mcpApi } from "../../lib/mcp";
 import type { McpServer } from "../../lib/mcp-types";
 import type { CoreAppDescriptor } from "../../lib/provider-types";
-import { ProviderIcon } from "../ProviderIcon";
+import { AppCountBar } from "../common/AppCountBar";
+import { AppToggleGroup } from "../common/AppToggleGroup";
+import { ListItemRow } from "../common/ListItemRow";
+import { ManagementListSearch } from "../common/ManagementListSearch";
 import { Button } from "../ui/button";
-import { Input } from "../ui/input";
 import { DeleteMcpDialog } from "./DeleteMcpDialog";
 import { McpDialog } from "./McpDialog";
 
@@ -215,51 +215,19 @@ export const McpPanel = forwardRef<McpPanelHandle, McpPanelProps>(
 
     return (
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-6">
-        <div className="mb-4 flex flex-shrink-0 items-center gap-4 rounded-xl border border-white/10 px-6 py-4 glass">
-          <span className="h-7 shrink-0 rounded-full border border-border-default bg-background/50 px-3 py-1 text-xs font-medium">
-            {servers.length} server{servers.length === 1 ? "" : "s"}
-          </span>
-          <div className="ml-auto flex min-w-0 gap-2 overflow-x-auto">
-            {apps.map((app) => {
-              const definition = appDefinition(app.id, [app]);
-              return (
-                <span
-                  key={app.id}
-                  className="flex shrink-0 items-center gap-1.5 rounded-full bg-muted px-2.5 py-1 text-xs text-muted-foreground"
-                >
-                  <ProviderIcon
-                    icon={definition.icon}
-                    name={definition.label}
-                    size={14}
-                  />
-                  {definition.label}:{" "}
-                  <strong className="text-foreground">{counts[app.id]}</strong>
-                </span>
-              );
-            })}
-          </div>
-        </div>
+        <AppCountBar
+          totalLabel={`${servers.length} MCP server${servers.length === 1 ? "" : "s"} configured`}
+          counts={counts}
+          apps={apps}
+        />
 
-        <div className="relative mb-4 flex-shrink-0" role="search">
-          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="Search MCP servers…"
-            aria-label="Search MCP servers"
-            className="pl-9 pr-9"
-          />
-          {search && (
-            <button
-              type="button"
-              onClick={() => setSearch("")}
-              aria-label="Clear MCP search"
-              className="absolute right-2 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground hover:bg-muted"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          )}
-        </div>
+        <ManagementListSearch
+          value={search}
+          onValueChange={setSearch}
+          placeholder="Search MCP name, description, tag, or command..."
+          ariaLabel="Search managed MCP servers"
+          clearLabel="Clear MCP search"
+        />
 
         {(error || notice) && (
           <div className="mb-4 space-y-2">
@@ -282,106 +250,96 @@ export const McpPanel = forwardRef<McpPanelHandle, McpPanelProps>(
           </div>
         )}
 
-        <div className="min-h-0 flex-1 overflow-y-auto pb-20">
-          {loading ? (
-            <div className="flex justify-center py-12 text-muted-foreground">
-              <LoaderCircle className="h-5 w-5 animate-spin" />
-            </div>
-          ) : servers.length === 0 ? (
-            <div className="py-12 text-center">
-              <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-muted">
-                <Server className="h-6 w-6 text-muted-foreground" />
+        <div className="-mr-3 min-h-0 flex-1 overflow-y-auto">
+          <div className="pb-24 pr-3">
+            {loading ? (
+              <div className="flex justify-center py-12 text-muted-foreground">
+                <LoaderCircle className="h-5 w-5 animate-spin" />
               </div>
-              <h2 className="text-lg font-medium">No MCP servers</h2>
-              <p className="mt-2 text-sm text-muted-foreground">
-                Add a server or import existing application configuration.
-              </p>
-            </div>
-          ) : filtered.length === 0 ? (
-            <div className="py-12 text-center text-sm text-muted-foreground">
-              No matching MCP servers.
-            </div>
-          ) : (
-            <div className="overflow-hidden rounded-xl border border-border-default">
-              {filtered.map((server, index) => (
-                <div
-                  key={server.id}
-                  className={`group flex items-center gap-3 px-4 py-2.5 transition-colors hover:bg-muted/50 ${
-                    index < filtered.length - 1
-                      ? "border-b border-border-default"
-                      : ""
-                  }`}
-                >
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium">
-                      {server.name || server.id}
-                    </p>
-                    <p className="truncate text-xs text-muted-foreground">
-                      {server.description ||
-                        server.tags?.join(", ") ||
-                        server.id}
-                    </p>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-1.5">
-                    {apps.map((app) => {
-                      const definition = appDefinition(app.id, [app]);
-                      const enabled = Boolean(server.apps[app.id]);
-                      return (
-                        <button
-                          key={app.id}
-                          type="button"
-                          disabled={blocked}
-                          onClick={() => void toggle(server, app.id)}
-                          aria-label={`${enabled ? "Disable" : "Enable"} ${server.name || server.id} for ${definition.label}`}
-                          aria-pressed={enabled}
-                          title={definition.label}
-                          className={`flex h-7 w-7 items-center justify-center rounded-lg transition-all disabled:cursor-not-allowed ${
-                            enabled
-                              ? "bg-emerald-500/15 opacity-100"
-                              : "opacity-35 hover:opacity-70"
-                          }`}
-                        >
-                          <ProviderIcon
-                            icon={definition.icon}
-                            name={definition.label}
-                            size={17}
-                          />
-                        </button>
-                      );
-                    })}
-                  </div>
-                  <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-7 w-7"
-                      disabled={blocked}
-                      onClick={() => {
-                        setError(null);
-                        setEditing(server);
-                      }}
-                      aria-label={`Edit ${server.name || server.id}`}
-                    >
-                      <Edit3 className="h-3.5 w-3.5" />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-7 w-7 hover:bg-red-100 hover:text-red-500 dark:hover:bg-red-500/10"
-                      disabled={blocked}
-                      onClick={() => {
-                        setError(null);
-                        setDeleting(server);
-                      }}
-                      aria-label={`Delete ${server.name || server.id}`}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </Button>
-                  </div>
+            ) : servers.length === 0 ? (
+              <div className="py-12 text-center">
+                <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-muted">
+                  <Server className="h-6 w-6 text-muted-foreground" />
                 </div>
-              ))}
-            </div>
-          )}
+                <h2 className="text-lg font-medium">No servers yet</h2>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  Click the button in the top right to add your first MCP
+                  server.
+                </p>
+              </div>
+            ) : filtered.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-12 text-center text-muted-foreground">
+                <Search className="mb-4 h-10 w-10 opacity-40" />
+                <p className="text-sm">No MCP servers match your search</p>
+              </div>
+            ) : (
+              <div className="overflow-hidden rounded-xl border border-border-default">
+                {filtered.map((server, index) => (
+                  <ListItemRow
+                    key={server.id}
+                    isLast={index === filtered.length - 1}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-medium">
+                        {server.name || server.id}
+                      </p>
+                      {server.description ? (
+                        <p
+                          className="truncate text-xs text-muted-foreground"
+                          title={server.description}
+                        >
+                          {server.description}
+                        </p>
+                      ) : server.tags?.length ? (
+                        <p className="truncate text-xs text-muted-foreground/60">
+                          {server.tags.join(", ")}
+                        </p>
+                      ) : null}
+                    </div>
+                    <AppToggleGroup
+                      apps={apps}
+                      stateFor={(appId) => ({
+                        enabled: Boolean(server.apps[appId]),
+                      })}
+                      onToggle={(appId) => void toggle(server, appId)}
+                      ariaLabel={(_, state, label) =>
+                        `${state.enabled ? "Disable" : "Enable"} ${server.name || server.id} for ${label}`
+                      }
+                      disabled={blocked}
+                    />
+                    <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7"
+                        disabled={blocked}
+                        onClick={() => {
+                          setError(null);
+                          setEditing(server);
+                        }}
+                        aria-label={`Edit ${server.name || server.id}`}
+                      >
+                        <Edit3 className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 hover:bg-red-100 hover:text-red-500 dark:hover:bg-red-500/10"
+                        disabled={blocked}
+                        onClick={() => {
+                          setError(null);
+                          setDeleting(server);
+                        }}
+                        aria-label={`Delete ${server.name || server.id}`}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  </ListItemRow>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
 
         {editing && (

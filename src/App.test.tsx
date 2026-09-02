@@ -337,18 +337,25 @@ describe("App", () => {
       name: "Add your first Claude Code provider",
     });
     await user.click(screen.getByRole("button", { name: "Manage Skills" }));
-    expect(screen.getByRole("heading", { name: "Skills" })).toBeVisible();
     expect(
-      await screen.findByRole("heading", { name: "No installed Skills" }),
+      screen.getByRole("heading", { name: "Skills Management" }),
     ).toBeVisible();
+    expect(
+      await screen.findByRole("heading", { name: "No skills installed" }),
+    ).toBeVisible();
+    expect(screen.getByText("0 installed")).toBeVisible();
+    expect(screen.queryByRole("button", { name: /discover/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /install/i })).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Back to providers" }));
     await user.click(
       screen.getByRole("button", { name: "Manage MCP servers" }),
     );
-    expect(screen.getByRole("heading", { name: "MCP Servers" })).toBeVisible();
     expect(
-      await screen.findByRole("heading", { name: "No MCP servers" }),
+      screen.getByRole("heading", { name: "MCP Server Management" }),
+    ).toBeVisible();
+    expect(
+      await screen.findByRole("heading", { name: "No servers yet" }),
     ).toBeVisible();
   });
 
@@ -362,6 +369,7 @@ describe("App", () => {
     });
     await user.click(screen.getByRole("button", { name: "Manage Skills" }));
     expect(await screen.findByText("Demo Skill")).toBeVisible();
+    expect(screen.getByText("1 installed")).toBeVisible();
 
     const claude = screen.getByRole("button", {
       name: "Disable Demo Skill for Claude Code",
@@ -395,7 +403,7 @@ describe("App", () => {
     await waitFor(() => expect(add).toBeDisabled());
     await user.click(add);
     expect(
-      screen.queryByRole("heading", { name: "Add MCP server" }),
+      screen.queryByRole("heading", { name: "Add MCP" }),
     ).not.toBeInTheDocument();
 
     initial.resolve([]);
@@ -429,9 +437,21 @@ describe("App", () => {
       expect(mcp.toggle).toHaveBeenCalledWith("context7", "codex", true, 1),
     );
     await waitFor(() => expect(mcp.list).toHaveBeenCalledTimes(2));
-    expect(
-      screen.getByRole("button", { name: "Disable Context7 for Codex" }),
-    ).toHaveAttribute("aria-pressed", "true");
+    const codex = screen.getByRole("button", {
+      name: "Disable Context7 for Codex",
+    });
+    expect(codex).toHaveAttribute("aria-pressed", "true");
+    expect(codex).toHaveClass("bg-green-500/10");
+    expect(screen.getByText("1 MCP server configured")).toBeVisible();
+
+    const search = screen.getByRole("textbox", {
+      name: "Search managed MCP servers",
+    });
+    await user.type(search, "missing");
+    expect(screen.getByText("No MCP servers match your search")).toBeVisible();
+    await user.keyboard("{Escape}");
+    expect(search).toHaveValue("");
+    expect(screen.getByText("Context7")).toBeVisible();
   });
 
   it("adds an MCP preset without exposing a raw configuration editor", async () => {
@@ -444,15 +464,23 @@ describe("App", () => {
     await user.click(
       screen.getByRole("button", { name: "Manage MCP servers" }),
     );
-    await screen.findByRole("heading", { name: "No MCP servers" });
+    await screen.findByRole("heading", { name: "No servers yet" });
     await user.click(screen.getByRole("button", { name: "Add MCP" }));
-    expect(
-      screen.getByRole("heading", { name: "Add MCP server" }),
-    ).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Add MCP" })).toBeVisible();
     expect(screen.queryByText("JSON configuration")).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "context7" }));
-    await user.click(screen.getByRole("button", { name: "Add server" }));
+    expect(screen.getByRole("button", { name: "Custom" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByRole("button", { name: "stdio" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    const preset = screen.getByRole("button", { name: "context7" });
+    await user.click(preset);
+    expect(preset).toHaveAttribute("aria-pressed", "true");
+    await user.click(screen.getByRole("button", { name: "Add" }));
     await waitFor(() => expect(mcp.upsert).toHaveBeenCalledTimes(1));
     expect(mcp.upsert.mock.calls[0][0]).toMatchObject({
       id: "context7",
@@ -610,7 +638,7 @@ describe("App", () => {
       "catalog unavailable",
     );
     expect(
-      screen.queryByRole("heading", { name: "MCP Servers" }),
+      screen.queryByRole("heading", { name: "MCP Server Management" }),
     ).not.toBeInTheDocument();
     expect(
       screen.queryByLabelText("MCP Servers placeholder"),

@@ -67,13 +67,15 @@ export function McpDialog({
   onCancel,
   onSave,
 }: McpDialogProps) {
+  const editing = server !== undefined;
   const [base, setBase] = useState<McpServer | undefined>(server);
   const [form, setForm] = useState<McpFormValue>(() =>
     server ? specToForm(server) : emptyForm(apps),
   );
-  const [selectedPreset, setSelectedPreset] = useState<string | null>(null);
+  const [selectedPreset, setSelectedPreset] = useState<string | null>(
+    editing ? null : "custom",
+  );
   const [validationError, setValidationError] = useState<string | null>(null);
-  const editing = server !== undefined;
   const duplicate = useMemo(
     () => !editing && existingIds.includes(form.id.trim()),
     [editing, existingIds, form.id],
@@ -121,9 +123,8 @@ export function McpDialog({
 
   return (
     <FullScreenPanel
-      title={editing ? "Edit MCP server" : "Add MCP server"}
+      title={editing ? "Edit MCP" : "Add MCP"}
       titleId="mcp-editor-title"
-      description="Configure one server and choose where it is enabled."
       closeLabel="Close MCP editor"
       busy={busy}
       onClose={onCancel}
@@ -136,79 +137,95 @@ export function McpDialog({
           ) : (
             <Plus className="mr-2 h-4 w-4" />
           )}
-          {busy ? "Saving…" : editing ? "Save" : "Add server"}
+          {busy ? "Saving…" : editing ? "Save" : "Add"}
         </Button>
       }
     >
-      <div className="mx-auto w-full max-w-4xl space-y-6">
-        {!editing && (
-          <section className="glass rounded-xl border border-white/10 p-6">
-            <h3 className="mb-3 text-sm font-medium">Preset</h3>
-            <div className="flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={selectCustom}
-                className={cn(
-                  "rounded-lg px-4 py-2 text-sm font-medium transition-colors",
-                  selectedPreset === "custom"
-                    ? "bg-emerald-500 text-white"
-                    : "bg-accent text-muted-foreground hover:bg-accent/80",
-                )}
+      <div className="flex h-full flex-col gap-6">
+        <section className="glass flex-shrink-0 space-y-6 rounded-xl border border-white/10 p-6">
+          {!editing && (
+            <div>
+              <h3 className="mb-3 text-sm font-medium">Preset</h3>
+              <div
+                className="flex flex-wrap gap-2"
+                role="group"
+                aria-label="MCP preset"
               >
-                Custom
-              </button>
-              {MCP_PRESETS.map((preset) => (
                 <button
-                  key={preset.id}
                   type="button"
-                  onClick={() => selectPreset(preset)}
-                  title={preset.description}
+                  onClick={selectCustom}
+                  aria-pressed={selectedPreset === "custom"}
                   className={cn(
                     "rounded-lg px-4 py-2 text-sm font-medium transition-colors",
-                    selectedPreset === preset.id
-                      ? "bg-emerald-500 text-white"
+                    selectedPreset === "custom"
+                      ? "bg-emerald-500 text-white dark:bg-emerald-600"
                       : "bg-accent text-muted-foreground hover:bg-accent/80",
                   )}
                 >
-                  {preset.id}
+                  Custom
                 </button>
-              ))}
+                {MCP_PRESETS.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    onClick={() => selectPreset(preset)}
+                    aria-pressed={selectedPreset === preset.id}
+                    title={preset.description}
+                    className={cn(
+                      "rounded-lg px-4 py-2 text-sm font-medium transition-colors",
+                      selectedPreset === preset.id
+                        ? "bg-emerald-500 text-white dark:bg-emerald-600"
+                        : "bg-accent text-muted-foreground hover:bg-accent/80",
+                    )}
+                  >
+                    {preset.id}
+                  </button>
+                ))}
+              </div>
             </div>
-          </section>
-        )}
+          )}
 
-        <section className="glass space-y-5 rounded-xl border border-white/10 p-6">
-          <div className="grid gap-5 sm:grid-cols-2">
-            <label className="space-y-2 text-sm font-medium">
-              <span>Server ID *</span>
-              <Input
-                value={form.id}
-                disabled={editing || busy}
-                onChange={(event) => update("id", event.target.value)}
-                placeholder="context7"
-                aria-invalid={duplicate || undefined}
-              />
+          <div>
+            <label
+              htmlFor="mcp-server-id"
+              className="mb-2 block text-sm font-medium"
+            >
+              Server ID <span className="text-red-500">*</span>
             </label>
-            <label className="space-y-2 text-sm font-medium">
-              <span>Name</span>
-              <Input
-                value={form.name}
-                disabled={busy}
-                onChange={(event) => update("name", event.target.value)}
-                placeholder="Context7"
-              />
+            <Input
+              id="mcp-server-id"
+              value={form.id}
+              disabled={editing || busy}
+              onChange={(event) => update("id", event.target.value)}
+              placeholder="context7"
+              aria-invalid={duplicate || undefined}
+            />
+          </div>
+          <div>
+            <label
+              htmlFor="mcp-server-name"
+              className="mb-2 block text-sm font-medium"
+            >
+              Name
             </label>
+            <Input
+              id="mcp-server-name"
+              value={form.name}
+              disabled={busy}
+              onChange={(event) => update("name", event.target.value)}
+              placeholder="Context7"
+            />
           </div>
 
           <div>
             <p className="mb-3 text-sm font-medium">Enabled applications</p>
-            <div className="flex flex-wrap gap-3">
+            <div className="flex flex-wrap gap-4">
               {apps.map((app) => {
                 const definition = appDefinition(app.id, [app]);
                 return (
                   <label
                     key={app.id}
-                    className="flex cursor-pointer items-center gap-2 rounded-lg bg-accent/60 px-3 py-2 text-sm"
+                    className="flex cursor-pointer select-none items-center gap-2 text-sm"
                   >
                     <input
                       type="checkbox"
@@ -235,16 +252,21 @@ export function McpDialog({
           </div>
         </section>
 
-        <section className="glass space-y-5 rounded-xl border border-white/10 p-6">
+        <section className="glass flex min-h-0 flex-1 flex-col space-y-5 rounded-xl border border-white/10 p-6">
           <div>
             <p className="mb-3 text-sm font-medium">Connection</p>
-            <div className="inline-flex rounded-lg bg-muted p-1">
+            <div
+              className="inline-flex rounded-lg bg-muted p-1"
+              role="group"
+              aria-label="MCP transport"
+            >
               {(["stdio", "http", "sse"] as const).map((transport) => (
                 <button
                   key={transport}
                   type="button"
                   disabled={busy}
                   onClick={() => update("transport", transport)}
+                  aria-pressed={form.transport === transport}
                   className={cn(
                     "rounded-md px-4 py-1.5 text-sm font-medium uppercase transition-colors",
                     form.transport === transport

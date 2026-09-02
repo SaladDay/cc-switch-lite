@@ -722,9 +722,9 @@ export default function App() {
   });
   const viewTitle =
     currentView === "mcp"
-      ? "MCP Servers"
+      ? "MCP Server Management"
       : currentView === "skills"
-        ? "Skills"
+        ? "Skills Management"
         : "Settings";
 
   return (
