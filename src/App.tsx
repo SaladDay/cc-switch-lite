@@ -259,6 +259,17 @@ export default function App() {
     [],
   );
 
+  const selectApp = useCallback((app: AppId) => {
+    setActiveApp(app);
+    setEditing(null);
+    setDeleting(null);
+    setMutationError(null);
+    setLiveError(null);
+    setCurrentError(null);
+    setNotice(null);
+    window.localStorage.setItem(APP_STORAGE_KEY, app);
+  }, []);
+
   useEffect(() => {
     const media = globalThis.matchMedia?.("(prefers-color-scheme: dark)");
     const apply = () => {
@@ -289,10 +300,9 @@ export default function App() {
       return;
     }
     if (!appIsVisible(appVisibility, activeApp)) {
-      setActiveApp(nextVisible[0].id);
-      window.localStorage.setItem(APP_STORAGE_KEY, nextVisible[0].id);
+      selectApp(nextVisible[0].id);
     }
-  }, [activeApp, appCatalog, appVisibility]);
+  }, [activeApp, appCatalog, appVisibility, selectApp]);
 
   useEffect(() => {
     window.localStorage.setItem(VIEW_STORAGE_KEY, currentView);
@@ -477,17 +487,6 @@ export default function App() {
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
   }, [activeApp, currentStateReady, refreshCurrent]);
-
-  const selectApp = (app: AppId) => {
-    setActiveApp(app);
-    setEditing(null);
-    setDeleting(null);
-    setMutationError(null);
-    setLiveError(null);
-    setCurrentError(null);
-    setNotice(null);
-    window.localStorage.setItem(APP_STORAGE_KEY, app);
-  };
 
   const openEditor = (provider: ProviderRecord | "new") => {
     if (!providerActionsReady) return;

@@ -1348,11 +1348,15 @@ describe("App", () => {
 
   it("provides minimal local settings without a plugin marketplace", async () => {
     const user = userEvent.setup();
+    api.list.mockResolvedValue([workProvider]);
     render(<App />);
 
-    await screen.findByRole("heading", {
-      name: "Add your first Claude Code provider",
-    });
+    await user.click(
+      await screen.findByRole("button", { name: "Switch to Work" }),
+    );
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Work is now the Claude Code user default",
+    );
     const settingsButton = screen.getByRole("button", {
       name: "Open settings",
     });
@@ -1366,7 +1370,7 @@ describe("App", () => {
 
     await user.click(
       screen.getByRole("button", {
-        name: "Hide Codex in application switcher",
+        name: "Hide Claude Code in application switcher",
       }),
     );
     await user.click(screen.getByRole("tab", { name: "About" }));
@@ -1384,8 +1388,9 @@ describe("App", () => {
     expect(
       within(
         screen.getByRole("navigation", { name: "Applications" }),
-      ).queryByRole("button", { name: "Codex" }),
+      ).queryByRole("button", { name: "Claude Code" }),
     ).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Open plugin marketplace" }),
     ).not.toBeInTheDocument();
