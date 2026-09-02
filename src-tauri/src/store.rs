@@ -1,15 +1,20 @@
 use std::{
     collections::HashSet,
-    fs::{self, OpenOptions},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use std::fs;
+
 use cc_switch_core::{builtin_app_adapter, AppType};
+use cc_switch_store::{
+    read_provider_row, read_provider_rows, ProviderRow as SharedProviderRow, SharedDatabase,
+    SharedStoreError,
+};
 use hmac::{Hmac, Mac};
 use rusqlite::{
-    params, types::ValueRef, Connection, OpenFlags, OptionalExtension, Row, Transaction,
-    TransactionBehavior,
+    params, types::ValueRef, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
 };
 use serde_json::{Map, Value};
 use sha2::Sha256;
@@ -25,7 +30,6 @@ use crate::provider::{
 use crate::provider::{validate_settings, AdapterDescriptor, ProviderUpdate};
 
 const SAFE_JS_INTEGER_MASK: u64 = (1_u64 << 53) - 1;
-const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const ADAPTER_BINDINGS_TABLE: &str = "cc_switch_lite_provider_adapters";
 const MAX_NATIVE_SETTINGS_BYTES: usize = 1024 * 1024;
 
@@ -67,6 +71,17 @@ impl StoreError {
     }
 }
 
+impl From<SharedStoreError> for StoreError {
+    fn from(error: SharedStoreError) -> Self {
+        match error {
+            SharedStoreError::Io { path, source } => Self::Io { path, source },
+            SharedStoreError::Database(error) => Self::Database(error),
+            SharedStoreError::InvalidDatabase(message) => Self::InvalidStore(message),
+            other => Self::InvalidStore(other.to_string()),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct StoredProvider {
     record: ProviderRecord,
@@ -88,6 +103,14 @@ struct NewProvider {
     settings: Value,
     category: Option<String>,
     metadata: Value,
+}
+
+#[derive(Default)]
+struct StoredAdapterBinding {
+    provider_created_at: Option<i64>,
+    adapter: Option<String>,
+    compatibility_settings: Option<String>,
+    extensions: Option<String>,
 }
 
 fn provider_for_live_action(
@@ -114,7 +137,7 @@ fn provider_for_live_action(
 }
 
 pub struct ProviderStore {
-    path: PathBuf,
+    database: SharedDatabase,
     revision_key: [u8; 16],
 }
 
@@ -124,8 +147,10 @@ impl ProviderStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self, StoreError> {
+        let database = SharedDatabase::open(path)?;
+        database.ensure_provider_schema()?;
         let store = Self {
-            path,
+            database,
             revision_key: *Uuid::new_v4().as_bytes(),
         };
         store.initialize()?;
@@ -1035,71 +1060,9 @@ impl ProviderStore {
     }
 
     fn initialize(&self) -> Result<(), StoreError> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|source| StoreError::Io {
-                path: parent.to_owned(),
-                source,
-            })?;
-        }
-        let exists = match fs::symlink_metadata(&self.path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(StoreError::InvalidStore(
-                    "shared provider database must not be a symbolic link".to_owned(),
-                ));
-            }
-            Ok(metadata) if metadata.is_file() => true,
-            Ok(_) => {
-                return Err(StoreError::InvalidStore(
-                    "shared provider database must be a regular file".to_owned(),
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(source) => {
-                return Err(StoreError::Io {
-                    path: self.path.clone(),
-                    source,
-                });
-            }
-        };
-        if !exists {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            match options.open(&self.path) {
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(source) => {
-                    return Err(StoreError::Io {
-                        path: self.path.clone(),
-                        source,
-                    });
-                }
-            }
-        }
         let connection = self.connect()?;
         connection.execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS providers (
-                id TEXT NOT NULL,
-                app_type TEXT NOT NULL,
-                name TEXT NOT NULL,
-                settings_config TEXT NOT NULL,
-                website_url TEXT,
-                category TEXT,
-                created_at INTEGER,
-                sort_index INTEGER,
-                notes TEXT,
-                icon TEXT,
-                icon_color TEXT,
-                meta TEXT NOT NULL DEFAULT '{{}}',
-                is_current BOOLEAN NOT NULL DEFAULT 0,
-                in_failover_queue BOOLEAN NOT NULL DEFAULT 0,
-                PRIMARY KEY (id, app_type)
-            );
-            CREATE TABLE IF NOT EXISTS {ADAPTER_BINDINGS_TABLE} (
+            "CREATE TABLE IF NOT EXISTS {ADAPTER_BINDINGS_TABLE} (
                 provider_id TEXT NOT NULL,
                 app_type TEXT NOT NULL,
                 provider_created_at INTEGER NOT NULL,
@@ -1127,59 +1090,11 @@ impl ProviderStore {
             "record_extensions_json",
             "TEXT NOT NULL DEFAULT '{}'",
         )?;
-        ensure_column(&connection, "providers", "website_url", "TEXT")?;
-        ensure_column(&connection, "providers", "icon", "TEXT")?;
-        self.verify_provider_schema(&connection)?;
-        drop(connection);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600)).map_err(
-                |source| StoreError::Io {
-                    path: self.path.clone(),
-                    source,
-                },
-            )?;
-        }
-        Ok(())
-    }
-
-    fn verify_provider_schema(&self, connection: &Connection) -> Result<(), StoreError> {
-        let mut statement = connection.prepare("PRAGMA table_info(providers)")?;
-        let columns = statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<HashSet<_>, _>>()?;
-        for required in [
-            "id",
-            "app_type",
-            "name",
-            "settings_config",
-            "created_at",
-            "sort_index",
-            "meta",
-            "is_current",
-            "in_failover_queue",
-        ] {
-            if !columns.contains(required) {
-                return Err(StoreError::InvalidStore(format!(
-                    "providers table is missing required column '{required}'"
-                )));
-            }
-        }
         Ok(())
     }
 
     fn connect(&self) -> Result<Connection, StoreError> {
-        let connection = Connection::open_with_flags(
-            &self.path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "foreign_keys", true)?;
-        Ok(connection)
+        self.database.connect().map_err(StoreError::from)
     }
 
     fn stored_providers(
@@ -1187,24 +1102,10 @@ impl ProviderStore {
         connection: &Connection,
         app: Option<&AppType>,
     ) -> Result<Vec<StoredProvider>, StoreError> {
-        let sql = format!(
-            "SELECT p.*, b.adapter_json AS lite_adapter_json,
-                    b.compatibility_settings_json AS lite_compatibility_settings_json,
-                    b.record_extensions_json AS lite_record_extensions_json
-             FROM providers p
-             LEFT JOIN {ADAPTER_BINDINGS_TABLE} b
-               ON b.provider_id = p.id
-              AND b.app_type = p.app_type
-             WHERE (?1 IS NULL OR p.app_type = ?1)
-             ORDER BY COALESCE(p.sort_index, 999999), p.created_at ASC, p.id ASC"
-        );
-        let mut statement = connection.prepare(&sql)?;
-        let mut rows = statement.query([app.map(AppType::as_str)])?;
-        let mut providers = Vec::new();
-        while let Some(row) = rows.next()? {
-            providers.push(self.stored_from_row(connection, row)?);
-        }
-        Ok(providers)
+        read_provider_rows(connection, app.map(AppType::as_str))?
+            .into_iter()
+            .map(|provider| self.stored_from_row(connection, provider))
+            .collect()
     }
 
     fn stored_provider(
@@ -1213,50 +1114,78 @@ impl ProviderStore {
         app: &AppType,
         id: &str,
     ) -> Result<Option<StoredProvider>, StoreError> {
-        self.stored_provider_query(transaction, Some(app), id)
+        read_provider_row(transaction, id, app.as_str())?
+            .map(|provider| self.stored_from_row(transaction, provider))
+            .transpose()
     }
 
-    fn stored_provider_query(
+    fn stored_adapter_binding(
         &self,
-        transaction: &Transaction<'_>,
-        app: Option<&AppType>,
+        connection: &Connection,
         id: &str,
-    ) -> Result<Option<StoredProvider>, StoreError> {
-        let sql = format!(
-            "SELECT p.*, b.adapter_json AS lite_adapter_json,
-                    b.compatibility_settings_json AS lite_compatibility_settings_json,
-                    b.record_extensions_json AS lite_record_extensions_json
-             FROM providers p
-             LEFT JOIN {ADAPTER_BINDINGS_TABLE} b
-               ON b.provider_id = p.id
-              AND b.app_type = p.app_type
-             WHERE p.id = ?1 AND (?2 IS NULL OR p.app_type = ?2)
-             LIMIT 1"
-        );
-        let mut statement = transaction.prepare(&sql)?;
-        let mut rows = statement.query(params![id, app.map(AppType::as_str)])?;
-        rows.next()?
-            .map(|row| self.stored_from_row(transaction, row))
-            .transpose()
+        app_type: &str,
+    ) -> Result<StoredAdapterBinding, StoreError> {
+        connection
+            .query_row(
+                &format!(
+                    "SELECT provider_created_at, adapter_json,
+                            compatibility_settings_json, record_extensions_json
+                     FROM {ADAPTER_BINDINGS_TABLE}
+                     WHERE provider_id = ?1 AND app_type = ?2"
+                ),
+                params![id, app_type],
+                |row| {
+                    Ok(StoredAdapterBinding {
+                        provider_created_at: Some(row.get(0)?),
+                        adapter: Some(row.get(1)?),
+                        compatibility_settings: row.get(2)?,
+                        extensions: Some(row.get(3)?),
+                    })
+                },
+            )
+            .optional()
+            .map(Option::unwrap_or_default)
+            .map_err(StoreError::from)
     }
 
     fn stored_from_row(
         &self,
         connection: &Connection,
-        row: &Row<'_>,
+        provider: SharedProviderRow,
     ) -> Result<StoredProvider, StoreError> {
-        let id: String = row.get("id")?;
-        let app_id: String = row.get("app_type")?;
-        let name: String = row.get("name")?;
-        let category: Option<String> = row.get("category")?;
-        let raw_metadata: String = row.get("meta")?;
-        let raw_settings: String = row.get("settings_config")?;
-        let is_current: bool = row.get("is_current")?;
-        let raw_adapter: Option<String> = row.get("lite_adapter_json")?;
-        let raw_compatibility_settings: Option<String> =
-            row.get("lite_compatibility_settings_json")?;
-        let raw_extensions: Option<String> = row.get("lite_record_extensions_json")?;
-        let app = parse_app(&app_id)?;
+        let app = parse_app(&provider.app_type)?;
+        let binding = self.stored_adapter_binding(connection, &provider.id, &provider.app_type)?;
+        let revision = snapshot_revision(
+            connection,
+            &provider,
+            &binding,
+            &provider.id,
+            &app,
+            &self.revision_key,
+        )?;
+        let SharedProviderRow {
+            id,
+            app_type: app_id,
+            name,
+            settings_config: raw_settings,
+            website_url,
+            category,
+            created_at: _,
+            sort_index: _,
+            notes,
+            icon,
+            icon_color,
+            meta: raw_metadata,
+            is_current,
+            in_failover_queue: _,
+            ..
+        } = provider;
+        let StoredAdapterBinding {
+            provider_created_at: _,
+            adapter: raw_adapter,
+            compatibility_settings: raw_compatibility_settings,
+            extensions: raw_extensions,
+        } = binding;
         let native_settings: Value = serde_json::from_str(&raw_settings).map_err(|_| {
             StoreError::InvalidStore(format!("provider '{id}' has invalid settings"))
         })?;
@@ -1297,14 +1226,14 @@ impl ProviderStore {
                 })?,
             None => Map::new(),
         };
-        for (field, column) in [
-            ("websiteUrl", "website_url"),
-            ("notes", "notes"),
-            ("icon", "icon"),
-            ("iconColor", "icon_color"),
+        for (field, value) in [
+            ("websiteUrl", website_url),
+            ("notes", notes),
+            ("icon", icon),
+            ("iconColor", icon_color),
         ] {
             extensions.remove(field);
-            if let Ok(Some(value)) = row.get::<_, Option<String>>(column) {
+            if let Some(value) = value {
                 extensions.insert(field.to_owned(), Value::String(value));
             }
         }
@@ -1321,7 +1250,6 @@ impl ProviderStore {
                 })?,
             );
         }
-        let revision = snapshot_revision(connection, row, &id, &app, &self.revision_key)?;
         let mut record = ProviderRecord {
             id,
             revision,
@@ -1351,7 +1279,7 @@ impl ProviderStore {
         );
         Ok(StoredProvider {
             record,
-            is_current,
+            is_current: is_current != 0,
             native_settings,
             lite_writable,
             lite_simple_editable,
@@ -1775,14 +1703,24 @@ fn now_millis() -> Result<i64, StoreError> {
 
 fn snapshot_revision(
     connection: &Connection,
-    provider_row: &Row<'_>,
+    provider: &SharedProviderRow,
+    binding: &StoredAdapterBinding,
     id: &str,
     app: &AppType,
     key: &[u8],
 ) -> Result<u64, StoreError> {
     let mut hasher =
         Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts revision keys of any length");
-    hash_row(&mut hasher, provider_row)?;
+    hasher.update(b"provider-v2");
+    hasher.update(provider.source_fingerprint());
+    let binding_snapshot = serde_json::to_vec(&(
+        binding.provider_created_at,
+        &binding.adapter,
+        &binding.compatibility_settings,
+        &binding.extensions,
+    ))
+    .map_err(|error| StoreError::InvalidStore(error.to_string()))?;
+    hasher.update(&binding_snapshot);
 
     let endpoints_exist = connection
         .query_row(
@@ -3068,6 +3006,20 @@ requires_openai_auth = true
         assert_eq!(created.adapter, expected);
         assert_eq!(created.extensions["liteConfigWritable"], false);
         assert_eq!(created.extensions["liteSimpleEditable"], false);
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                &format!(
+                    "UPDATE {ADAPTER_BINDINGS_TABLE}
+                     SET provider_created_at = provider_created_at + 1
+                     WHERE provider_id = ?1 AND app_type = ?2"
+                ),
+                params![created.id, app.as_str()],
+            )
+            .unwrap();
+        let binding_changed = store.list(app.as_str()).unwrap().pop().unwrap();
+        assert_ne!(binding_changed.revision, created.revision);
         store
             .connect()
             .unwrap()
