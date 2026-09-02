@@ -42,3 +42,12 @@ layers may still reference them; profile-aware route cleanup is not part of
 this bootstrap step.
 Claude Code status refers to the user-level default; project, local, or managed
 settings can still override it.
+
+Installed Skill rows and per-application selections use the same shared
+database. Lite can inspect and switch those selections, but it does not install,
+discover, update, or uninstall Skills. Core owns native state projection and
+reference recovery; Lite owns the SQLite transaction, shared live-file lock,
+and resolved host paths. Reference identity is stored beside each native Skill
+root under `.cc-switch-skill-references/<app>` so future CC Switch hosts can use
+the same owner records. Existing native links created without Core ownership
+remain read-only instead of being adopted or removed implicitly.

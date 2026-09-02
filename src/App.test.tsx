@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import App, { sameJsonValue } from "./App";
 import type { McpServer } from "./lib/mcp-types";
+import type { InstalledSkill } from "./lib/skill-types";
 import type {
   AdapterDescriptor,
   AppId,
@@ -35,12 +36,18 @@ const mcp = vi.hoisted(() => ({
   importExisting: vi.fn(),
 }));
 
+const skills = vi.hoisted(() => ({
+  list: vi.fn(),
+  toggle: vi.fn(),
+}));
+
 vi.mock("./lib/providers", async (importOriginal) => {
   const original = await importOriginal<typeof import("./lib/providers")>();
   return { ...original, providersApi: api };
 });
 
 vi.mock("./lib/mcp", () => ({ mcpApi: mcp }));
+vi.mock("./lib/skills", () => ({ skillsApi: skills }));
 
 const adapters: AdapterDescriptor[] = [
   {
@@ -129,6 +136,33 @@ const contextServer: McpServer = {
   },
   tags: ["docs"],
   revision: 1,
+};
+
+const demoSkill: InstalledSkill = {
+  id: "demo",
+  name: "Demo Skill",
+  description: "A configured Skill",
+  directory: "demo",
+  apps: [
+    {
+      app: "claude",
+      selected: true,
+      enabled: true,
+      writable: true,
+      canEnable: true,
+      canDisable: true,
+      reason: null,
+    },
+    {
+      app: "codex",
+      selected: false,
+      enabled: false,
+      writable: false,
+      canEnable: false,
+      canDisable: false,
+      reason: "nativeConflict",
+    },
+  ],
 };
 
 function deferred<T>() {
@@ -237,6 +271,7 @@ describe("App", () => {
     document.documentElement.className = "";
     for (const mock of Object.values(api)) mock.mockReset();
     for (const mock of Object.values(mcp)) mock.mockReset();
+    for (const mock of Object.values(skills)) mock.mockReset();
     const appIds = [
       "claude",
       "claude-desktop",
@@ -270,6 +305,8 @@ describe("App", () => {
       disabledApps: 0,
       failedApps: [],
     });
+    skills.list.mockResolvedValue([]);
+    skills.toggle.mockResolvedValue(undefined);
   });
 
   it("shows every application from the shared core boundary", async () => {
@@ -301,7 +338,9 @@ describe("App", () => {
     });
     await user.click(screen.getByRole("button", { name: "Manage Skills" }));
     expect(screen.getByRole("heading", { name: "Skills" })).toBeVisible();
-    expect(screen.getByLabelText("Skills placeholder")).toBeVisible();
+    expect(
+      await screen.findByRole("heading", { name: "No installed Skills" }),
+    ).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: "Back to providers" }));
     await user.click(
@@ -311,6 +350,33 @@ describe("App", () => {
     expect(
       await screen.findByRole("heading", { name: "No MCP servers" }),
     ).toBeVisible();
+  });
+
+  it("switches installed Skills through the core-backed application state", async () => {
+    const user = userEvent.setup();
+    skills.list.mockResolvedValue([demoSkill]);
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Add your first Claude Code provider",
+    });
+    await user.click(screen.getByRole("button", { name: "Manage Skills" }));
+    expect(await screen.findByText("Demo Skill")).toBeVisible();
+
+    const claude = screen.getByRole("button", {
+      name: "Disable Demo Skill for Claude Code",
+    });
+    expect(claude).toHaveAttribute("aria-pressed", "true");
+    await user.click(claude);
+
+    await waitFor(() =>
+      expect(skills.toggle).toHaveBeenCalledWith("demo", "claude", false),
+    );
+    expect(
+      screen.getByRole("button", {
+        name: /Enable Demo Skill for Codex.*unmanaged entry/,
+      }),
+    ).toBeDisabled();
   });
 
   it("blocks MCP actions until the initial catalog has loaded", async () => {

@@ -5,7 +5,10 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use cc_switch_core::{fs::shared_live_config_lock_path, MAX_OPERATION_CONTENT_BYTES};
+use cc_switch_core::{
+    fs::shared_live_config_lock_path, AppType, InstalledSkillSnapshot, SkillCatalogEntry,
+    MAX_OPERATION_CONTENT_BYTES,
+};
 use fs4::{FileExt, TryLockError};
 use serde::Deserialize;
 use thiserror::Error;
@@ -16,6 +19,7 @@ use crate::{
     native_live::NativeLiveConfig,
     operation::{LivePaths, OperationError, OperationExecutor, OperationPlan, OperationReceipt},
     provider::{NativeImport, ProviderRecord},
+    skill_live::{PreparedSkillChange, SkillHostError, SkillLiveConfig},
 };
 
 #[derive(Debug, Error)]
@@ -57,12 +61,13 @@ impl LiveError {
 pub struct LiveConfig {
     native: NativeLiveConfig,
     mcp: McpLiveConfig,
+    home: PathBuf,
     lock_path: PathBuf,
     gate: Mutex<()>,
 }
 
 pub(crate) struct LockedLiveReceipt<'a, T> {
-    value: T,
+    pub(crate) value: T,
     gate: MutexGuard<'a, ()>,
     file_lock: File,
 }
@@ -70,6 +75,7 @@ pub(crate) struct LockedLiveReceipt<'a, T> {
 pub(crate) type LiveWriteReceipt<'a> = LockedLiveReceipt<'a, OperationReceipt>;
 pub(crate) type McpWriteReceipt<'a> = LockedLiveReceipt<'a, McpLiveReceipt>;
 pub(crate) type McpImportObservation<'a> = LockedLiveReceipt<'a, McpImportSnapshot>;
+pub(crate) type SkillWriteReceipt<'a> = LockedLiveReceipt<'a, PreparedSkillChange>;
 
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -80,8 +86,10 @@ struct SharedPathSettings {
     grok_config_dir: Option<String>,
     opencode_config_dir: Option<String>,
     hermes_config_dir: Option<String>,
+    skill_storage_location: Option<String>,
 }
 
+#[derive(Clone)]
 pub(crate) struct ResolvedConfigDirs {
     pub(crate) claude: PathBuf,
     pub(crate) codex: PathBuf,
@@ -94,10 +102,12 @@ pub(crate) struct ResolvedConfigDirs {
 
 impl LiveConfig {
     pub fn from_home(home: &Path) -> Result<Self, LiveError> {
-        let dirs = resolve_config_dirs(home)?;
+        let settings = load_shared_path_settings(home);
+        let dirs = resolve_config_dirs(home, &settings)?;
         let claude_mcp = claude_mcp_path(home, &dirs.claude)?;
+        let native = NativeLiveConfig::from_home(home, &dirs)?;
         Ok(Self {
-            native: NativeLiveConfig::from_home(home, &dirs)?,
+            native,
             mcp: McpLiveConfig::new(
                 (claude_mcp, dirs.claude),
                 (dirs.codex.join("config.toml"), dirs.codex),
@@ -106,6 +116,7 @@ impl LiveConfig {
                 (dirs.opencode.join("opencode.json"), dirs.opencode),
                 (dirs.hermes.join("config.yaml"), dirs.hermes),
             ),
+            home: home.to_owned(),
             lock_path: shared_live_config_lock_path(home),
             gate: Mutex::new(()),
         })
@@ -116,6 +127,70 @@ impl LiveConfig {
             LiveError::InvalidProvider("application is not available in Lite".to_owned())
         })?;
         self.with_lock(|| self.native.import_drafts(app))
+    }
+
+    pub fn inspect_skills(
+        &self,
+        catalog: &[SkillCatalogEntry],
+    ) -> Result<Vec<InstalledSkillSnapshot>, SkillHostError> {
+        let (_gate, _file_lock) = self.acquire_lock().map_err(map_skill_lock_error)?;
+        self.skill_config()?.inspect(catalog)
+    }
+
+    pub fn apply_skill_recoverable(
+        &self,
+        catalog: &[SkillCatalogEntry],
+        skill_id: &str,
+        app: &AppType,
+        requested: Option<bool>,
+    ) -> Result<SkillWriteReceipt<'_>, SkillHostError> {
+        let (gate, file_lock) = self.acquire_lock().map_err(map_skill_lock_error)?;
+        let value = self
+            .skill_config()?
+            .apply(catalog, skill_id, app, requested)?;
+        Ok(LockedLiveReceipt {
+            value,
+            gate,
+            file_lock,
+        })
+    }
+
+    pub fn commit_skill(&self, receipt: SkillWriteReceipt<'_>) -> Result<(), SkillHostError> {
+        let LockedLiveReceipt {
+            value,
+            gate,
+            file_lock,
+        } = receipt;
+        let result = value.commit();
+        drop(file_lock);
+        drop(gate);
+        result
+    }
+
+    pub fn rollback_skill(&self, receipt: SkillWriteReceipt<'_>) -> Result<(), SkillHostError> {
+        let LockedLiveReceipt {
+            value,
+            gate,
+            file_lock,
+        } = receipt;
+        let result = value.rollback();
+        drop(file_lock);
+        drop(gate);
+        result
+    }
+
+    fn skill_config(&self) -> Result<SkillLiveConfig, SkillHostError> {
+        let settings = load_shared_path_settings(&self.home);
+        let dirs = resolve_config_dirs(&self.home, &settings)
+            .map_err(|error| SkillHostError::Live(error.to_string()))?;
+        let native = NativeLiveConfig::from_home(&self.home, &dirs)
+            .map_err(|error| SkillHostError::Live(error.to_string()))?;
+        SkillLiveConfig::from_home(
+            &self.home,
+            &dirs,
+            native.paths(),
+            settings.skill_storage_location.as_deref(),
+        )
     }
 
     pub fn apply_mcp_recoverable(
@@ -286,8 +361,10 @@ impl LiveConfig {
     }
 }
 
-fn resolve_config_dirs(home: &Path) -> Result<ResolvedConfigDirs, LiveError> {
-    let settings = load_shared_path_settings(home);
+fn resolve_config_dirs(
+    home: &Path,
+    settings: &SharedPathSettings,
+) -> Result<ResolvedConfigDirs, LiveError> {
     let claude_env = std::env::var_os("CLAUDE_CONFIG_DIR");
     let codex_env = std::env::var_os("CODEX_HOME");
     let hermes_env = std::env::var_os("HERMES_HOME");
@@ -342,6 +419,13 @@ fn resolve_config_dirs(home: &Path) -> Result<ResolvedConfigDirs, LiveError> {
             "Pi config directory",
         )?,
     })
+}
+
+fn map_skill_lock_error(error: LiveError) -> SkillHostError {
+    match error {
+        LiveError::LockUnavailable => SkillHostError::LockUnavailable,
+        other => SkillHostError::Live(other.to_string()),
+    }
 }
 
 fn load_shared_path_settings(home: &Path) -> SharedPathSettings {
@@ -617,6 +701,37 @@ mod tests {
                 .unwrap()
                 .join("profiles/claude")
         );
+    }
+
+    #[test]
+    fn skill_settings_are_reloaded_and_do_not_block_other_live_features() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = LiveConfig::from_home(directory.path()).unwrap();
+        fs::create_dir(directory.path().join(".cc-switch")).unwrap();
+        fs::write(
+            directory.path().join(".cc-switch/settings.json"),
+            r#"{"skillStorageLocation":"future-value"}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            live.inspect_skills(&[]),
+            Err(SkillHostError::InvalidStorage(value)) if value == "future-value"
+        ));
+    }
+
+    #[test]
+    fn relative_hermes_root_does_not_invalidate_the_skill_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join(".cc-switch")).unwrap();
+        fs::write(
+            directory.path().join(".cc-switch/settings.json"),
+            r#"{"hermesConfigDir":"relative/hermes"}"#,
+        )
+        .unwrap();
+
+        let live = LiveConfig::from_home(directory.path()).unwrap();
+        assert!(live.inspect_skills(&[]).unwrap().is_empty());
     }
 
     #[test]
