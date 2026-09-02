@@ -279,17 +279,22 @@ dependencies = [
 [[package]]
 name = "cc-switch-core"
 version = "0.1.0"
-source = "git+https://github.com/SaladDay/cc-switch-core?rev=c13a969e224c8c9a6ac958f6a8bf9853b0af2093#c13a969e224c8c9a6ac958f6a8bf9853b0af2093"
+source = "git+https://github.com/SaladDay/cc-switch-core?rev=465a55e8be25ba6dc030c41122b75e66bdd6a58b#465a55e8be25ba6dc030c41122b75e66bdd6a58b"
 dependencies = [
  "http",
  "json-five",
  "json5",
+ "junction",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
  "thiserror 2.0.20",
  "toml_edit 0.25.13+spec-1.1.0",
+ "unicode-casefold",
+ "unicode-normalization",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1787,6 +1792,16 @@ checksum = "5dea2b27dd239b2556ed7a25ba842fe47fd602e7fc7433c2a8d6106d4d9edd70"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "junction"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "160f2eade097f30263b548aae5deb12ad349c909baa710fa24b92c9090b2e006"
+dependencies = [
+ "scopeguard",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3906,6 +3921,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "unicode-casefold"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f66b1c8f8caa2ab31dc6d3f35386f16efdab89668f93411e565ac368908e8f"
+
+[[package]]
 name = "unicode-general-category"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3916,6 +3937,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-segmentation"

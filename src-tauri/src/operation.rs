@@ -135,13 +135,19 @@ pub(crate) struct OperationReceipt {
 impl OperationReceipt {
     pub(crate) fn rollback(self) -> Result<(), OperationError> {
         let Self { inner, paths } = self;
-        let mut host = FileOperationHost { paths: &paths };
+        let mut host = FileOperationHost::new(&paths);
         inner.rollback(&mut host).map_err(map_rollback_error)
     }
 }
 
-struct FileOperationHost<'a> {
+pub(crate) struct FileOperationHost<'a> {
     paths: &'a LivePaths,
+}
+
+impl<'a> FileOperationHost<'a> {
+    pub(crate) fn new(paths: &'a LivePaths) -> Self {
+        Self { paths }
+    }
 }
 
 impl OperationHost for FileOperationHost<'_> {
@@ -209,7 +215,7 @@ impl<'a> OperationExecutor<'a> {
         plan: &OperationPlan,
     ) -> Result<OperationReceipt, OperationError> {
         self.validate(plan)?;
-        let mut host = FileOperationHost { paths: self.paths };
+        let mut host = FileOperationHost::new(self.paths);
         let inner = execute_operation_plan(plan, &mut host).map_err(map_execution_error)?;
         Ok(OperationReceipt {
             inner,

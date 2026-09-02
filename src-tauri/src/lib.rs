@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use cc_switch_core::{
     builtin_app_adapter, builtin_app_registry, builtin_simple_provider_forms, AppCapability,
-    AppDescriptor, SimpleProviderFormDescriptor,
+    AppDescriptor, InstalledSkillSnapshot, SimpleProviderFormDescriptor,
 };
 
 mod live;
@@ -11,6 +11,8 @@ mod mcp_live;
 mod native_live;
 mod operation;
 mod provider;
+mod skill;
+mod skill_live;
 mod store;
 
 use live::{LiveConfig, LiveError};
@@ -21,6 +23,7 @@ use provider::{
     ProviderDraft, ProviderRecord, SimpleProviderDraft, SimpleProviderUpdate,
 };
 use serde::Serialize;
+use skill::{SkillError, SkillStore};
 use store::{ProviderStore, StoreError};
 use tauri::{Manager, State};
 
@@ -61,6 +64,15 @@ impl From<LiveError> for CommandError {
 
 impl From<McpError> for CommandError {
     fn from(error: McpError) -> Self {
+        Self {
+            code: error.code(),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<SkillError> for CommandError {
+    fn from(error: SkillError) -> Self {
         Self {
             code: error.code(),
             message: error.to_string(),
@@ -534,17 +546,55 @@ fn import_mcp_from_apps(
     }
 }
 
+#[tauri::command]
+fn list_skills(
+    store: State<'_, SkillStore>,
+    live: State<'_, LiveConfig>,
+) -> CommandResult<Vec<InstalledSkillSnapshot>> {
+    store.list(&live).map_err(Into::into)
+}
+
+#[tauri::command]
+fn toggle_skill_app(
+    store: State<'_, SkillStore>,
+    live: State<'_, LiveConfig>,
+    skill_id: String,
+    app_id: String,
+    enabled: bool,
+) -> CommandResult<()> {
+    let app = app_id.parse::<cc_switch_core::AppType>().map_err(|_| {
+        CommandError::from(SkillError::Host(
+            skill_live::SkillHostError::UnsupportedApp(app_id),
+        ))
+    })?;
+    store
+        .toggle(&live, &skill_id, app, enabled)
+        .map_err(Into::into)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let home_dir = app.path().home_dir()?;
             let store = ProviderStore::from_home(&home_dir)?;
-            let mcp_store = McpStore::open(store::database_path(&home_dir))?;
+            let database_path = store::database_path(&home_dir);
+            let mcp_store = McpStore::open(database_path.clone())?;
+            let skill_store = SkillStore::open(database_path)?;
+            let live = LiveConfig::from_home(&home_dir)?;
+            match skill_store.reconcile_pending(&live) {
+                Ok(failures) => {
+                    for failure in failures {
+                        eprintln!("Skill startup recovery remains pending for {failure}");
+                    }
+                }
+                Err(error) => eprintln!("Skill startup recovery could not run: {error}"),
+            }
             // The shared database is authoritative; startup never imports old Lite files.
             app.manage(store);
             app.manage(mcp_store);
-            app.manage(LiveConfig::from_home(&home_dir)?);
+            app.manage(skill_store);
+            app.manage(live);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -564,6 +614,8 @@ pub fn run() {
             toggle_mcp_app,
             delete_mcp_server,
             import_mcp_from_apps,
+            list_skills,
+            toggle_skill_app,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run CC Switch Lite");

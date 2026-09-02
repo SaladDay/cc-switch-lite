@@ -59,6 +59,10 @@ impl NativeLiveConfig {
         })
     }
 
+    pub(crate) fn paths(&self) -> &LivePaths {
+        &self.paths
+    }
+
     #[cfg(test)]
     pub fn for_tests(home: &Path, claude_dir: PathBuf, codex_dir: PathBuf) -> Self {
         let (normal, threep, profile, meta) = test_claude_desktop_paths(home);
