@@ -81,6 +81,7 @@ export function SettingsPanel({
               aria-selected={tab === item}
               aria-controls={`settings-${item}-panel`}
               tabIndex={tab === item ? 0 : -1}
+              autoFocus={item === "general"}
               onClick={() => setTab(item)}
               onKeyDown={(event) => moveTab(event, item)}
               className={cn(

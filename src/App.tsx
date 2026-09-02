@@ -180,6 +180,8 @@ export default function App() {
   activeAppRef.current = activeApp;
   const addProviderButtonRef = useRef<HTMLButtonElement>(null);
   const mcpPanelRef = useRef<McpPanelHandle>(null);
+  const settingsButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreSettingsFocusRef = useRef(false);
   const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const definition = appDefinition(activeApp, appCatalog);
   const visibleApps = appCatalog.filter((app) =>
@@ -294,6 +296,10 @@ export default function App() {
 
   useEffect(() => {
     window.localStorage.setItem(VIEW_STORAGE_KEY, currentView);
+    if (currentView === "providers" && restoreSettingsFocusRef.current) {
+      restoreSettingsFocusRef.current = false;
+      settingsButtonRef.current?.focus();
+    }
   }, [currentView]);
 
   useEffect(() => {
@@ -699,6 +705,7 @@ export default function App() {
           >
             {currentView === "providers" ? (
               <Button
+                ref={settingsButtonRef}
                 variant="ghost"
                 size="icon"
                 disabled={mutationBusy || liveBusy !== null}
@@ -718,7 +725,12 @@ export default function App() {
                     (currentView === "mcp" && mcpManagementBusy) ||
                     (currentView === "skills" && skillsManagementBusy)
                   }
-                  onClick={() => setCurrentView("providers")}
+                  onClick={() => {
+                    if (currentView === "settings") {
+                      restoreSettingsFocusRef.current = true;
+                    }
+                    setCurrentView("providers");
+                  }}
                   className="mr-2 rounded-lg"
                   aria-label="Back to providers"
                 >

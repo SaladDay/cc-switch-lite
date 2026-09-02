@@ -1353,8 +1353,12 @@ describe("App", () => {
     await screen.findByRole("heading", {
       name: "Add your first Claude Code provider",
     });
-    await user.click(screen.getByRole("button", { name: "Open settings" }));
+    const settingsButton = screen.getByRole("button", {
+      name: "Open settings",
+    });
+    await user.click(settingsButton);
     expect(screen.getByRole("heading", { name: "Settings" })).toBeVisible();
+    expect(screen.getByRole("tab", { name: "General" })).toHaveFocus();
 
     await user.click(screen.getByRole("button", { name: "Dark" }));
     expect(document.documentElement).toHaveClass("dark");
@@ -1372,6 +1376,11 @@ describe("App", () => {
     expect(screen.getByText("Version 0.1.0-alpha.1")).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: "Back to providers" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Open settings" }),
+      ).toHaveFocus(),
+    );
     expect(
       within(
         screen.getByRole("navigation", { name: "Applications" }),
