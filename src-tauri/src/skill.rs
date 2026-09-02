@@ -58,12 +58,8 @@ impl SkillStore {
     }
 
     pub fn list(&self, live: &LiveConfig) -> Result<Vec<InstalledSkillSnapshot>, SkillError> {
-        let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let catalog = load_catalog(&transaction)?;
-        let snapshots = live.inspect_skills(&catalog)?;
-        transaction.commit()?;
-        Ok(snapshots)
+        let catalog = load_catalog(&self.connect()?)?;
+        live.inspect_skills(&catalog).map_err(Into::into)
     }
 
     pub fn toggle(

@@ -114,15 +114,15 @@ impl SkillLiveConfig {
             .filter(|descriptor| descriptor.skill_contract().is_some())
             .map(|descriptor| {
                 let app = descriptor.app().clone();
-                let native_root = native_root(dirs, &app).join("skills");
+                let native_root = absolute_root(native_root(dirs, &app))?.join("skills");
                 let state_root = native_root
                     .parent()
                     .expect("a native Skill root has a parent")
                     .join(STATE_DIRECTORY)
                     .join(app.as_str());
-                (app, native_root, state_root)
+                Ok((app, native_root, state_root))
             })
-            .collect();
+            .collect::<Result<Vec<_>, SkillHostError>>()?;
         Ok(Self {
             source_root,
             unified_root,
@@ -205,6 +205,13 @@ impl SkillLiveConfig {
         create_real_directory(native_root, false)?;
         create_real_directory(state_root, true)
     }
+}
+
+fn absolute_root(path: &Path) -> Result<PathBuf, SkillHostError> {
+    std::path::absolute(path).map_err(|source| SkillHostError::Io {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 fn native_root<'a>(dirs: &'a ResolvedConfigDirs, app: &AppType) -> &'a Path {

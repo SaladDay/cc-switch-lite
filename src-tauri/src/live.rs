@@ -61,7 +61,7 @@ impl LiveError {
 pub struct LiveConfig {
     native: NativeLiveConfig,
     mcp: McpLiveConfig,
-    skills: SkillLiveConfig,
+    home: PathBuf,
     lock_path: PathBuf,
     gate: Mutex<()>,
 }
@@ -106,13 +106,6 @@ impl LiveConfig {
         let dirs = resolve_config_dirs(home, &settings)?;
         let claude_mcp = claude_mcp_path(home, &dirs.claude)?;
         let native = NativeLiveConfig::from_home(home, &dirs)?;
-        let skills = SkillLiveConfig::from_home(
-            home,
-            &dirs,
-            native.paths(),
-            settings.skill_storage_location.as_deref(),
-        )
-        .map_err(|error| LiveError::InvalidConfig(error.to_string()))?;
         Ok(Self {
             native,
             mcp: McpLiveConfig::new(
@@ -123,7 +116,7 @@ impl LiveConfig {
                 (dirs.opencode.join("opencode.json"), dirs.opencode),
                 (dirs.hermes.join("config.yaml"), dirs.hermes),
             ),
-            skills,
+            home: home.to_owned(),
             lock_path: shared_live_config_lock_path(home),
             gate: Mutex::new(()),
         })
@@ -141,7 +134,7 @@ impl LiveConfig {
         catalog: &[SkillCatalogEntry],
     ) -> Result<Vec<InstalledSkillSnapshot>, SkillHostError> {
         let (_gate, _file_lock) = self.acquire_lock().map_err(map_skill_lock_error)?;
-        self.skills.inspect(catalog)
+        self.skill_config()?.inspect(catalog)
     }
 
     pub fn apply_skill_recoverable(
@@ -152,7 +145,9 @@ impl LiveConfig {
         requested: Option<bool>,
     ) -> Result<SkillWriteReceipt<'_>, SkillHostError> {
         let (gate, file_lock) = self.acquire_lock().map_err(map_skill_lock_error)?;
-        let value = self.skills.apply(catalog, skill_id, app, requested)?;
+        let value = self
+            .skill_config()?
+            .apply(catalog, skill_id, app, requested)?;
         Ok(LockedLiveReceipt {
             value,
             gate,
@@ -182,6 +177,20 @@ impl LiveConfig {
         drop(file_lock);
         drop(gate);
         result
+    }
+
+    fn skill_config(&self) -> Result<SkillLiveConfig, SkillHostError> {
+        let settings = load_shared_path_settings(&self.home);
+        let dirs = resolve_config_dirs(&self.home, &settings)
+            .map_err(|error| SkillHostError::Live(error.to_string()))?;
+        let native = NativeLiveConfig::from_home(&self.home, &dirs)
+            .map_err(|error| SkillHostError::Live(error.to_string()))?;
+        SkillLiveConfig::from_home(
+            &self.home,
+            &dirs,
+            native.paths(),
+            settings.skill_storage_location.as_deref(),
+        )
     }
 
     pub fn apply_mcp_recoverable(
@@ -692,6 +701,37 @@ mod tests {
                 .unwrap()
                 .join("profiles/claude")
         );
+    }
+
+    #[test]
+    fn skill_settings_are_reloaded_and_do_not_block_other_live_features() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = LiveConfig::from_home(directory.path()).unwrap();
+        fs::create_dir(directory.path().join(".cc-switch")).unwrap();
+        fs::write(
+            directory.path().join(".cc-switch/settings.json"),
+            r#"{"skillStorageLocation":"future-value"}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            live.inspect_skills(&[]),
+            Err(SkillHostError::InvalidStorage(value)) if value == "future-value"
+        ));
+    }
+
+    #[test]
+    fn relative_hermes_root_does_not_invalidate_the_skill_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join(".cc-switch")).unwrap();
+        fs::write(
+            directory.path().join(".cc-switch/settings.json"),
+            r#"{"hermesConfigDir":"relative/hermes"}"#,
+        )
+        .unwrap();
+
+        let live = LiveConfig::from_home(directory.path()).unwrap();
+        assert!(live.inspect_skills(&[]).unwrap().is_empty());
     }
 
     #[test]
