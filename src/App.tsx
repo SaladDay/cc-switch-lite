@@ -11,6 +11,7 @@ import {
   Download,
   LoaderCircle,
   Plus,
+  Settings as SettingsIcon,
   Wrench,
 } from "lucide-react";
 
@@ -19,6 +20,7 @@ import { McpIcon } from "./components/McpIcon";
 import { McpPanel, type McpPanelHandle } from "./components/mcp/McpPanel";
 import { ProviderDialog } from "./components/ProviderDialog";
 import { AppSwitcher } from "./components/AppSwitcher";
+import { SettingsPanel } from "./components/settings/SettingsPanel";
 import { SkillsPanel } from "./components/skills/SkillsPanel";
 import {
   ProviderList,
@@ -41,13 +43,21 @@ import type {
   SimpleProviderFormDescriptor,
 } from "./lib/provider-types";
 import { isNativeAdapter, sameAdapterIdentity } from "./lib/provider-types";
+import {
+  APP_VISIBILITY_STORAGE_KEY,
+  THEME_STORAGE_KEY,
+  appIsVisible,
+  initialAppVisibility,
+  initialTheme,
+  type Theme,
+} from "./lib/preferences";
 import { errorMessage, providersApi } from "./lib/providers";
 
 const APP_STORAGE_KEY = "cc-switch-lite:last-app";
 const VIEW_STORAGE_KEY = "cc-switch-lite:last-view";
 const DRAG_BAR_HEIGHT = 28;
 const HEADER_HEIGHT = 64;
-type View = "providers" | "mcp" | "skills";
+type View = "providers" | "mcp" | "skills" | "settings";
 
 function initialApp(): AppId {
   const stored = window.localStorage.getItem(APP_STORAGE_KEY);
@@ -138,6 +148,8 @@ function adapterMatchesProvider(
 export default function App() {
   const [activeApp, setActiveApp] = useState<AppId>(initialApp);
   const [currentView, setCurrentView] = useState<View>(initialView);
+  const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [appVisibility, setAppVisibility] = useState(initialAppVisibility);
   const [appCatalog, setAppCatalog] = useState<CoreAppDescriptor[]>([]);
   const [catalogReady, setCatalogReady] = useState(false);
   const [adapters, setAdapters] = useState<AdapterDescriptor[]>([]);
@@ -170,6 +182,9 @@ export default function App() {
   const mcpPanelRef = useRef<McpPanelHandle>(null);
   const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const definition = appDefinition(activeApp, appCatalog);
+  const visibleApps = appCatalog.filter((app) =>
+    appIsVisible(appVisibility, app.id),
+  );
   const isClaude = activeApp === "claude";
   const additive =
     appCatalog.find((app) => app.id === activeApp)?.configurationMode ===
@@ -245,27 +260,79 @@ export default function App() {
   useEffect(() => {
     const media = globalThis.matchMedia?.("(prefers-color-scheme: dark)");
     const apply = () => {
-      document.documentElement.classList.toggle(
-        "dark",
-        Boolean(media?.matches),
-      );
+      const dark = theme === "dark" || (theme === "system" && media?.matches);
+      document.documentElement.classList.toggle("dark", Boolean(dark));
     };
     apply();
-    if (!media) return;
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    if (theme !== "system" || !media) return;
     media.addEventListener("change", apply);
     return () => media.removeEventListener("change", apply);
-  }, []);
+  }, [theme]);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      APP_VISIBILITY_STORAGE_KEY,
+      JSON.stringify(appVisibility),
+    );
+    if (appCatalog.length === 0) return;
+    const nextVisible = appCatalog.filter((app) =>
+      appIsVisible(appVisibility, app.id),
+    );
+    if (nextVisible.length === 0) {
+      setAppVisibility((current) => ({
+        ...current,
+        [appCatalog[0].id]: true,
+      }));
+      return;
+    }
+    if (!appIsVisible(appVisibility, activeApp)) {
+      setActiveApp(nextVisible[0].id);
+      window.localStorage.setItem(APP_STORAGE_KEY, nextVisible[0].id);
+    }
+  }, [activeApp, appCatalog, appVisibility]);
 
   useEffect(() => {
     window.localStorage.setItem(VIEW_STORAGE_KEY, currentView);
   }, [currentView]);
 
   useEffect(() => {
-    if (!catalogReady || currentView === "providers") return;
+    if (
+      !catalogReady ||
+      currentView === "providers" ||
+      currentView === "settings"
+    )
+      return;
     if (!supportsFeature(appCatalog, activeApp, currentView)) {
       setCurrentView("providers");
     }
   }, [activeApp, appCatalog, catalogReady, currentView]);
+
+  useEffect(() => {
+    const openSettings = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === ",") {
+        event.preventDefault();
+        if (
+          !mutationBusy &&
+          liveBusy === null &&
+          !mcpManagementBusy &&
+          !skillsManagementBusy &&
+          editing === null &&
+          deleting === null
+        )
+          setCurrentView("settings");
+      }
+    };
+    window.addEventListener("keydown", openSettings);
+    return () => window.removeEventListener("keydown", openSettings);
+  }, [
+    deleting,
+    editing,
+    liveBusy,
+    mcpManagementBusy,
+    mutationBusy,
+    skillsManagementBusy,
+  ]);
 
   useEffect(() => {
     let ignore = false;
@@ -600,7 +667,12 @@ export default function App() {
       isCurrent,
     };
   });
-  const viewTitle = currentView === "mcp" ? "MCP Servers" : "Skills";
+  const viewTitle =
+    currentView === "mcp"
+      ? "MCP Servers"
+      : currentView === "skills"
+        ? "Skills"
+        : "Settings";
 
   return (
     <div
@@ -625,7 +697,19 @@ export default function App() {
             className="flex items-center gap-1"
             style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
           >
-            {currentView !== "providers" && (
+            {currentView === "providers" ? (
+              <Button
+                variant="ghost"
+                size="icon"
+                disabled={mutationBusy || liveBusy !== null}
+                onClick={() => setCurrentView("settings")}
+                title="Settings"
+                aria-label="Open settings"
+                className="hover:bg-black/5 dark:hover:bg-white/5"
+              >
+                <SettingsIcon className="h-4 w-4" />
+              </Button>
+            ) : (
               <div className="flex items-center gap-2">
                 <Button
                   variant="outline"
@@ -650,7 +734,7 @@ export default function App() {
               {currentView === "providers" && (
                 <AppSwitcher
                   activeApp={activeApp}
-                  apps={appCatalog}
+                  apps={visibleApps.length > 0 ? visibleApps : appCatalog}
                   disabled={mutationBusy || liveBusy !== null}
                   onSwitch={selectApp}
                 />
@@ -844,10 +928,18 @@ export default function App() {
             apps={mcpApps}
             onInteractionBlockedChange={setMcpManagementBusy}
           />
-        ) : (
+        ) : currentView === "skills" ? (
           <SkillsPanel
             apps={appCatalog}
             onInteractionBlockedChange={setSkillsManagementBusy}
+          />
+        ) : (
+          <SettingsPanel
+            apps={appCatalog}
+            theme={theme}
+            appVisibility={appVisibility}
+            onThemeChange={setTheme}
+            onAppVisibilityChange={setAppVisibility}
           />
         )}
       </main>

@@ -1346,16 +1346,36 @@ describe("App", () => {
     expect(trigger).toHaveFocus();
   });
 
-  it("does not expose settings or a plugin marketplace", async () => {
+  it("provides minimal local settings without a plugin marketplace", async () => {
+    const user = userEvent.setup();
     render(<App />);
 
-    expect(
-      await screen.findByRole("heading", {
-        name: "Add your first Claude Code provider",
+    await screen.findByRole("heading", {
+      name: "Add your first Claude Code provider",
+    });
+    await user.click(screen.getByRole("button", { name: "Open settings" }));
+    expect(screen.getByRole("heading", { name: "Settings" })).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Dark" }));
+    expect(document.documentElement).toHaveClass("dark");
+    expect(window.localStorage.getItem("cc-switch-lite:theme")).toBe("dark");
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Hide Codex in application switcher",
       }),
-    ).toBeVisible();
+    );
+    await user.click(screen.getByRole("tab", { name: "About" }));
     expect(
-      screen.queryByRole("button", { name: "Open settings" }),
+      screen.getByRole("heading", { name: "CC Switch Lite" }),
+    ).toBeVisible();
+    expect(screen.getByText("Version 0.1.0-alpha.1")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Back to providers" }));
+    expect(
+      within(
+        screen.getByRole("navigation", { name: "Applications" }),
+      ).queryByRole("button", { name: "Codex" }),
     ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Open plugin marketplace" }),
