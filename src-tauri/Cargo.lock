@@ -279,7 +279,7 @@ dependencies = [
 [[package]]
 name = "cc-switch-core"
 version = "0.1.0"
-source = "git+https://github.com/SaladDay/cc-switch-core?rev=fef203a9feade13874f33b84743948fbd3f646c9#fef203a9feade13874f33b84743948fbd3f646c9"
+source = "git+https://github.com/SaladDay/cc-switch-core?rev=634379f4f5db15ebec55d51fd8e03233eb198849#634379f4f5db15ebec55d51fd8e03233eb198849"
 dependencies = [
  "http",
  "json-five",
@@ -302,6 +302,7 @@ name = "cc-switch-lite"
 version = "0.1.0-alpha.1"
 dependencies = [
  "cc-switch-core",
+ "cc-switch-store",
  "fs4",
  "hmac",
  "json5",
@@ -318,6 +319,18 @@ dependencies = [
  "toml_edit 0.25.13+spec-1.1.0",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "cc-switch-store"
+version = "0.1.0"
+source = "git+https://github.com/SaladDay/cc-switch-core?rev=634379f4f5db15ebec55d51fd8e03233eb198849#634379f4f5db15ebec55d51fd8e03233eb198849"
+dependencies = [
+ "libc",
+ "rusqlite",
+ "sha2",
+ "thiserror 2.0.20",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
