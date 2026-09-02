@@ -1,4 +1,4 @@
-import type { AppId, CoreAppDescriptor, JsonValue } from "./provider-types";
+import type { AppId, CoreAppDescriptor } from "./provider-types";
 
 export interface AppDefinition {
   id: AppId;
@@ -141,48 +141,4 @@ export function supportsFeature(
       .find((descriptor) => descriptor.id === appId)
       ?.capabilities.includes(FEATURE_CAPABILITIES[feature]) ?? false
   );
-}
-
-const NATIVE_SETTINGS_TEMPLATES: Record<string, Record<string, JsonValue>> = {
-  claude: { env: {} },
-  "claude-desktop": {
-    env: { ANTHROPIC_BASE_URL: "", ANTHROPIC_AUTH_TOKEN: "" },
-  },
-  codex: { auth: {}, config: "" },
-  gemini: {
-    env: {
-      GOOGLE_GEMINI_BASE_URL: "",
-      GEMINI_API_KEY: "",
-      GEMINI_MODEL: "gemini-3.6-flash",
-    },
-  },
-  grokbuild: {
-    config:
-      '[models]\ndefault = "grok-4.5"\n\n[model."grok-4.5"]\nmodel = "grok-4.5"\nbase_url = ""\nname = "Custom"\napi_key = ""\napi_backend = "responses"\ncontext_window = 500000\n',
-  },
-  opencode: {
-    npm: "@ai-sdk/openai-compatible",
-    options: { baseURL: "", apiKey: "", setCacheKey: true },
-    models: {},
-  },
-  openclaw: {
-    baseUrl: "",
-    apiKey: "",
-    api: "openai-completions",
-    models: [],
-  },
-  hermes: {
-    name: "",
-    base_url: "",
-    api_key: "",
-    api_mode: "chat_completions",
-    models: [],
-  },
-  pi: { baseUrl: "", apiKey: "", models: [] },
-};
-
-export function nativeSettingsTemplate(
-  appId: string,
-): Record<string, JsonValue> {
-  return NATIVE_SETTINGS_TEMPLATES[appId as AppId] ?? {};
 }
