@@ -279,7 +279,7 @@ dependencies = [
 [[package]]
 name = "cc-switch-core"
 version = "0.1.0"
-source = "git+https://github.com/SaladDay/cc-switch-core?rev=264bd00f944c06cdf1f0137d76304871a4ea8389#264bd00f944c06cdf1f0137d76304871a4ea8389"
+source = "git+https://github.com/SaladDay/cc-switch-core?rev=1dd88b5368f3ddeb7c767920ca857641c4bdb076#1dd88b5368f3ddeb7c767920ca857641c4bdb076"
 dependencies = [
  "http",
  "json-five",
@@ -324,8 +324,9 @@ dependencies = [
 [[package]]
 name = "cc-switch-store"
 version = "0.1.0"
-source = "git+https://github.com/SaladDay/cc-switch-core?rev=264bd00f944c06cdf1f0137d76304871a4ea8389#264bd00f944c06cdf1f0137d76304871a4ea8389"
+source = "git+https://github.com/SaladDay/cc-switch-core?rev=1dd88b5368f3ddeb7c767920ca857641c4bdb076#1dd88b5368f3ddeb7c767920ca857641c4bdb076"
 dependencies = [
+ "cc-switch-core",
  "libc",
  "rusqlite",
  "sha2",
