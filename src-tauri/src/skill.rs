@@ -1,10 +1,10 @@
-use std::{collections::HashSet, fs, path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
-use cc_switch_core::{
-    skill_catalog_columns, AppType, InstalledSkillSnapshot, SkillCatalogDecision,
-    SkillCatalogEntry, SkillCatalogEntryError, SkillControlReason,
+use cc_switch_core::{AppType, InstalledSkillSnapshot, SkillCatalogDecision, SkillControlReason};
+use cc_switch_store::{
+    apply_skill_catalog_plan, begin_immediate_transaction, read_skill_catalog,
+    read_skill_catalog_entry, SharedDatabase, SharedStoreError, SkillCatalogWriteOutcome,
 };
-use rusqlite::{params, Connection, OpenFlags, Row, TransactionBehavior};
 use thiserror::Error;
 
 use crate::{
@@ -12,14 +12,14 @@ use crate::{
     skill_live::SkillHostError,
 };
 
-const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-
 #[derive(Debug, Error)]
 pub enum SkillError {
     #[error("shared Skill database failed: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("shared Skill data is invalid: {0}")]
     InvalidStore(String),
+    #[error(transparent)]
+    SharedWrite(SharedStoreError),
     #[error("Skill changed outside this editor; reload and try again")]
     Conflict,
     #[error(transparent)]
@@ -37,7 +37,7 @@ pub enum SkillError {
 impl SkillError {
     pub fn code(&self) -> &'static str {
         match self {
-            Self::Database(_) | Self::Io { .. } => "storage_error",
+            Self::Database(_) | Self::Io { .. } | Self::SharedWrite(_) => "storage_error",
             Self::InvalidStore(_) => "invalid_store",
             Self::Conflict => "conflict",
             Self::Host(error) => error.code(),
@@ -46,19 +46,30 @@ impl SkillError {
     }
 }
 
+impl From<SharedStoreError> for SkillError {
+    fn from(error: SharedStoreError) -> Self {
+        match error {
+            SharedStoreError::Io { path, source } => Self::Io { path, source },
+            SharedStoreError::Database(error) => Self::Database(error),
+            SharedStoreError::InvalidDatabase(message) => Self::InvalidStore(message),
+            other => Self::SharedWrite(other),
+        }
+    }
+}
+
 pub struct SkillStore {
-    path: PathBuf,
+    database: SharedDatabase,
 }
 
 impl SkillStore {
     pub fn open(path: PathBuf) -> Result<Self, SkillError> {
-        let store = Self { path };
-        store.initialize()?;
-        Ok(store)
+        let database = SharedDatabase::open(path)?;
+        database.ensure_skill_schema()?;
+        Ok(Self { database })
     }
 
     pub fn list(&self, live: &LiveConfig) -> Result<Vec<InstalledSkillSnapshot>, SkillError> {
-        let catalog = load_catalog(&self.connect()?)?;
+        let catalog = read_skill_catalog(&self.connect()?)?;
         live.inspect_skills(&catalog).map_err(Into::into)
     }
 
@@ -132,12 +143,15 @@ impl SkillStore {
         requested: Option<bool>,
     ) -> Result<(), SkillError> {
         let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let catalog = load_catalog(&transaction)?;
+        let mut transaction = begin_immediate_transaction(&mut connection)?;
+        let catalog = read_skill_catalog(&transaction)?;
         let receipt = live.apply_skill_recoverable(&catalog, skill_id, &app, requested)?;
 
         let database_result = (|| -> Result<(), SkillError> {
-            apply_catalog_change(&transaction, &catalog, &receipt)?;
+            require_applied(apply_skill_catalog_plan(
+                &mut transaction,
+                receipt.value.plan(),
+            )?)?;
             transaction.commit()?;
             Ok(())
         })();
@@ -160,12 +174,10 @@ impl SkillStore {
     ) -> Result<(), SkillError> {
         let decision = self
             .connect()
-            .and_then(|connection| load_catalog(&connection))
-            .map(|catalog| {
-                receipt
-                    .value
-                    .decide_catalog(catalog.iter().find(|entry| entry.id() == skill_id))
-            });
+            .and_then(|connection| {
+                read_skill_catalog_entry(&connection, skill_id).map_err(Into::into)
+            })
+            .map(|entry| receipt.value.decide_catalog(entry.as_ref()));
         match decision {
             Ok(SkillCatalogDecision::KeepLive) => commit_live(live, receipt),
             Ok(SkillCatalogDecision::RestoreLive) => {
@@ -184,88 +196,15 @@ impl SkillStore {
         }
     }
 
-    fn initialize(&self) -> Result<(), SkillError> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|source| SkillError::Io {
-                path: parent.to_owned(),
-                source,
-            })?;
-        }
-        let connection = self.connect()?;
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS skills (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                directory TEXT NOT NULL,
-                repo_owner TEXT,
-                repo_name TEXT,
-                repo_branch TEXT DEFAULT 'main',
-                readme_url TEXT,
-                enabled_claude BOOLEAN NOT NULL DEFAULT 0,
-                enabled_codex BOOLEAN NOT NULL DEFAULT 0,
-                enabled_gemini BOOLEAN NOT NULL DEFAULT 0,
-                enabled_grokbuild BOOLEAN NOT NULL DEFAULT 0,
-                enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
-                enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
-                enabled_pi BOOLEAN NOT NULL DEFAULT 0,
-                installed_at INTEGER NOT NULL DEFAULT 0,
-                content_hash TEXT,
-                updated_at INTEGER NOT NULL DEFAULT 0
-            );",
-        )?;
-        for column in skill_catalog_columns() {
-            ensure_column(&connection, column.as_str())?;
-        }
-        verify_schema(&connection)
-    }
-
-    fn connect(&self) -> Result<Connection, SkillError> {
-        let connection = Connection::open_with_flags(
-            &self.path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        Ok(connection)
+    fn connect(&self) -> Result<rusqlite::Connection, SkillError> {
+        self.database.connect().map_err(Into::into)
     }
 }
 
-fn apply_catalog_change(
-    transaction: &rusqlite::Transaction<'_>,
-    catalog: &[SkillCatalogEntry],
-    receipt: &SkillWriteReceipt<'_>,
-) -> Result<(), SkillError> {
-    let guard = receipt.value.plan().catalog_guard();
-    let current = catalog
-        .iter()
-        .find(|entry| entry.id() == guard.skill_id())
-        .ok_or(SkillError::Conflict)?;
-    if !guard.matches(current) {
-        return Err(SkillError::Conflict);
-    }
-    let Some(change) = receipt.value.plan().catalog_change() else {
-        return Ok(());
-    };
-    let column = change.column().as_str();
-    let changed = transaction.execute(
-        &format!(
-            "UPDATE skills SET \"{column}\" = ?1
-             WHERE id = ?2 AND name = ?3 AND directory = ?4 AND \"{column}\" = ?5"
-        ),
-        params![
-            change.replacement(),
-            change.skill_id(),
-            guard.expected_name(),
-            guard.expected_directory(),
-            change.expected(),
-        ],
-    )?;
-    if changed == 1 {
-        Ok(())
-    } else {
-        Err(SkillError::Conflict)
+fn require_applied(outcome: SkillCatalogWriteOutcome) -> Result<(), SkillError> {
+    match outcome {
+        SkillCatalogWriteOutcome::Applied => Ok(()),
+        SkillCatalogWriteOutcome::NotApplied => Err(SkillError::Conflict),
     }
 }
 
@@ -290,95 +229,12 @@ fn rollback_live(
     }
 }
 
-fn load_catalog(connection: &Connection) -> Result<Vec<SkillCatalogEntry>, SkillError> {
-    let columns = skill_catalog_columns().collect::<Vec<_>>();
-    let selection_columns = columns
-        .iter()
-        .map(|column| format!("\"{}\"", column.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT id, name, description, directory, {selection_columns}
-         FROM skills ORDER BY name, id"
-    );
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement.query_map([], |row| raw_skill(row, columns.len()))?;
-    rows.map(|row| {
-        let row = row?;
-        SkillCatalogEntry::try_new(
-            row.id,
-            row.name,
-            row.description,
-            row.directory,
-            columns.iter().copied().zip(row.selections),
-        )
-        .map_err(invalid_catalog_entry)
-    })
-    .collect()
-}
-
-struct RawSkill {
-    id: String,
-    name: String,
-    description: Option<String>,
-    directory: String,
-    selections: Vec<bool>,
-}
-
-fn raw_skill(row: &Row<'_>, selection_count: usize) -> rusqlite::Result<RawSkill> {
-    let selections = (0..selection_count)
-        .map(|offset| row.get(4 + offset))
-        .collect::<Result<Vec<bool>, _>>()?;
-    Ok(RawSkill {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        description: row.get(2)?,
-        directory: row.get(3)?,
-        selections,
-    })
-}
-
-fn invalid_catalog_entry(error: SkillCatalogEntryError) -> SkillError {
-    SkillError::InvalidStore(error.to_string())
-}
-
-fn ensure_column(connection: &Connection, column: &str) -> Result<(), SkillError> {
-    let columns = table_columns(connection)?;
-    if !columns.contains(column) {
-        connection.execute_batch(&format!(
-            "ALTER TABLE skills ADD COLUMN \"{column}\" BOOLEAN NOT NULL DEFAULT 0"
-        ))?;
-    }
-    Ok(())
-}
-
-fn verify_schema(connection: &Connection) -> Result<(), SkillError> {
-    let columns = table_columns(connection)?;
-    for required in ["id", "name", "description", "directory"]
-        .into_iter()
-        .chain(skill_catalog_columns().map(|column| column.as_str()))
-    {
-        if !columns.contains(required) {
-            return Err(SkillError::InvalidStore(format!(
-                "skills table is missing required column '{required}'"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn table_columns(connection: &Connection) -> Result<HashSet<String>, SkillError> {
-    let mut statement = connection.prepare("PRAGMA table_info(skills)")?;
-    let columns = statement
-        .query_map([], |row| row.get(1))?
-        .collect::<Result<HashSet<_>, _>>()?;
-    Ok(columns)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use cc_switch_core::skill_catalog_columns;
+    use rusqlite::Connection;
+    use std::{fs, path::Path};
     use tempfile::tempdir;
 
     fn insert_skill(path: &Path) {
@@ -399,7 +255,7 @@ mod tests {
         let store = SkillStore::open(path.clone()).unwrap();
         insert_skill(&path);
 
-        let catalog = load_catalog(&store.connect().unwrap()).unwrap();
+        let catalog = read_skill_catalog(&store.connect().unwrap()).unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(
             catalog[0]
