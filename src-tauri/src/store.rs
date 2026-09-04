@@ -10,10 +10,10 @@ use std::fs;
 use cc_switch_core::{builtin_app_adapter, AppType};
 use cc_switch_store::{
     begin_immediate_transaction, delete_provider as delete_provider_row,
-    insert_provider as insert_provider_row, read_provider_row, read_provider_rows,
-    set_provider_current, update_provider_configuration, update_provider_details,
-    update_provider_metadata, ProviderInsert, ProviderRow as SharedProviderRow,
-    ProviderWriteOutcome, SharedDatabase, SharedStoreError,
+    insert_provider_if_absent as insert_provider_row, read_provider_row, read_provider_rows,
+    set_provider_current_if_unchanged, update_provider_configuration_if_unchanged,
+    update_provider_details_if_unchanged, update_provider_metadata_if_unchanged, ProviderInsert,
+    ProviderRow as SharedProviderRow, ProviderWriteOutcome, SharedDatabase, SharedStoreError,
 };
 use hmac::{Hmac, Mac};
 use rusqlite::{params, types::ValueRef, Connection, OptionalExtension, Row, Transaction};
@@ -89,6 +89,7 @@ impl From<SharedStoreError> for StoreError {
 #[derive(Clone)]
 struct StoredProvider {
     record: ProviderRecord,
+    source_fingerprint: [u8; 32],
     is_current: bool,
     native_settings: Value,
     lite_writable: bool,
@@ -170,13 +171,27 @@ fn replace_exclusive_current(
         .into_iter()
         .filter(|provider| provider.is_current != 0)
     {
-        if set_provider_current(transaction, &provider.id, &provider.app_type, false)?
-            != ProviderWriteOutcome::Applied
+        if set_provider_current_if_unchanged(
+            transaction,
+            &provider.id,
+            &provider.app_type,
+            provider.source_fingerprint(),
+            false,
+        )? != ProviderWriteOutcome::Applied
         {
             return Err(StoreError::Conflict(id.to_owned()));
         }
     }
-    if set_provider_current(transaction, id, app.as_str(), true)? != ProviderWriteOutcome::Applied {
+    let target = read_provider_row(transaction, id, app.as_str())?
+        .ok_or_else(|| StoreError::Conflict(id.to_owned()))?;
+    if set_provider_current_if_unchanged(
+        transaction,
+        id,
+        app.as_str(),
+        target.source_fingerprint(),
+        true,
+    )? != ProviderWriteOutcome::Applied
+    {
         return Err(StoreError::Conflict(id.to_owned()));
     }
 
@@ -247,8 +262,15 @@ fn write_lite_metadata(
 ) -> Result<(), StoreError> {
     let raw = serde_json::to_string(metadata)
         .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
-    if update_provider_metadata(transaction, id, app.as_str(), &raw)?
-        != ProviderWriteOutcome::Applied
+    let current = read_provider_row(transaction, id, app.as_str())?
+        .ok_or_else(|| StoreError::Conflict(id.to_owned()))?;
+    if update_provider_metadata_if_unchanged(
+        transaction,
+        id,
+        app.as_str(),
+        current.source_fingerprint(),
+        &raw,
+    )? != ProviderWriteOutcome::Applied
     {
         return Err(StoreError::Conflict(id.to_owned()));
     }
@@ -574,10 +596,11 @@ impl ProviderStore {
         let name = validate_name(name).map_err(StoreError::InvalidProvider)?;
         let settings_config = serde_json::to_string(&settings)
             .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
-        if update_provider_configuration(
+        if update_provider_configuration_if_unchanged(
             &mut transaction,
             id,
             app.as_str(),
+            &current.source_fingerprint,
             &name,
             &settings_config,
         )? != ProviderWriteOutcome::Applied
@@ -598,12 +621,19 @@ impl ProviderStore {
                 write_lite_metadata(&mut transaction, &app, id, &metadata)?;
             }
         }
-        if current.is_current
-            && !app.is_additive_mode()
-            && set_provider_current(&mut transaction, id, app.as_str(), false)?
-                != ProviderWriteOutcome::Applied
-        {
-            return Err(StoreError::Conflict(id.to_owned()));
+        if current.is_current && !app.is_additive_mode() {
+            let refreshed = read_provider_row(&transaction, id, app.as_str())?
+                .ok_or_else(|| StoreError::Conflict(id.to_owned()))?;
+            if set_provider_current_if_unchanged(
+                &mut transaction,
+                id,
+                app.as_str(),
+                refreshed.source_fingerprint(),
+                false,
+            )? != ProviderWriteOutcome::Applied
+            {
+                return Err(StoreError::Conflict(id.to_owned()));
+            }
         }
         if migrate_builtin_binding {
             let changed = transaction.execute(
@@ -736,10 +766,12 @@ impl ProviderStore {
                 let category = category.or(current.record.category);
                 let metadata = serde_json::to_string(&Value::Object(merged_metadata.clone()))
                     .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
-                if update_provider_details(
+                let expected_fingerprint = current.source_fingerprint;
+                if update_provider_details_if_unchanged(
                     &mut transaction,
                     &id,
                     app.as_str(),
+                    &expected_fingerprint,
                     next_name,
                     &settings_config,
                     category.as_deref(),
@@ -956,10 +988,11 @@ impl ProviderStore {
         let name = validate_name(&update.name).map_err(StoreError::InvalidProvider)?;
         let settings_config = serde_json::to_string(&settings)
             .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
-        if update_provider_configuration(
+        if update_provider_configuration_if_unchanged(
             &mut transaction,
             id,
             &current.record.app_id,
+            &current.source_fingerprint,
             &name,
             &settings_config,
         )? != ProviderWriteOutcome::Applied
@@ -1016,6 +1049,9 @@ impl ProviderStore {
             ),
             params![id, app.as_str()],
         )?;
+        // Shared full-product databases can own cascading provider rows that
+        // Lite must not enumerate or delete directly. The product revision was
+        // checked above, so retain the compatibility delete for those cascades.
         if delete_provider_row(&mut transaction, id, app.as_str())? != ProviderWriteOutcome::Applied
         {
             return Err(StoreError::Conflict(id.to_owned()));
@@ -1065,6 +1101,7 @@ impl ProviderStore {
                 ),
                 params![id, app.as_str()],
             )?;
+            // Keep unknown host cascades inside the shared provider delete.
             if delete_provider_row(&mut transaction, id, app.as_str())?
                 != ProviderWriteOutcome::Applied
             {
@@ -1286,6 +1323,7 @@ impl ProviderStore {
         connection: &Connection,
         provider: SharedProviderRow,
     ) -> Result<StoredProvider, StoreError> {
+        let source_fingerprint = *provider.source_fingerprint();
         let app = parse_app(&provider.app_type)?;
         let binding = self.stored_adapter_binding(connection, &provider.id, &provider.app_type)?;
         let revision = snapshot_revision(
@@ -1412,6 +1450,7 @@ impl ProviderStore {
         );
         Ok(StoredProvider {
             record,
+            source_fingerprint,
             is_current: is_current != 0,
             native_settings,
             lite_writable,
