@@ -2,17 +2,17 @@ use std::{fs, path::PathBuf};
 
 use cc_switch_core::{
     builtin_app_adapter, builtin_app_registry, fs::atomic_write, mcp_servers_equivalent,
-    AppCapability, AppType, McpConfigTarget, McpServerProjection,
+    AppCapability, AppType, McpConfigResource, McpServerProjection,
 };
 
 use crate::{
-    live::LiveError,
+    live::{LiveError, ResolvedConfigDirs},
     mcp::{McpImportsByApp, McpLiveChange, McpNativeLinkState},
-    operation::{read_optional, resolve_write_path, OperationError},
+    operation::{read_optional, resolve_write_path, LivePaths, OperationError},
 };
 
 struct McpPath {
-    target: McpConfigTarget,
+    app: AppType,
     path: PathBuf,
     install_marker: PathBuf,
 }
@@ -44,47 +44,46 @@ struct McpFileReceipt {
 
 impl McpLiveConfig {
     pub fn new(
-        claude: (PathBuf, PathBuf),
-        codex: (PathBuf, PathBuf),
-        gemini: (PathBuf, PathBuf),
-        grok: (PathBuf, PathBuf),
-        opencode: (PathBuf, PathBuf),
-        hermes: (PathBuf, PathBuf),
-    ) -> Self {
-        Self {
-            paths: vec![
-                McpPath {
-                    target: McpConfigTarget::Claude,
-                    path: claude.0,
-                    install_marker: claude.1,
-                },
-                McpPath {
-                    target: McpConfigTarget::Codex,
-                    path: codex.0,
-                    install_marker: codex.1,
-                },
-                McpPath {
-                    target: McpConfigTarget::Gemini,
-                    path: gemini.0,
-                    install_marker: gemini.1,
-                },
-                McpPath {
-                    target: McpConfigTarget::GrokBuild,
-                    path: grok.0,
-                    install_marker: grok.1,
-                },
-                McpPath {
-                    target: McpConfigTarget::OpenCode,
-                    path: opencode.0,
-                    install_marker: opencode.1,
-                },
-                McpPath {
-                    target: McpConfigTarget::Hermes,
-                    path: hermes.0,
-                    install_marker: hermes.1,
-                },
-            ],
-        }
+        native: &LivePaths,
+        roots: &ResolvedConfigDirs,
+        host_defined: impl IntoIterator<Item = (AppType, PathBuf)>,
+    ) -> Result<Self, LiveError> {
+        let host_defined = host_defined.into_iter().collect::<Vec<_>>();
+        let paths = builtin_app_registry()
+            .descriptors()
+            .filter_map(|descriptor| {
+                descriptor
+                    .mcp_contract()
+                    .map(|contract| (descriptor, contract))
+            })
+            .map(|(descriptor, contract)| {
+                let app = descriptor.app().clone();
+                let path = match contract.resource() {
+                    McpConfigResource::LogicalTarget(target) => native.path_for(target).to_owned(),
+                    McpConfigResource::HostDefined => host_defined
+                        .iter()
+                        .find_map(|(candidate, path)| (candidate == &app).then(|| path.clone()))
+                        .ok_or_else(|| {
+                            LiveError::InvalidConfig(format!(
+                                "host MCP path is missing for {}",
+                                descriptor.id()
+                            ))
+                        })?,
+                    _ => {
+                        return Err(LiveError::InvalidConfig(format!(
+                            "MCP resource is not supported for {}",
+                            descriptor.id()
+                        )))
+                    }
+                };
+                Ok(McpPath {
+                    install_marker: roots.root(&app)?.to_owned(),
+                    app,
+                    path,
+                })
+            })
+            .collect::<Result<Vec<_>, LiveError>>()?;
+        Ok(Self { paths })
     }
 
     pub fn apply(&self, changes: &mut [McpLiveChange]) -> Result<McpLiveReceipt, LiveError> {
@@ -267,18 +266,15 @@ impl McpLiveConfig {
     }
 
     fn path_for_app(&self, app: &AppType) -> Result<&McpPath, LiveError> {
-        let target = builtin_app_adapter(app)
-            .mcp_config_target()
+        self.paths
+            .iter()
+            .find(|path| &path.app == app)
             .ok_or_else(|| {
                 LiveError::InvalidConfig(format!(
                     "application '{}' does not support MCP",
                     app.as_str()
                 ))
-            })?;
-        self.paths
-            .iter()
-            .find(|path| path.target == target)
-            .ok_or_else(|| LiveError::InvalidConfig("MCP path is not configured".to_owned()))
+            })
     }
 }
 
@@ -323,17 +319,16 @@ mod tests {
     use tempfile::tempdir;
 
     fn config(home: &Path) -> McpLiveConfig {
+        let claude = home.join(".claude");
+        let codex = home.join(".codex");
+        let roots = crate::live::ResolvedConfigDirs::for_tests(home, claude.clone(), codex.clone());
+        let native = crate::native_live::NativeLiveConfig::for_tests(home, claude, codex);
         McpLiveConfig::new(
-            (home.join(".claude.json"), home.join(".claude")),
-            (home.join(".codex/config.toml"), home.join(".codex")),
-            (home.join(".gemini/settings.json"), home.join(".gemini")),
-            (home.join(".grok/config.toml"), home.join(".grok")),
-            (
-                home.join(".config/opencode/opencode.json"),
-                home.join(".config/opencode"),
-            ),
-            (home.join(".hermes/config.yaml"), home.join(".hermes")),
+            native.paths(),
+            &roots,
+            [(AppType::Claude, home.join(".claude.json"))],
         )
+        .expect("test MCP resources are complete")
     }
 
     #[test]

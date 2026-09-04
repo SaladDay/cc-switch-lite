@@ -11,6 +11,7 @@ mod mcp_live;
 mod native_live;
 mod operation;
 mod provider;
+mod resource;
 mod skill;
 mod skill_live;
 mod store;

@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::ffi::OsStr;
 
 use cc_switch_core::{
-    builtin_app_adapter, claude_desktop, codex, gemini, AppType, HermesProviderSource,
-    LiveDocumentSet, LogicalTarget, NativeAction, NativeImportContext as CoreImportContext,
-    NativeImportError, NativeImportStep, NativePlanContext, NativePlanError, NativePlanRequest,
-    NativeProviderAccess, NativeProviderMode, ObservedDocument, ProviderSnapshot,
+    builtin_app_adapter, claude_desktop, gemini, AppType, HermesProviderSource, LiveDocumentSet,
+    LogicalTarget, NativeAction, NativeImportContext as CoreImportContext, NativeImportError,
+    NativeImportStep, NativePlanContext, NativePlanError, NativePlanRequest, NativeProviderAccess,
+    NativeProviderMode, ObservedDocument, ProviderSnapshot,
 };
 use serde_json::{json, Map, Value};
 
@@ -17,6 +17,7 @@ use crate::{
     provider::{
         is_lite_writable, native_adapter_reference, NativeImport, ProviderDraft, ProviderRecord,
     },
+    resource::resolve_config_root_resource,
 };
 
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000157210";
@@ -28,6 +29,7 @@ const HERMES_DICT_SOURCE: &str = "providers_dict";
 
 pub struct NativeLiveConfig {
     paths: LivePaths,
+    fallback_roots: Vec<(LogicalTarget, PathBuf)>,
 }
 
 pub(crate) struct PreparedNativePlan {
@@ -37,25 +39,45 @@ pub(crate) struct PreparedNativePlan {
 
 impl NativeLiveConfig {
     pub fn from_home(home: &Path, dirs: &ResolvedConfigDirs) -> Result<Self, LiveError> {
-        let (normal, threep, profile, meta) = claude_desktop_paths(home);
+        Self::from_resources(dirs, claude_desktop_paths(home))
+    }
+
+    fn from_resources(
+        dirs: &ResolvedConfigDirs,
+        desktop: (PathBuf, PathBuf, PathBuf, PathBuf),
+    ) -> Result<Self, LiveError> {
+        let (normal, threep, profile, meta) = desktop;
+        let host_defined = [
+            (LogicalTarget::ClaudeDesktopNormalConfig, normal),
+            (LogicalTarget::ClaudeDesktopThreepConfig, threep),
+            (LogicalTarget::ClaudeDesktopProfile, profile),
+            (LogicalTarget::ClaudeDesktopMeta, meta),
+        ];
+        let mut paths = Vec::with_capacity(LogicalTarget::ALL.len());
+        let mut fallback_roots = Vec::new();
+        for target in LogicalTarget::ALL {
+            let resource = target.resource_path();
+            let path = if let Some((_, fallbacks)) = resource.config_root_relative() {
+                let root = dirs.root(&target.app())?;
+                if !fallbacks.is_empty() {
+                    fallback_roots.push((target, root.to_owned()));
+                }
+                resolve_config_root_resource(root, resource).ok_or_else(|| {
+                    LiveError::InvalidConfig(format!("relative resource is invalid for {target:?}"))
+                })?
+            } else {
+                host_defined
+                    .iter()
+                    .find_map(|(candidate, path)| (*candidate == target).then(|| path.clone()))
+                    .ok_or_else(|| {
+                        LiveError::InvalidConfig(format!("host path is missing for {target:?}"))
+                    })?
+            };
+            paths.push((target, path));
+        }
         Ok(Self {
-            paths: LivePaths {
-                claude_settings: dirs.claude.join("settings.json"),
-                claude_desktop_normal_config: normal,
-                claude_desktop_threep_config: threep,
-                claude_desktop_profile: profile,
-                claude_desktop_meta: meta,
-                codex_auth: dirs.codex.join("auth.json"),
-                codex_config: dirs.codex.join("config.toml"),
-                codex_model_catalog: dirs.codex.join(codex::MODEL_CATALOG_FILENAME),
-                gemini_env: dirs.gemini.join(".env"),
-                gemini_settings: dirs.gemini.join("settings.json"),
-                grok_config: dirs.grok.join("config.toml"),
-                opencode_config: dirs.opencode.join("opencode.json"),
-                openclaw_config: home.join(".openclaw").join("openclaw.json"),
-                hermes_config: dirs.hermes.join("config.yaml"),
-                pi_models: dirs.pi.join("models.json"),
-            },
+            paths: LivePaths::try_new(paths)?,
+            fallback_roots,
         })
     }
 
@@ -65,34 +87,32 @@ impl NativeLiveConfig {
 
     #[cfg(test)]
     pub fn for_tests(home: &Path, claude_dir: PathBuf, codex_dir: PathBuf) -> Self {
-        let (normal, threep, profile, meta) = test_claude_desktop_paths(home);
-        Self {
-            paths: LivePaths {
-                claude_settings: claude_dir.join("settings.json"),
-                claude_desktop_normal_config: normal,
-                claude_desktop_threep_config: threep,
-                claude_desktop_profile: profile,
-                claude_desktop_meta: meta,
-                codex_auth: codex_dir.join("auth.json"),
-                codex_config: codex_dir.join("config.toml"),
-                codex_model_catalog: codex_dir.join(codex::MODEL_CATALOG_FILENAME),
-                gemini_env: home.join(".gemini/.env"),
-                gemini_settings: home.join(".gemini/settings.json"),
-                grok_config: home.join(".grok/config.toml"),
-                opencode_config: home.join(".config/opencode/opencode.json"),
-                openclaw_config: home.join(".openclaw/openclaw.json"),
-                hermes_config: home.join(".hermes/config.yaml"),
-                pi_models: home.join(".pi/agent/models.json"),
-            },
-        }
+        let dirs = ResolvedConfigDirs::for_tests(home, claude_dir, codex_dir);
+        Self::from_resources(&dirs, test_claude_desktop_paths(home))
+            .expect("test resources are complete")
     }
 
     fn resolved_for_targets(&self, targets: &[LogicalTarget]) -> Result<Self, LiveError> {
-        let mut paths = self.paths.clone();
+        let mut paths = self.current_paths()?;
         for target in targets {
             paths = paths.resolved_for_write(*target)?;
         }
-        Ok(Self { paths })
+        Ok(Self {
+            paths,
+            fallback_roots: self.fallback_roots.clone(),
+        })
+    }
+
+    fn current_paths(&self) -> Result<LivePaths, LiveError> {
+        let mut paths = self.paths.clone();
+        for (target, root) in &self.fallback_roots {
+            let path =
+                resolve_config_root_resource(root, target.resource_path()).ok_or_else(|| {
+                    LiveError::InvalidConfig(format!("relative resource is invalid for {target:?}"))
+                })?;
+            paths.replace(*target, path);
+        }
+        Ok(paths)
     }
 
     pub fn import_drafts(&self, app: AppType) -> Result<Vec<NativeImport>, LiveError> {
@@ -100,7 +120,7 @@ impl NativeLiveConfig {
             ensure_claude_desktop_supported()?;
         }
         let adapter = builtin_app_adapter(&app);
-        let mut paths = self.paths.clone();
+        let mut paths = self.current_paths()?;
         let mut observations = adapter
             .targets()
             .iter()
@@ -560,6 +580,54 @@ mod tests {
     }
 
     #[test]
+    fn claude_resource_rechecks_the_core_declared_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let claude = directory.path().join(".claude");
+        std::fs::create_dir(&claude).unwrap();
+        let legacy = claude.join("claude.json");
+        let native = NativeLiveConfig::for_tests(
+            directory.path(),
+            claude.clone(),
+            directory.path().join(".codex"),
+        );
+        assert_eq!(
+            native
+                .current_paths()
+                .unwrap()
+                .path_for(LogicalTarget::ClaudeSettings),
+            claude.join("settings.json")
+        );
+
+        std::fs::write(&legacy, "{}").unwrap();
+        assert_eq!(
+            native
+                .current_paths()
+                .unwrap()
+                .path_for(LogicalTarget::ClaudeSettings),
+            legacy
+        );
+
+        let preferred = claude.join("settings.json");
+        std::fs::write(&preferred, "{}").unwrap();
+        assert_eq!(
+            native
+                .current_paths()
+                .unwrap()
+                .path_for(LogicalTarget::ClaudeSettings),
+            preferred
+        );
+
+        std::fs::remove_file(&preferred).unwrap();
+        assert_eq!(
+            native
+                .current_paths()
+                .unwrap()
+                .path_for(LogicalTarget::ClaudeSettings),
+            legacy
+        );
+    }
+
+    #[test]
     fn additive_json_plans_preserve_unrelated_configuration() {
         let directory = tempfile::tempdir().unwrap();
         let native = NativeLiveConfig::for_tests(
@@ -567,9 +635,16 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.opencode_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::OpenCodeConfig)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.opencode_config,
+            native.paths.path_for(LogicalTarget::OpenCodeConfig),
             r#"{"theme":"dark","provider":{"existing":{"options":{}}}}"#,
         )
         .unwrap();
@@ -603,9 +678,16 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.pi_models.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::PiModels)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.pi_models,
+            native.paths.path_for(LogicalTarget::PiModels),
             r#"{providers:{anthropic:{oauth:"native"},custom:{models:[]}}}"#,
         )
         .unwrap();
@@ -628,9 +710,16 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.pi_models.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::PiModels)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.pi_models,
+            native.paths.path_for(LogicalTarget::PiModels),
             r#"{providers:{valid:{models:[]},invalid:42}}"#,
         )
         .unwrap();
@@ -649,9 +738,16 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.openclaw_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::OpenClawConfig)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.openclaw_config,
+            native.paths.path_for(LogicalTarget::OpenClawConfig),
             "{\n  // keep this comment\n  tools: { profile: 'coding' },\n  models: { mode: 'merge', providers: {} },\n}\n",
         )
         .unwrap();
@@ -679,9 +775,11 @@ mod tests {
         OperationExecutor::new(&native.paths)
             .execute(&plan)
             .expect("execute JSON5 plan");
-        assert!(std::fs::read_to_string(&native.paths.openclaw_config)
-            .unwrap()
-            .contains("// keep this comment"));
+        assert!(
+            std::fs::read_to_string(native.paths.path_for(LogicalTarget::OpenClawConfig))
+                .unwrap()
+                .contains("// keep this comment")
+        );
     }
 
     #[test]
@@ -692,14 +790,32 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.gemini_settings.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::GeminiSettings)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.gemini_settings,
+            native.paths.path_for(LogicalTarget::GeminiSettings),
             r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#,
         )
         .unwrap();
-        std::fs::create_dir_all(native.paths.grok_config.parent().unwrap()).unwrap();
-        std::fs::write(&native.paths.grok_config, "# official\n").unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::GrokConfig)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            native.paths.path_for(LogicalTarget::GrokConfig),
+            "# official\n",
+        )
+        .unwrap();
 
         let gemini = native.import_drafts(AppType::Gemini).unwrap().remove(0);
         let grok = native.import_drafts(AppType::GrokBuild).unwrap().remove(0);
@@ -724,8 +840,19 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.gemini_env.parent().unwrap()).unwrap();
-        std::fs::write(&native.paths.gemini_env, "GEMINI_API_KEY=ok\nbroken").unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::GeminiEnv)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            native.paths.path_for(LogicalTarget::GeminiEnv),
+            "GEMINI_API_KEY=ok\nbroken",
+        )
+        .unwrap();
         assert!(matches!(
             native.import_drafts(AppType::Gemini),
             Err(LiveError::InvalidConfig(_))
@@ -750,14 +877,21 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.codex_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::CodexConfig)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.codex_auth,
+            native.paths.path_for(LogicalTarget::CodexAuth),
             r#"{"tokens":{"access_token":"oauth-login"}}"#,
         )
         .unwrap();
         std::fs::write(
-            &native.paths.codex_config,
+            native.paths.path_for(LogicalTarget::CodexConfig),
             "model = \"old\"\n[mcp_servers.keep]\ncommand = \"keep\"\n",
         )
         .unwrap();
@@ -798,10 +932,15 @@ mod tests {
         OperationExecutor::new(&native.paths)
             .execute(&plan)
             .expect("execute Codex plan");
-        assert!(std::fs::read_to_string(&native.paths.codex_auth)
-            .unwrap()
-            .contains("oauth-login"));
-        assert!(native.paths.codex_model_catalog.exists());
+        assert!(
+            std::fs::read_to_string(native.paths.path_for(LogicalTarget::CodexAuth))
+                .unwrap()
+                .contains("oauth-login")
+        );
+        assert!(native
+            .paths
+            .path_for(LogicalTarget::CodexModelCatalog)
+            .exists());
     }
 
     #[test]
@@ -812,14 +951,21 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.codex_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::CodexConfig)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.codex_auth,
+            native.paths.path_for(LogicalTarget::CodexAuth),
             vec![b'x'; cc_switch_core::MAX_OPERATION_CONTENT_BYTES + 1],
         )
         .unwrap();
         std::fs::write(
-            &native.paths.codex_model_catalog,
+            native.paths.path_for(LogicalTarget::CodexModelCatalog),
             vec![b'x'; cc_switch_core::MAX_OPERATION_CONTENT_BYTES + 1],
         )
         .unwrap();
@@ -851,11 +997,26 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.codex_config.parent().unwrap()).unwrap();
-        std::fs::write(&native.paths.codex_config, "model = \"gpt-5\"\n").unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::CodexConfig)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            native.paths.path_for(LogicalTarget::CodexConfig),
+            "model = \"gpt-5\"\n",
+        )
+        .unwrap();
         let unrelated = directory.path().join("unrelated.json");
         std::fs::write(&unrelated, "{}").unwrap();
-        symlink(&unrelated, &native.paths.codex_model_catalog).unwrap();
+        symlink(
+            &unrelated,
+            native.paths.path_for(LogicalTarget::CodexModelCatalog),
+        )
+        .unwrap();
 
         native
             .apply_plan(
@@ -902,14 +1063,21 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.codex_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::CodexConfig)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.codex_config,
+            native.paths.path_for(LogicalTarget::CodexConfig),
             "model = \"old\"\nmodel_catalog_json = \"cc-switch-model-catalog.json\"\n",
         )
         .unwrap();
         std::fs::write(
-            &native.paths.codex_model_catalog,
+            native.paths.path_for(LogicalTarget::CodexModelCatalog),
             "{\"models\":[{\"model\":\"old\"}]}\n",
         )
         .unwrap();
@@ -934,7 +1102,10 @@ mod tests {
         OperationExecutor::new(&native.paths)
             .execute(&plan)
             .expect("execute Codex plan");
-        assert!(!native.paths.codex_model_catalog.exists());
+        assert!(!native
+            .paths
+            .path_for(LogicalTarget::CodexModelCatalog)
+            .exists());
     }
 
     #[test]
@@ -945,9 +1116,16 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.codex_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::CodexConfig)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.codex_auth,
+            native.paths.path_for(LogicalTarget::CodexAuth),
             r#"{"auth_mode":"apikey","OPENAI_API_KEY":"old-third-party"}"#,
         )
         .unwrap();
@@ -975,9 +1153,16 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.hermes_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::HermesConfig)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.hermes_config,
+            native.paths.path_for(LogicalTarget::HermesConfig),
             "model:\n  provider: old\n  default: old-model\n  context_length: 32000\ncustom_providers: []\n",
         )
         .unwrap();
@@ -1008,9 +1193,16 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.hermes_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::HermesConfig)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.hermes_config,
+            native.paths.path_for(LogicalTarget::HermesConfig),
             "model:\n  provider: old\n  default: old-model\n  context_length: 32000\ncustom_providers:\n  - name: old\n    base_url: https://old.example.com\n    models:\n      old-model: {}\n  - name: keep\n    base_url: https://keep.example.com\n",
         )
         .unwrap();
@@ -1040,9 +1232,16 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.pi_models.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::PiModels)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.pi_models,
+            native.paths.path_for(LogicalTarget::PiModels),
             r#"{"providers":{"remove":{"models":[]}}}"#,
         )
         .unwrap();
@@ -1069,9 +1268,16 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.hermes_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::HermesConfig)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.hermes_config,
+            native.paths.path_for(LogicalTarget::HermesConfig),
             "providers:\n  anthropic:\n    base_url: https://api.anthropic.com\n    models:\n      claude-opus: {}\n",
         )
         .unwrap();
@@ -1104,9 +1310,16 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.hermes_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::HermesConfig)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.hermes_config,
+            native.paths.path_for(LogicalTarget::HermesConfig),
             "custom_providers:\n  - name: shared\n    base_url: https://writable.example.com\n    models:\n      writable: {}\nproviders:\n  shadow:\n    name: shared\n    base_url: https://readonly.example.com\n    models:\n      readonly: {}\n",
         )
         .unwrap();
@@ -1243,9 +1456,16 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.claude_desktop_profile.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::ClaudeDesktopProfile)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.claude_desktop_profile,
+            native.paths.path_for(LogicalTarget::ClaudeDesktopProfile),
             r#"{
                 "inferenceGatewayBaseUrl": "https://example.com",
                 "inferenceGatewayApiKey": "secret",
@@ -1279,9 +1499,16 @@ mod tests {
             directory.path().join(".claude"),
             directory.path().join(".codex"),
         );
-        std::fs::create_dir_all(native.paths.hermes_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            native
+                .paths
+                .path_for(LogicalTarget::HermesConfig)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
-            &native.paths.hermes_config,
+            native.paths.path_for(LogicalTarget::HermesConfig),
             "custom_providers:\n  - name: old\ncustom_providers:\n  - name: new\n",
         )
         .unwrap();

@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::{
     live::ResolvedConfigDirs,
     operation::{read_optional, FileOperationHost, LivePaths, OperationError},
+    resource::resolve_config_root_resource,
 };
 
 const STATE_DIRECTORY: &str = ".cc-switch-skill-references";
@@ -111,10 +112,25 @@ impl SkillLiveConfig {
         };
         let app_roots = builtin_app_registry()
             .descriptors()
-            .filter(|descriptor| descriptor.skill_contract().is_some())
-            .map(|descriptor| {
+            .filter_map(|descriptor| {
+                descriptor
+                    .skill_contract()
+                    .map(|contract| (descriptor, contract))
+            })
+            .map(|(descriptor, contract)| {
                 let app = descriptor.app().clone();
-                let native_root = absolute_root(native_root(dirs, &app))?.join("skills");
+                let config_root = dirs
+                    .root(&app)
+                    .map_err(|error| SkillHostError::Runtime(error.to_string()))?;
+                let native_root =
+                    resolve_config_root_resource(config_root, contract.native_resource())
+                        .ok_or_else(|| {
+                            SkillHostError::Runtime(format!(
+                                "{} requires a host-defined Skill path",
+                                descriptor.id()
+                            ))
+                        })?;
+                let native_root = absolute_root(&native_root)?;
                 let state_root = native_root
                     .parent()
                     .expect("a native Skill root has a parent")
@@ -212,21 +228,6 @@ fn absolute_root(path: &Path) -> Result<PathBuf, SkillHostError> {
         path: path.to_owned(),
         source,
     })
-}
-
-fn native_root<'a>(dirs: &'a ResolvedConfigDirs, app: &AppType) -> &'a Path {
-    match app {
-        AppType::Claude => &dirs.claude,
-        AppType::Codex => &dirs.codex,
-        AppType::Gemini => &dirs.gemini,
-        AppType::GrokBuild => &dirs.grok,
-        AppType::OpenCode => &dirs.opencode,
-        AppType::Hermes => &dirs.hermes,
-        AppType::Pi => &dirs.pi,
-        AppType::ClaudeDesktop | AppType::OpenClaw => {
-            unreachable!("only applications with Skill contracts are collected")
-        }
-    }
 }
 
 fn create_real_directory(path: &Path, private: bool) -> Result<(), SkillHostError> {
