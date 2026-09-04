@@ -6,8 +6,8 @@ use std::{
 };
 
 use cc_switch_core::{
-    fs::shared_live_config_lock_path, AppType, InstalledSkillSnapshot, SkillCatalogEntry,
-    MAX_OPERATION_CONTENT_BYTES,
+    builtin_app_registry, fs::shared_live_config_lock_path, AppType, InstalledSkillSnapshot,
+    SkillCatalogEntry, MAX_OPERATION_CONTENT_BYTES,
 };
 use fs4::{FileExt, TryLockError};
 use serde::Deserialize;
@@ -91,6 +91,22 @@ struct SharedPathSettings {
     skill_storage_location: Option<String>,
 }
 
+impl SharedPathSettings {
+    fn config_dir(&self, app: &AppType) -> Option<&str> {
+        match app {
+            AppType::Claude => self.claude_config_dir.as_deref(),
+            AppType::Codex => self.codex_config_dir.as_deref(),
+            AppType::Gemini => self.gemini_config_dir.as_deref(),
+            AppType::GrokBuild => self.grok_config_dir.as_deref(),
+            AppType::OpenCode => self.opencode_config_dir.as_deref(),
+            AppType::OpenClaw => self.openclaw_config_dir.as_deref(),
+            AppType::Hermes => self.hermes_config_dir.as_deref(),
+            AppType::Pi => self.pi_config_dir.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ResolvedConfigDirs {
     roots: Vec<(AppType, PathBuf)>,
@@ -106,18 +122,20 @@ impl ResolvedConfigDirs {
 
     #[cfg(test)]
     pub(crate) fn for_tests(home: &Path, claude: PathBuf, codex: PathBuf) -> Self {
-        Self {
-            roots: vec![
-                (AppType::Claude, claude),
-                (AppType::Codex, codex),
-                (AppType::Gemini, home.join(".gemini")),
-                (AppType::GrokBuild, home.join(".grok")),
-                (AppType::OpenCode, home.join(".config/opencode")),
-                (AppType::OpenClaw, home.join(".openclaw")),
-                (AppType::Hermes, home.join(".hermes")),
-                (AppType::Pi, home.join(".pi/agent")),
-            ],
-        }
+        let roots = builtin_app_registry()
+            .descriptors()
+            .filter_map(|descriptor| {
+                let app = descriptor.app().clone();
+                let root = match &app {
+                    AppType::Claude => claude.clone(),
+                    AppType::Codex => codex.clone(),
+                    AppType::Hermes => home.join(".hermes"),
+                    _ => home.join(descriptor.config_root().home_relative_path()?),
+                };
+                Some((app, root))
+            })
+            .collect();
+        Self { roots }
     }
 }
 
@@ -380,93 +398,48 @@ fn resolve_config_dirs(
     home: &Path,
     settings: &SharedPathSettings,
 ) -> Result<ResolvedConfigDirs, LiveError> {
-    let claude_env = std::env::var_os("CLAUDE_CONFIG_DIR");
-    let codex_env = std::env::var_os("CODEX_HOME");
-    let hermes_env = std::env::var_os("HERMES_HOME");
-    let pi_env = std::env::var_os("PI_CODING_AGENT_DIR");
-    Ok(ResolvedConfigDirs {
-        roots: vec![
-            (
-                AppType::Claude,
-                configured_root(
+    let roots = builtin_app_registry()
+        .descriptors()
+        .filter_map(|descriptor| {
+            let app = descriptor.app().clone();
+            if app == AppType::Hermes {
+                let root = hermes_root(
                     home,
-                    settings.claude_config_dir.as_deref(),
-                    claude_env.as_deref(),
-                    &home.join(".claude"),
-                    "Claude config directory",
-                )?,
-            ),
-            (
-                AppType::Codex,
-                configured_root(
-                    home,
-                    settings.codex_config_dir.as_deref(),
-                    codex_env.as_deref(),
-                    &home.join(".codex"),
-                    "Codex config directory",
-                )?,
-            ),
-            (
-                AppType::Gemini,
-                configured_root(
-                    home,
-                    settings.gemini_config_dir.as_deref(),
-                    None,
-                    &home.join(".gemini"),
-                    "Gemini config directory",
-                )?,
-            ),
-            (
-                AppType::GrokBuild,
-                configured_root(
-                    home,
-                    settings.grok_config_dir.as_deref(),
-                    None,
-                    &home.join(".grok"),
-                    "Grok config directory",
-                )?,
-            ),
-            (
-                AppType::OpenCode,
-                configured_root(
-                    home,
-                    settings.opencode_config_dir.as_deref(),
-                    None,
-                    &home.join(".config/opencode"),
-                    "OpenCode config directory",
-                )?,
-            ),
-            (
-                AppType::OpenClaw,
-                configured_root(
-                    home,
-                    settings.openclaw_config_dir.as_deref(),
-                    None,
-                    &home.join(".openclaw"),
-                    "OpenClaw config directory",
-                )?,
-            ),
-            (
-                AppType::Hermes,
-                hermes_root(
-                    home,
-                    settings.hermes_config_dir.as_deref(),
-                    hermes_env.as_deref(),
+                    settings.config_dir(&app),
+                    std::env::var_os("HERMES_HOME").as_deref(),
                     &crate::native_live::default_hermes_dir(home),
-                ),
-            ),
-            (
-                AppType::Pi,
+                );
+                return Some(Ok((app, root)));
+            }
+            let relative = descriptor.config_root().home_relative_path()?;
+            let environment = config_root_environment(&app);
+            let label = if app == AppType::GrokBuild {
+                "Grok config directory".to_owned()
+            } else {
+                format!("{} config directory", descriptor.display_name())
+            };
+            Some(
                 configured_root(
                     home,
-                    settings.pi_config_dir.as_deref(),
-                    pi_env.as_deref(),
-                    &home.join(".pi/agent"),
-                    "Pi config directory",
-                )?,
-            ),
-        ],
-    })
+                    settings.config_dir(&app),
+                    environment.as_deref(),
+                    &home.join(relative),
+                    &label,
+                )
+                .map(|root| (app, root)),
+            )
+        })
+        .collect::<Result<Vec<_>, LiveError>>()?;
+    Ok(ResolvedConfigDirs { roots })
+}
+
+fn config_root_environment(app: &AppType) -> Option<std::ffi::OsString> {
+    match app {
+        AppType::Claude => std::env::var_os("CLAUDE_CONFIG_DIR"),
+        AppType::Codex => std::env::var_os("CODEX_HOME"),
+        AppType::Pi => std::env::var_os("PI_CODING_AGENT_DIR"),
+        _ => None,
+    }
 }
 
 fn map_skill_lock_error(error: LiveError) -> SkillHostError {
@@ -677,7 +650,37 @@ fn config_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cc_switch_core::builtin_app_adapter;
     use serde_json::json;
+
+    #[test]
+    fn config_dirs_cover_every_core_root_resource() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let home = directory.path();
+        let dirs = ResolvedConfigDirs::for_tests(home, home.join(".claude"), home.join(".codex"));
+
+        for descriptor in builtin_app_registry().descriptors() {
+            let adapter = builtin_app_adapter(descriptor.app());
+            let needs_root = adapter
+                .targets()
+                .iter()
+                .any(|target| target.resource_path().config_root_relative().is_some())
+                || descriptor.skill_contract().is_some_and(|contract| {
+                    contract.native_resource().config_root_relative().is_some()
+                });
+            if needs_root {
+                assert!(dirs.root(descriptor.app()).is_ok(), "{}", descriptor.id());
+            }
+            if let Some(relative) = descriptor.config_root().home_relative_path() {
+                assert_eq!(
+                    dirs.root(descriptor.app()).unwrap(),
+                    home.join(relative),
+                    "{}",
+                    descriptor.id()
+                );
+            }
+        }
+    }
 
     #[test]
     fn config_roots_require_absolute_paths_and_allow_missing_directories() {
