@@ -1,17 +1,18 @@
-use std::{collections::HashSet, fmt, path::PathBuf};
+use std::{fmt, path::PathBuf};
 
 use cc_switch_core::{
     builtin_app_adapter, builtin_app_registry, mcp_servers_equivalent, validate_mcp_server,
     validate_mcp_server_for_app, AppCapability, AppType, McpConfigTarget, McpNativeSnapshot,
 };
 use cc_switch_store::{
-    begin_immediate_transaction, delete_mcp_server, insert_mcp_server, read_mcp_server_row,
-    read_mcp_server_rows, set_mcp_server_enabled, update_mcp_server,
+    begin_immediate_transaction, delete_mcp_native_links, delete_mcp_server,
+    ensure_mcp_native_link_schema, insert_mcp_server, read_mcp_native_link, read_mcp_server_row,
+    read_mcp_server_rows, set_mcp_server_enabled, update_mcp_server, upsert_mcp_native_link,
     McpServerRow as SharedMcpServerRow, McpServerValues, McpServerWriteOutcome, SharedDatabase,
     SharedStoreError,
 };
 use hmac::{Hmac, Mac};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
@@ -252,12 +253,12 @@ impl McpStore {
             }
         };
         let finalize = (|| -> Result<(), McpError> {
-            persist_native_links(&transaction, &changes)?;
             write_server(
                 &mut transaction,
                 current.as_ref().map(|stored| &stored.source_fingerprint),
                 &server,
             )?;
+            persist_native_links(&mut transaction, &changes)?;
             transaction.commit()?;
             Ok(())
         })();
@@ -296,7 +297,7 @@ impl McpStore {
             }
         };
         let finalize = (|| -> Result<(), McpError> {
-            persist_native_links(&transaction, &changes)?;
+            persist_native_links(&mut transaction, &changes)?;
             require_applied(set_mcp_server_enabled(
                 &mut transaction,
                 id,
@@ -332,7 +333,7 @@ impl McpStore {
             }
         };
         let finalize = (|| -> Result<(), McpError> {
-            transaction.execute("DELETE FROM mcp_native_links WHERE server_id = ?1", [id])?;
+            delete_mcp_native_links(&mut transaction, id)?;
             require_applied(delete_mcp_server(
                 &mut transaction,
                 id,
@@ -379,20 +380,9 @@ impl McpStore {
 
     fn initialize(&self) -> Result<(), McpError> {
         self.database.ensure_mcp_server_schema()?;
-        let connection = self.connect()?;
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS mcp_native_links (
-                server_id TEXT NOT NULL,
-                app_id TEXT NOT NULL,
-                native_snapshot TEXT,
-                PRIMARY KEY (server_id, app_id)
-            );
-            DELETE FROM mcp_native_links
-             WHERE NOT EXISTS (
-                SELECT 1 FROM mcp_servers WHERE mcp_servers.id = mcp_native_links.server_id
-             );",
-        )?;
-        verify_native_link_schema(&connection)
+        let mut connection = self.connect()?;
+        ensure_mcp_native_link_schema(&mut connection)?;
+        Ok(())
     }
 
     fn connect(&self) -> Result<Connection, McpError> {
@@ -475,7 +465,6 @@ fn merge_imports(
                 &import.id,
                 &app,
                 import.native_snapshot.as_ref(),
-                true,
             )?;
         }
     }
@@ -723,24 +712,20 @@ fn get_native_link(
     server_id: &str,
     app: &AppType,
 ) -> Result<Option<Option<McpNativeSnapshot>>, McpError> {
-    let raw = connection
-        .query_row(
-            "SELECT native_snapshot FROM mcp_native_links WHERE server_id = ?1 AND app_id = ?2",
-            params![server_id, app.as_str()],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?;
-    raw.map(|raw| {
-        raw.map(|raw| {
-            serde_json::from_str(&raw).map_err(|error| McpError::InvalidStore(error.to_string()))
+    read_mcp_native_link(connection, server_id, app.as_str())?
+        .map(|link| {
+            link.native_snapshot
+                .map(|raw| {
+                    serde_json::from_str(&raw)
+                        .map_err(|error| McpError::InvalidStore(error.to_string()))
+                })
+                .transpose()
         })
         .transpose()
-    })
-    .transpose()
 }
 
 fn persist_native_links(
-    connection: &Connection,
+    transaction: &mut rusqlite::Transaction<'_>,
     changes: &[McpLiveChange],
 ) -> Result<(), McpError> {
     for change in changes {
@@ -750,7 +735,7 @@ fn persist_native_links(
                 id,
                 link_state: McpNativeLinkState::Observed,
                 ..
-            } => upsert_native_link(connection, id, app, None, true)?,
+            } => upsert_native_link(transaction, id, app, None)?,
             McpLiveChange::Upsert { .. } => {}
             McpLiveChange::Disable {
                 app,
@@ -759,7 +744,7 @@ fn persist_native_links(
                 link_state,
                 ..
             } if *link_state != McpNativeLinkState::Unowned => {
-                upsert_native_link(connection, id, app, native_snapshot.as_ref(), true)?;
+                upsert_native_link(transaction, id, app, native_snapshot.as_ref())?;
             }
             McpLiveChange::Disable { .. } => {}
             McpLiveChange::Remove { .. } => {}
@@ -769,23 +754,16 @@ fn persist_native_links(
 }
 
 fn upsert_native_link(
-    connection: &Connection,
+    transaction: &mut rusqlite::Transaction<'_>,
     server_id: &str,
     app: &AppType,
     snapshot: Option<&McpNativeSnapshot>,
-    replace_snapshot: bool,
 ) -> Result<(), McpError> {
     let snapshot = snapshot
         .map(serde_json::to_string)
         .transpose()
         .map_err(|error| McpError::InvalidStore(error.to_string()))?;
-    connection.execute(
-        "INSERT INTO mcp_native_links (server_id, app_id, native_snapshot)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(server_id, app_id) DO UPDATE SET native_snapshot =
-           CASE WHEN ?4 THEN excluded.native_snapshot ELSE mcp_native_links.native_snapshot END",
-        params![server_id, app.as_str(), snapshot, replace_snapshot],
-    )?;
+    upsert_mcp_native_link(transaction, server_id, app.as_str(), snapshot.as_deref())?;
     Ok(())
 }
 
@@ -801,21 +779,6 @@ fn recover_on_failure<T>(
             )));
         }
         return Err(error);
-    }
-    Ok(())
-}
-
-fn verify_native_link_schema(connection: &Connection) -> Result<(), McpError> {
-    let mut statement = connection.prepare("PRAGMA table_info(mcp_native_links)")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<HashSet<_>, _>>()?;
-    for required in ["server_id", "app_id", "native_snapshot"] {
-        if !columns.contains(required) {
-            return Err(McpError::InvalidStore(format!(
-                "mcp_native_links is missing required column '{required}'"
-            )));
-        }
     }
     Ok(())
 }
@@ -865,6 +828,57 @@ mod tests {
         let mut expected = server();
         expected.revision = listed[0].revision;
         assert_eq!(listed, vec![expected]);
+    }
+
+    #[test]
+    fn first_ownership_migration_claims_legacy_enabled_rows() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cc-switch.db");
+        let database = SharedDatabase::open(path.clone()).unwrap();
+        database.ensure_mcp_server_schema().unwrap();
+        let mut connection = database.connect().unwrap();
+        let mut transaction = begin_immediate_transaction(&mut connection).unwrap();
+        write_server(&mut transaction, None, &server()).unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'mcp_native_links'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(connection);
+        drop(database);
+
+        let store = McpStore::open(path).unwrap();
+        let connection = store.connect().unwrap();
+        assert!(get_native_link(&connection, "context7", &AppType::Claude)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn existing_ownership_table_does_not_claim_unlinked_rows() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cc-switch.db");
+        let database = SharedDatabase::open(path.clone()).unwrap();
+        database.ensure_mcp_server_schema().unwrap();
+        let mut connection = database.connect().unwrap();
+        ensure_mcp_native_link_schema(&mut connection).unwrap();
+        let mut transaction = begin_immediate_transaction(&mut connection).unwrap();
+        write_server(&mut transaction, None, &server()).unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        drop(database);
+
+        let store = McpStore::open(path).unwrap();
+        let connection = store.connect().unwrap();
+        assert!(get_native_link(&connection, "context7", &AppType::Claude)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1184,11 +1198,12 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
         let mut connection = store.connect().unwrap();
-        let transaction = connection.transaction().unwrap();
+        let mut transaction = connection.transaction().unwrap();
         let mut previous = server();
         previous.apps = McpApps::default();
         let mut updated = previous.clone();
         updated.server = json!({"type":"stdio","command":"uvx"});
+        write_server(&mut transaction, None, &previous).unwrap();
 
         assert!(live_changes(&transaction, Some(&previous), Some(&updated))
             .unwrap()
@@ -1197,7 +1212,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        upsert_native_link(&transaction, &previous.id, &AppType::Claude, None, false).unwrap();
+        upsert_native_link(&mut transaction, &previous.id, &AppType::Claude, None).unwrap();
         assert!(live_changes(&transaction, Some(&previous), Some(&updated))
             .unwrap()
             .is_empty());
@@ -1205,7 +1220,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        upsert_native_link(&transaction, &previous.id, &AppType::OpenCode, None, false).unwrap();
+        upsert_native_link(&mut transaction, &previous.id, &AppType::OpenCode, None).unwrap();
         let removals = live_changes(&transaction, Some(&previous), None).unwrap();
         assert_eq!(removals.len(), 1);
         assert!(matches!(
@@ -1228,8 +1243,10 @@ mod tests {
             .upsert_with_live(record, |_| Ok::<_, ()>(()), |_| Ok(()))
             .unwrap()
             .unwrap();
-        let connection = Connection::open(&path).unwrap();
-        upsert_native_link(&connection, "context7", &AppType::Gemini, None, false).unwrap();
+        let mut connection = Connection::open(&path).unwrap();
+        let mut transaction = connection.transaction().unwrap();
+        upsert_native_link(&mut transaction, "context7", &AppType::Gemini, None).unwrap();
+        transaction.commit().unwrap();
         let current = store.list().unwrap().remove(0);
 
         store
@@ -1262,12 +1279,13 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
         let mut connection = store.connect().unwrap();
-        let transaction = connection.transaction().unwrap();
+        let mut transaction = connection.transaction().unwrap();
         let mut previous = server();
         previous.apps = McpApps::default();
         let mut updated = previous.clone();
         updated.server = json!({"type":"stdio","command":"uvx"});
-        upsert_native_link(&transaction, &previous.id, &AppType::OpenCode, None, false).unwrap();
+        write_server(&mut transaction, None, &previous).unwrap();
+        upsert_native_link(&mut transaction, &previous.id, &AppType::OpenCode, None).unwrap();
 
         let updates = live_changes(&transaction, Some(&previous), Some(&updated)).unwrap();
 
