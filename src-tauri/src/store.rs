@@ -9,11 +9,12 @@ use std::fs;
 
 use cc_switch_core::{builtin_app_adapter, AppType};
 use cc_switch_store::{
-    begin_immediate_transaction, delete_provider as delete_provider_row,
-    insert_provider as insert_provider_row, read_provider_row, read_provider_rows,
-    set_provider_current, update_provider_configuration, update_provider_details,
-    update_provider_metadata, ProviderInsert, ProviderRow as SharedProviderRow,
-    ProviderWriteOutcome, SharedDatabase, SharedStoreError,
+    begin_immediate_transaction,
+    delete_provider_with_host_cleanup_if_unchanged as delete_provider_row,
+    insert_provider_if_absent as insert_provider_row, read_provider_row, read_provider_rows,
+    set_provider_current_if_unchanged, update_provider_configuration_if_unchanged,
+    update_provider_details_if_unchanged, update_provider_metadata_if_unchanged, ProviderInsert,
+    ProviderRow as SharedProviderRow, ProviderWriteOutcome, SharedDatabase, SharedStoreError,
 };
 use hmac::{Hmac, Mac};
 use rusqlite::{params, types::ValueRef, Connection, OptionalExtension, Row, Transaction};
@@ -89,6 +90,7 @@ impl From<SharedStoreError> for StoreError {
 #[derive(Clone)]
 struct StoredProvider {
     record: ProviderRecord,
+    source_fingerprint: [u8; 32],
     is_current: bool,
     native_settings: Value,
     lite_writable: bool,
@@ -170,13 +172,27 @@ fn replace_exclusive_current(
         .into_iter()
         .filter(|provider| provider.is_current != 0)
     {
-        if set_provider_current(transaction, &provider.id, &provider.app_type, false)?
-            != ProviderWriteOutcome::Applied
+        if set_provider_current_if_unchanged(
+            transaction,
+            &provider.id,
+            &provider.app_type,
+            provider.source_fingerprint(),
+            false,
+        )? != ProviderWriteOutcome::Applied
         {
             return Err(StoreError::Conflict(id.to_owned()));
         }
     }
-    if set_provider_current(transaction, id, app.as_str(), true)? != ProviderWriteOutcome::Applied {
+    let target = read_provider_row(transaction, id, app.as_str())?
+        .ok_or_else(|| StoreError::Conflict(id.to_owned()))?;
+    if set_provider_current_if_unchanged(
+        transaction,
+        id,
+        app.as_str(),
+        target.source_fingerprint(),
+        true,
+    )? != ProviderWriteOutcome::Applied
+    {
         return Err(StoreError::Conflict(id.to_owned()));
     }
 
@@ -247,8 +263,15 @@ fn write_lite_metadata(
 ) -> Result<(), StoreError> {
     let raw = serde_json::to_string(metadata)
         .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
-    if update_provider_metadata(transaction, id, app.as_str(), &raw)?
-        != ProviderWriteOutcome::Applied
+    let current = read_provider_row(transaction, id, app.as_str())?
+        .ok_or_else(|| StoreError::Conflict(id.to_owned()))?;
+    if update_provider_metadata_if_unchanged(
+        transaction,
+        id,
+        app.as_str(),
+        current.source_fingerprint(),
+        &raw,
+    )? != ProviderWriteOutcome::Applied
     {
         return Err(StoreError::Conflict(id.to_owned()));
     }
@@ -574,10 +597,11 @@ impl ProviderStore {
         let name = validate_name(name).map_err(StoreError::InvalidProvider)?;
         let settings_config = serde_json::to_string(&settings)
             .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
-        if update_provider_configuration(
+        if update_provider_configuration_if_unchanged(
             &mut transaction,
             id,
             app.as_str(),
+            &current.source_fingerprint,
             &name,
             &settings_config,
         )? != ProviderWriteOutcome::Applied
@@ -598,12 +622,19 @@ impl ProviderStore {
                 write_lite_metadata(&mut transaction, &app, id, &metadata)?;
             }
         }
-        if current.is_current
-            && !app.is_additive_mode()
-            && set_provider_current(&mut transaction, id, app.as_str(), false)?
-                != ProviderWriteOutcome::Applied
-        {
-            return Err(StoreError::Conflict(id.to_owned()));
+        if current.is_current && !app.is_additive_mode() {
+            let refreshed = read_provider_row(&transaction, id, app.as_str())?
+                .ok_or_else(|| StoreError::Conflict(id.to_owned()))?;
+            if set_provider_current_if_unchanged(
+                &mut transaction,
+                id,
+                app.as_str(),
+                refreshed.source_fingerprint(),
+                false,
+            )? != ProviderWriteOutcome::Applied
+            {
+                return Err(StoreError::Conflict(id.to_owned()));
+            }
         }
         if migrate_builtin_binding {
             let changed = transaction.execute(
@@ -736,10 +767,12 @@ impl ProviderStore {
                 let category = category.or(current.record.category);
                 let metadata = serde_json::to_string(&Value::Object(merged_metadata.clone()))
                     .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
-                if update_provider_details(
+                let expected_fingerprint = current.source_fingerprint;
+                if update_provider_details_if_unchanged(
                     &mut transaction,
                     &id,
                     app.as_str(),
+                    &expected_fingerprint,
                     next_name,
                     &settings_config,
                     category.as_deref(),
@@ -956,10 +989,11 @@ impl ProviderStore {
         let name = validate_name(&update.name).map_err(StoreError::InvalidProvider)?;
         let settings_config = serde_json::to_string(&settings)
             .map_err(|error| StoreError::InvalidProvider(error.to_string()))?;
-        if update_provider_configuration(
+        if update_provider_configuration_if_unchanged(
             &mut transaction,
             id,
             &current.record.app_id,
+            &current.source_fingerprint,
             &name,
             &settings_config,
         )? != ProviderWriteOutcome::Applied
@@ -1010,13 +1044,12 @@ impl ProviderStore {
         if current.is_current && !app.is_additive_mode() {
             return Err(StoreError::CurrentProvider(id.to_owned()));
         }
-        transaction.execute(
-            &format!(
-                "DELETE FROM {ADAPTER_BINDINGS_TABLE} WHERE provider_id = ?1 AND app_type = ?2"
-            ),
-            params![id, app.as_str()],
-        )?;
-        if delete_provider_row(&mut transaction, id, app.as_str())? != ProviderWriteOutcome::Applied
+        if delete_provider_row(
+            &mut transaction,
+            id,
+            app.as_str(),
+            &current.source_fingerprint,
+        )? != ProviderWriteOutcome::Applied
         {
             return Err(StoreError::Conflict(id.to_owned()));
         }
@@ -1059,14 +1092,12 @@ impl ProviderStore {
             }
         };
         let finalize = (|| -> Result<(), StoreError> {
-            transaction.execute(
-                &format!(
-                    "DELETE FROM {ADAPTER_BINDINGS_TABLE} WHERE provider_id = ?1 AND app_type = ?2"
-                ),
-                params![id, app.as_str()],
-            )?;
-            if delete_provider_row(&mut transaction, id, app.as_str())?
-                != ProviderWriteOutcome::Applied
+            if delete_provider_row(
+                &mut transaction,
+                id,
+                app.as_str(),
+                &current.source_fingerprint,
+            )? != ProviderWriteOutcome::Applied
             {
                 return Err(StoreError::Conflict(id.to_owned()));
             }
@@ -1286,6 +1317,7 @@ impl ProviderStore {
         connection: &Connection,
         provider: SharedProviderRow,
     ) -> Result<StoredProvider, StoreError> {
+        let source_fingerprint = *provider.source_fingerprint();
         let app = parse_app(&provider.app_type)?;
         let binding = self.stored_adapter_binding(connection, &provider.id, &provider.app_type)?;
         let revision = snapshot_revision(
@@ -1412,6 +1444,7 @@ impl ProviderStore {
         );
         Ok(StoredProvider {
             record,
+            source_fingerprint,
             is_current: is_current != 0,
             native_settings,
             lite_writable,
@@ -3322,32 +3355,6 @@ requires_openai_auth = true
 
         let refreshed = store.list("codex").unwrap().pop().unwrap();
         connection
-            .execute_batch(
-                "CREATE TABLE provider_endpoints (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    provider_id TEXT NOT NULL,
-                    app_type TEXT NOT NULL,
-                    url TEXT NOT NULL,
-                    added_at INTEGER,
-                    FOREIGN KEY (provider_id, app_type)
-                        REFERENCES providers(id, app_type) ON DELETE CASCADE
-                );",
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO provider_endpoints (provider_id, app_type, url, added_at)
-                 VALUES (?1, 'codex', 'https://example.com', 1)",
-                [&created.id],
-            )
-            .unwrap();
-        assert!(matches!(
-            store.delete("codex", &created.id, refreshed.revision),
-            Err(StoreError::Conflict(_))
-        ));
-
-        let refreshed = store.list("codex").unwrap().pop().unwrap();
-        connection
             .execute(
                 "ALTER TABLE providers ADD COLUMN future_full_field TEXT NOT NULL DEFAULT ''",
                 [],
@@ -3364,6 +3371,89 @@ requires_openai_auth = true
             store.delete("codex", &created.id, refreshed.revision),
             Err(StoreError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn provider_delete_allows_host_cleanup_without_catalog_rewrites() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cc-switch.db");
+        let store = ProviderStore::open(path.clone()).unwrap();
+        let deleted = create_native(&store, &AppType::Codex, "Deleted");
+        let preserved = create_native(&store, &AppType::Codex, "Preserved");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE host_provider_bindings (
+                    provider_id TEXT NOT NULL,
+                    app_type TEXT NOT NULL,
+                    value TEXT NOT NULL
+                 );
+                 CREATE TRIGGER delete_host_provider_binding
+                 AFTER DELETE ON providers
+                 BEGIN
+                     DELETE FROM host_provider_bindings
+                     WHERE provider_id = OLD.id AND app_type = OLD.app_type;
+                 END;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO host_provider_bindings VALUES (?1, 'codex', 'keep')",
+                [&deleted.id],
+            )
+            .unwrap();
+
+        store
+            .delete("codex", &deleted.id, deleted.revision)
+            .unwrap();
+
+        assert_eq!(store.list("codex").unwrap()[0].id, preserved.id);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM host_provider_bindings", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn provider_delete_rejects_host_cleanup_that_rewrites_catalog() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cc-switch.db");
+        let store = ProviderStore::open(path.clone()).unwrap();
+        let deleted = create_native(&store, &AppType::Codex, "Deleted");
+        let preserved = create_native(&store, &AppType::Codex, "Preserved");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER rewrite_other_provider
+                 AFTER DELETE ON providers
+                 WHEN OLD.id = '{}'
+                 BEGIN
+                     UPDATE providers SET name = 'Rewritten'
+                     WHERE id = '{}' AND app_type = 'codex';
+                 END;",
+                deleted.id, preserved.id
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            store.delete("codex", &deleted.id, deleted.revision),
+            Err(StoreError::Conflict(_))
+        ));
+        let providers = store.list("codex").unwrap();
+        assert_eq!(providers.len(), 2);
+        assert!(providers.iter().any(|provider| provider.id == deleted.id));
+        assert_eq!(
+            providers
+                .iter()
+                .find(|provider| provider.id == preserved.id)
+                .unwrap()
+                .name,
+            "Preserved"
+        );
     }
 
     #[test]
