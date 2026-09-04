@@ -1,17 +1,15 @@
-use std::{collections::HashSet, fmt, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use cc_switch_core::{
-    builtin_app_adapter, builtin_app_registry, mcp_servers_equivalent, validate_mcp_server,
-    validate_mcp_server_for_app, AppCapability, AppType, McpConfigTarget, McpNativeSnapshot,
+    builtin_app_registry, mcp_servers_equivalent, validate_mcp_server, validate_mcp_server_for_app,
+    AppType, McpCatalogColumn, McpNativeSnapshot,
 };
 use cc_switch_store::{
-    begin_immediate_transaction, delete_mcp_server, insert_mcp_server, read_mcp_server_row,
-    read_mcp_server_rows, set_mcp_server_enabled, update_mcp_server,
-    McpServerRow as SharedMcpServerRow, McpServerValues, McpServerWriteOutcome, SharedDatabase,
-    SharedStoreError,
+    ensure_mcp_native_link_schema, read_mcp_server_rows, McpServerCatalogValues, McpServerFields,
+    McpServerRow as SharedMcpServerRow, McpTransactionGuard, SharedDatabase, SharedStoreError,
 };
 use hmac::{Hmac, Mac};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
@@ -56,52 +54,57 @@ impl From<SharedStoreError> for McpError {
         match error {
             SharedStoreError::Database(error) => Self::Database(error),
             SharedStoreError::InvalidDatabase(message) => Self::InvalidStore(message),
+            SharedStoreError::McpTransactionConflict => Self::Conflict,
             other => Self::SharedStore(other),
         }
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpApps {
-    #[serde(default)]
-    pub claude: bool,
-    #[serde(default)]
-    pub codex: bool,
-    #[serde(default)]
-    pub gemini: bool,
-    #[serde(default)]
-    pub grokbuild: bool,
-    #[serde(default)]
-    pub opencode: bool,
-    #[serde(default)]
-    pub hermes: bool,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct McpApps(BTreeMap<String, bool>);
+
+impl Default for McpApps {
+    fn default() -> Self {
+        Self(
+            builtin_app_registry()
+                .descriptors()
+                .filter(|descriptor| descriptor.mcp_contract().is_some())
+                .map(|descriptor| (descriptor.id().to_owned(), false))
+                .collect(),
+        )
+    }
 }
 
 impl McpApps {
-    fn enabled(&self, app: &AppType) -> bool {
-        match app {
-            AppType::Claude => self.claude,
-            AppType::Codex => self.codex,
-            AppType::Gemini => self.gemini,
-            AppType::GrokBuild => self.grokbuild,
-            AppType::OpenCode => self.opencode,
-            AppType::Hermes => self.hermes,
-            AppType::ClaudeDesktop | AppType::OpenClaw | AppType::Pi => false,
-        }
+    pub(crate) fn enabled(&self, app: &AppType) -> bool {
+        self.0.get(app.as_str()).copied().unwrap_or(false)
     }
 
     fn set(&mut self, app: &AppType, enabled: bool) -> Result<(), McpError> {
-        match app {
-            AppType::Claude => self.claude = enabled,
-            AppType::Codex => self.codex = enabled,
-            AppType::Gemini => self.gemini = enabled,
-            AppType::GrokBuild => self.grokbuild = enabled,
-            AppType::OpenCode => self.opencode = enabled,
-            AppType::Hermes => self.hermes = enabled,
-            AppType::ClaudeDesktop | AppType::OpenClaw | AppType::Pi => {
+        require_mcp_app(app)?;
+        self.0.insert(app.as_str().to_owned(), enabled);
+        Ok(())
+    }
+
+    fn from_row(row: &SharedMcpServerRow) -> Self {
+        let mut apps = Self::default();
+        for descriptor in builtin_app_registry().descriptors() {
+            if let Some(enabled) = row.enabled_for(descriptor.app()) {
+                apps.0.insert(descriptor.id().to_owned(), enabled);
+            }
+        }
+        apps
+    }
+
+    fn validate(&self) -> Result<(), McpError> {
+        for id in self.0.keys() {
+            let descriptor = builtin_app_registry()
+                .find(id)
+                .filter(|descriptor| descriptor.id() == id && descriptor.mcp_contract().is_some());
+            if descriptor.is_none() {
                 return Err(McpError::InvalidServer(format!(
-                    "application '{}' does not support MCP",
-                    app.as_str()
+                    "application '{id}' does not support MCP"
                 )));
             }
         }
@@ -239,11 +242,11 @@ impl McpStore {
     ) -> Result<Result<(), E>, McpError> {
         validate_server(&server)?;
         let mut connection = self.connect()?;
-        let mut transaction = begin_immediate_transaction(&mut connection)?;
-        let current = get_server(&transaction, &server.id, &self.revision_key)?;
+        let mut transaction = McpTransactionGuard::begin(&mut connection)?;
+        let current = get_server(&mut transaction, &server.id, &self.revision_key)?;
         let current_server = current.as_ref().map(|stored| &stored.server);
         ensure_expected_revision(current_server, server.revision)?;
-        let mut changes = live_changes(&transaction, current_server, Some(&server))?;
+        let mut changes = live_changes(&mut transaction, current_server, Some(&server))?;
         let receipt = match apply(&mut changes) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -252,12 +255,12 @@ impl McpStore {
             }
         };
         let finalize = (|| -> Result<(), McpError> {
-            persist_native_links(&transaction, &changes)?;
             write_server(
                 &mut transaction,
                 current.as_ref().map(|stored| &stored.source_fingerprint),
                 &server,
             )?;
+            persist_native_links(&mut transaction, &changes)?;
             transaction.commit()?;
             Ok(())
         })();
@@ -276,8 +279,8 @@ impl McpStore {
     ) -> Result<Result<(), E>, McpError> {
         let target = require_mcp_app(&app)?;
         let mut connection = self.connect()?;
-        let mut transaction = begin_immediate_transaction(&mut connection)?;
-        let current = get_server(&transaction, id, &self.revision_key)?
+        let mut transaction = McpTransactionGuard::begin(&mut connection)?;
+        let current = get_server(&mut transaction, id, &self.revision_key)?
             .ok_or_else(|| McpError::NotFound(id.into()))?;
         ensure_expected_revision(Some(&current.server), expected_revision)?;
         if current.server.apps.enabled(&app) == enabled {
@@ -287,7 +290,7 @@ impl McpStore {
         let mut updated = current.server.clone();
         updated.apps.set(&app, enabled)?;
         validate_server(&updated)?;
-        let mut changes = live_changes(&transaction, Some(&current.server), Some(&updated))?;
+        let mut changes = live_changes(&mut transaction, Some(&current.server), Some(&updated))?;
         let receipt = match apply(&mut changes) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -296,14 +299,8 @@ impl McpStore {
             }
         };
         let finalize = (|| -> Result<(), McpError> {
-            persist_native_links(&transaction, &changes)?;
-            require_applied(set_mcp_server_enabled(
-                &mut transaction,
-                id,
-                &current.source_fingerprint,
-                target,
-                enabled,
-            )?)?;
+            persist_native_links(&mut transaction, &changes)?;
+            transaction.set_server_selection(id, &current.source_fingerprint, target, enabled)?;
             transaction.commit()?;
             Ok(())
         })();
@@ -319,11 +316,11 @@ impl McpStore {
         rollback: impl FnOnce(T) -> Result<(), String>,
     ) -> Result<Result<(), E>, McpError> {
         let mut connection = self.connect()?;
-        let mut transaction = begin_immediate_transaction(&mut connection)?;
-        let current = get_server(&transaction, id, &self.revision_key)?
+        let mut transaction = McpTransactionGuard::begin(&mut connection)?;
+        let current = get_server(&mut transaction, id, &self.revision_key)?
             .ok_or_else(|| McpError::NotFound(id.into()))?;
         ensure_expected_revision(Some(&current.server), expected_revision)?;
-        let mut changes = live_changes(&transaction, Some(&current.server), None)?;
+        let mut changes = live_changes(&mut transaction, Some(&current.server), None)?;
         let receipt = match apply(&mut changes) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -332,12 +329,7 @@ impl McpStore {
             }
         };
         let finalize = (|| -> Result<(), McpError> {
-            transaction.execute("DELETE FROM mcp_native_links WHERE server_id = ?1", [id])?;
-            require_applied(delete_mcp_server(
-                &mut transaction,
-                id,
-                &current.source_fingerprint,
-            )?)?;
+            transaction.delete_server(id, &current.source_fingerprint)?;
             transaction.commit()?;
             Ok(())
         })();
@@ -351,7 +343,7 @@ impl McpStore {
         verify_live_snapshot: impl FnOnce(&T) -> bool,
     ) -> Result<Result<McpImportReport, E>, McpError> {
         let mut connection = self.connect()?;
-        let mut transaction = begin_immediate_transaction(&mut connection)?;
+        let mut transaction = McpTransactionGuard::begin(&mut connection)?;
         let (imports, observation) = match observe() {
             Ok(observed) => observed,
             Err(error) => {
@@ -379,20 +371,9 @@ impl McpStore {
 
     fn initialize(&self) -> Result<(), McpError> {
         self.database.ensure_mcp_server_schema()?;
-        let connection = self.connect()?;
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS mcp_native_links (
-                server_id TEXT NOT NULL,
-                app_id TEXT NOT NULL,
-                native_snapshot TEXT,
-                PRIMARY KEY (server_id, app_id)
-            );
-            DELETE FROM mcp_native_links
-             WHERE NOT EXISTS (
-                SELECT 1 FROM mcp_servers WHERE mcp_servers.id = mcp_native_links.server_id
-             );",
-        )?;
-        verify_native_link_schema(&connection)
+        let mut connection = self.connect()?;
+        ensure_mcp_native_link_schema(&mut connection)?;
+        Ok(())
     }
 
     fn connect(&self) -> Result<Connection, McpError> {
@@ -401,7 +382,7 @@ impl McpStore {
 }
 
 fn merge_imports(
-    transaction: &mut rusqlite::Transaction<'_>,
+    transaction: &mut McpTransactionGuard<'_>,
     imports: McpImportsByApp,
     revision_key: &[u8; 16],
 ) -> Result<McpImportReport, McpError> {
@@ -418,7 +399,7 @@ fn merge_imports(
             }
         };
         for import in imports {
-            if let Some(mut current) = get_server(transaction, &import.id, revision_key)? {
+            if let Some(current) = get_server(transaction, &import.id, revision_key)? {
                 if !mcp_servers_equivalent(&app, &current.server.server, &import.server) {
                     report.failed_apps.push(format!(
                         "{}: server '{}' conflicts with the shared catalog",
@@ -437,21 +418,26 @@ fn merge_imports(
                         continue;
                     }
                 }
-                if current.server.apps.enabled(&app) != import.enabled {
-                    current.server.apps.set(&app, import.enabled)?;
-                    require_applied(set_mcp_server_enabled(
-                        transaction,
+                let selection_changed = current.server.apps.enabled(&app) != import.enabled;
+                if selection_changed {
+                    transaction.set_server_selection(
                         &import.id,
                         &current.source_fingerprint,
                         target,
                         import.enabled,
-                    )?)?;
+                    )?;
                     if import.enabled {
                         report.enabled_apps += 1;
                     } else {
                         report.disabled_apps += 1;
                     }
                 }
+                upsert_native_link(
+                    transaction,
+                    &import.id,
+                    &app,
+                    import.native_snapshot.as_ref(),
+                )?;
             } else {
                 let mut apps = McpApps::default();
                 apps.set(&app, import.enabled)?;
@@ -468,15 +454,14 @@ fn merge_imports(
                 };
                 validate_server(&server)?;
                 write_server(transaction, None, &server)?;
+                upsert_native_link(
+                    transaction,
+                    &import.id,
+                    &app,
+                    import.native_snapshot.as_ref(),
+                )?;
                 report.new_servers += 1;
             }
-            upsert_native_link(
-                transaction,
-                &import.id,
-                &app,
-                import.native_snapshot.as_ref(),
-                true,
-            )?;
         }
     }
     Ok(report)
@@ -490,6 +475,7 @@ fn row_to_server(row: SharedMcpServerRow, revision_key: &[u8; 16]) -> Result<Mcp
         rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
     })?;
     let revision = server_revision(row.source_fingerprint(), revision_key);
+    let apps = McpApps::from_row(&row);
     Ok(McpServer {
         id: row.id,
         name: row.name,
@@ -499,23 +485,17 @@ fn row_to_server(row: SharedMcpServerRow, revision_key: &[u8; 16]) -> Result<Mcp
         docs: row.docs,
         tags,
         revision,
-        apps: McpApps {
-            claude: row.enabled_claude != 0,
-            codex: row.enabled_codex != 0,
-            gemini: row.enabled_gemini != 0,
-            grokbuild: row.enabled_grokbuild != 0,
-            opencode: row.enabled_opencode != 0,
-            hermes: row.enabled_hermes != 0,
-        },
+        apps,
     })
 }
 
 fn get_server(
-    connection: &Connection,
+    transaction: &mut McpTransactionGuard<'_>,
     id: &str,
     revision_key: &[u8; 16],
 ) -> Result<Option<StoredMcpServer>, McpError> {
-    read_mcp_server_row(connection, id)?
+    transaction
+        .read_server(id)?
         .map(|row| {
             let source_fingerprint = *row.source_fingerprint();
             row_to_server(row, revision_key).map(|server| StoredMcpServer {
@@ -546,7 +526,7 @@ fn server_revision(source_fingerprint: &[u8; 32], key: &[u8; 16]) -> u64 {
 }
 
 fn write_server(
-    transaction: &mut rusqlite::Transaction<'_>,
+    transaction: &mut McpTransactionGuard<'_>,
     expected_fingerprint: Option<&[u8; 32]>,
     server: &McpServer,
 ) -> Result<(), McpError> {
@@ -554,38 +534,29 @@ fn write_server(
         .map_err(|error| McpError::InvalidServer(error.to_string()))?;
     let tags = serde_json::to_string(&server.tags)
         .map_err(|error| McpError::InvalidServer(error.to_string()))?;
-    let values = McpServerValues {
-        id: &server.id,
-        name: &server.name,
-        server_config: &server_config,
-        description: server.description.as_deref(),
-        homepage: server.homepage.as_deref(),
-        docs: server.docs.as_deref(),
-        tags: &tags,
-        enabled_claude: server.apps.claude,
-        enabled_codex: server.apps.codex,
-        enabled_gemini: server.apps.gemini,
-        enabled_grokbuild: server.apps.grokbuild,
-        enabled_opencode: server.apps.opencode,
-        enabled_hermes: server.apps.hermes,
-    };
-    let outcome = match expected_fingerprint {
-        Some(expected) => update_mcp_server(transaction, expected, &values)?,
-        None => insert_mcp_server(transaction, &values)?,
-    };
-    require_applied(outcome)
-}
-
-fn require_applied(outcome: McpServerWriteOutcome) -> Result<(), McpError> {
-    match outcome {
-        McpServerWriteOutcome::Applied => Ok(()),
-        McpServerWriteOutcome::NotApplied => Err(McpError::Conflict),
+    let values = McpServerCatalogValues::new(
+        McpServerFields {
+            id: &server.id,
+            name: &server.name,
+            server_config: &server_config,
+            description: server.description.as_deref(),
+            homepage: server.homepage.as_deref(),
+            docs: server.docs.as_deref(),
+            tags: &tags,
+        },
+        |app| server.apps.enabled(app),
+    );
+    match expected_fingerprint {
+        Some(expected) => transaction.update_server_catalog(expected, &values)?,
+        None => transaction.insert_server_catalog(&values)?,
     }
+    Ok(())
 }
 
 fn validate_server(server: &McpServer) -> Result<(), McpError> {
     validate_mcp_server(&server.id, &server.server)
         .map_err(|error| McpError::InvalidServer(error.to_string()))?;
+    server.apps.validate()?;
     if server.name.trim().is_empty() || server.name.len() > 128 {
         return Err(McpError::InvalidServer(
             "name must contain at most 128 bytes".to_owned(),
@@ -627,38 +598,31 @@ fn validate_app_activation(app: &AppType, id: &str, server: &Value) -> Result<()
         .map_err(|error| McpError::InvalidServer(error.to_string()))
 }
 
-fn require_mcp_app(app: &AppType) -> Result<McpConfigTarget, McpError> {
+fn require_mcp_app(app: &AppType) -> Result<McpCatalogColumn, McpError> {
     let descriptor = builtin_app_registry().for_app(app);
-    let adapter = builtin_app_adapter(app);
-    if !descriptor.supports(AppCapability::Mcp) {
-        return Err(McpError::InvalidServer(format!(
-            "application '{}' does not support MCP",
-            app.as_str()
-        )));
-    }
-    adapter.mcp_config_target().ok_or_else(|| {
-        McpError::InvalidServer(format!(
-            "application '{}' does not support MCP",
-            app.as_str()
-        ))
-    })
+    descriptor
+        .mcp_contract()
+        .map(|contract| contract.catalog_column())
+        .ok_or_else(|| {
+            McpError::InvalidServer(format!(
+                "application '{}' does not support MCP",
+                app.as_str()
+            ))
+        })
 }
 
 fn live_changes(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &mut McpTransactionGuard<'_>,
     before: Option<&McpServer>,
     after: Option<&McpServer>,
 ) -> Result<Vec<McpLiveChange>, McpError> {
     let mut changes = Vec::new();
-    for descriptor in builtin_app_registry()
-        .descriptors()
-        .filter(|descriptor| descriptor.supports(AppCapability::Mcp))
-    {
+    for descriptor in builtin_app_registry().descriptors() {
+        let Some(contract) = descriptor.mcp_contract() else {
+            continue;
+        };
         let app = descriptor.app().clone();
-        let preserves_disabled_entry = descriptor
-            .mcp_contract()
-            .expect("MCP capability has a native contract")
-            .preserves_disabled_entry();
+        let preserves_disabled_entry = contract.preserves_disabled_entry();
         let id = after
             .or(before)
             .expect("a live change has a server")
@@ -719,28 +683,42 @@ fn live_changes(
 }
 
 fn get_native_link(
-    connection: &Connection,
+    transaction: &mut McpTransactionGuard<'_>,
     server_id: &str,
     app: &AppType,
 ) -> Result<Option<Option<McpNativeSnapshot>>, McpError> {
-    let raw = connection
-        .query_row(
-            "SELECT native_snapshot FROM mcp_native_links WHERE server_id = ?1 AND app_id = ?2",
-            params![server_id, app.as_str()],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?;
-    raw.map(|raw| {
-        raw.map(|raw| {
-            serde_json::from_str(&raw).map_err(|error| McpError::InvalidStore(error.to_string()))
-        })
-        .transpose()
+    decode_native_link(transaction.read_native_link(server_id, app.as_str())?)
+}
+
+fn decode_native_link(
+    link: Option<cc_switch_store::McpNativeLinkRow>,
+) -> Result<Option<Option<McpNativeSnapshot>>, McpError> {
+    link.map(|link| {
+        link.native_snapshot
+            .map(|raw| {
+                serde_json::from_str(&raw)
+                    .map_err(|error| McpError::InvalidStore(error.to_string()))
+            })
+            .transpose()
     })
     .transpose()
 }
 
-fn persist_native_links(
+#[cfg(test)]
+fn read_native_link_for_test(
     connection: &Connection,
+    server_id: &str,
+    app: &AppType,
+) -> Result<Option<Option<McpNativeSnapshot>>, McpError> {
+    decode_native_link(cc_switch_store::read_mcp_native_link(
+        connection,
+        server_id,
+        app.as_str(),
+    )?)
+}
+
+fn persist_native_links(
+    transaction: &mut McpTransactionGuard<'_>,
     changes: &[McpLiveChange],
 ) -> Result<(), McpError> {
     for change in changes {
@@ -750,7 +728,7 @@ fn persist_native_links(
                 id,
                 link_state: McpNativeLinkState::Observed,
                 ..
-            } => upsert_native_link(connection, id, app, None, true)?,
+            } => upsert_native_link(transaction, id, app, None)?,
             McpLiveChange::Upsert { .. } => {}
             McpLiveChange::Disable {
                 app,
@@ -759,7 +737,7 @@ fn persist_native_links(
                 link_state,
                 ..
             } if *link_state != McpNativeLinkState::Unowned => {
-                upsert_native_link(connection, id, app, native_snapshot.as_ref(), true)?;
+                upsert_native_link(transaction, id, app, native_snapshot.as_ref())?;
             }
             McpLiveChange::Disable { .. } => {}
             McpLiveChange::Remove { .. } => {}
@@ -769,23 +747,16 @@ fn persist_native_links(
 }
 
 fn upsert_native_link(
-    connection: &Connection,
+    transaction: &mut McpTransactionGuard<'_>,
     server_id: &str,
     app: &AppType,
     snapshot: Option<&McpNativeSnapshot>,
-    replace_snapshot: bool,
 ) -> Result<(), McpError> {
     let snapshot = snapshot
         .map(serde_json::to_string)
         .transpose()
         .map_err(|error| McpError::InvalidStore(error.to_string()))?;
-    connection.execute(
-        "INSERT INTO mcp_native_links (server_id, app_id, native_snapshot)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(server_id, app_id) DO UPDATE SET native_snapshot =
-           CASE WHEN ?4 THEN excluded.native_snapshot ELSE mcp_native_links.native_snapshot END",
-        params![server_id, app.as_str(), snapshot, replace_snapshot],
-    )?;
+    transaction.upsert_native_link(server_id, app.as_str(), snapshot.as_deref())?;
     Ok(())
 }
 
@@ -805,36 +776,26 @@ fn recover_on_failure<T>(
     Ok(())
 }
 
-fn verify_native_link_schema(connection: &Connection) -> Result<(), McpError> {
-    let mut statement = connection.prepare("PRAGMA table_info(mcp_native_links)")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<HashSet<_>, _>>()?;
-    for required in ["server_id", "app_id", "native_snapshot"] {
-        if !columns.contains(required) {
-            return Err(McpError::InvalidStore(format!(
-                "mcp_native_links is missing required column '{required}'"
-            )));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::tempdir;
 
+    fn apps_enabled(apps: impl IntoIterator<Item = AppType>) -> McpApps {
+        let mut selections = McpApps::default();
+        for app in apps {
+            selections.set(&app, true).unwrap();
+        }
+        selections
+    }
+
     fn server() -> McpServer {
         McpServer {
             id: "context7".to_owned(),
             name: "Context7".to_owned(),
             server: json!({"type":"stdio","command":"npx","future":true}),
-            apps: McpApps {
-                claude: true,
-                ..Default::default()
-            },
+            apps: apps_enabled([AppType::Claude]),
             description: Some("Docs".to_owned()),
             homepage: None,
             docs: None,
@@ -865,6 +826,121 @@ mod tests {
         let mut expected = server();
         expected.revision = listed[0].revision;
         assert_eq!(listed, vec![expected]);
+    }
+
+    #[test]
+    fn shared_schema_and_ipc_apps_follow_the_core_registry() {
+        let directory = tempdir().unwrap();
+        let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let registry_apps = builtin_app_registry()
+            .descriptors()
+            .filter(|descriptor| descriptor.mcp_contract().is_some())
+            .map(|descriptor| descriptor.app().clone())
+            .collect::<Vec<_>>();
+        let mut record = server();
+        record.apps = apps_enabled(registry_apps.clone());
+
+        store
+            .upsert_with_live(record, |_| Ok::<_, ()>(()), |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        let current = store.list().unwrap().remove(0);
+        for app in &registry_apps {
+            assert!(current.apps.enabled(app));
+        }
+
+        let serialized = serde_json::to_value(current.apps).unwrap();
+        let keys = serialized
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = registry_apps
+            .iter()
+            .map(|app| app.as_str().to_owned())
+            .collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn save_rejects_non_mcp_app_selections() {
+        let directory = tempdir().unwrap();
+        let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let mut record = server();
+        record.apps.0.insert("pi".to_owned(), true);
+
+        let result = store.upsert_with_live(record, |_| Ok::<_, ()>(()), |_| Ok(()));
+
+        assert!(matches!(result, Err(McpError::InvalidServer(_))));
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn first_ownership_migration_claims_legacy_enabled_rows() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cc-switch.db");
+        let database = SharedDatabase::open(path.clone()).unwrap();
+        database.ensure_mcp_server_schema().unwrap();
+        let connection = database.connect().unwrap();
+        let record = server();
+        connection
+            .execute(
+                "INSERT INTO mcp_servers
+                    (id, name, server_config, description, tags, enabled_claude)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                rusqlite::params![
+                    record.id,
+                    record.name,
+                    serde_json::to_string(&record.server).unwrap(),
+                    record.description,
+                    serde_json::to_string(&record.tags).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'mcp_native_links'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(connection);
+        drop(database);
+
+        let store = McpStore::open(path).unwrap();
+        let connection = store.connect().unwrap();
+        assert!(
+            read_native_link_for_test(&connection, "context7", &AppType::Claude)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn existing_ownership_table_does_not_claim_unlinked_rows() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cc-switch.db");
+        let database = SharedDatabase::open(path.clone()).unwrap();
+        database.ensure_mcp_server_schema().unwrap();
+        let mut connection = database.connect().unwrap();
+        ensure_mcp_native_link_schema(&mut connection).unwrap();
+        let mut transaction = McpTransactionGuard::begin(&mut connection).unwrap();
+        write_server(&mut transaction, None, &server()).unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        drop(database);
+
+        let store = McpStore::open(path).unwrap();
+        let connection = store.connect().unwrap();
+        assert!(
+            read_native_link_for_test(&connection, "context7", &AppType::Claude)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -945,6 +1021,42 @@ mod tests {
     }
 
     #[test]
+    fn native_link_trigger_cannot_rewrite_a_new_catalog_row() {
+        let directory = tempdir().unwrap();
+        let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
+        store
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER rewrite_catalog_after_link
+                 AFTER INSERT ON mcp_native_links BEGIN
+                    UPDATE mcp_servers SET name = 'rewritten' WHERE id = NEW.server_id;
+                 END;",
+            )
+            .unwrap();
+        let rolled_back = std::cell::Cell::new(false);
+
+        let result = store.upsert_with_live(
+            server(),
+            |changes| {
+                let McpLiveChange::Upsert { link_state, .. } = &mut changes[0] else {
+                    panic!("expected upsert");
+                };
+                *link_state = McpNativeLinkState::Observed;
+                Ok::<_, ()>(())
+            },
+            |_| {
+                rolled_back.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(McpError::Conflict)));
+        assert!(rolled_back.get());
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
     fn external_database_edit_rejects_a_stale_whole_row_update() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("cc-switch.db");
@@ -975,7 +1087,7 @@ mod tests {
         assert!(!applied.get());
         let current = store.list().unwrap().remove(0);
         assert_eq!(current.name, "Context7");
-        assert!(current.apps.codex);
+        assert!(current.apps.enabled(&AppType::Codex));
     }
 
     #[test]
@@ -1052,7 +1164,12 @@ mod tests {
 
         assert!(matches!(result, Err(McpError::Conflict)));
         assert!(!applied.get());
-        assert!(!store.list().unwrap().remove(0).apps.codex);
+        assert!(!store
+            .list()
+            .unwrap()
+            .remove(0)
+            .apps
+            .enabled(&AppType::Codex));
     }
 
     #[test]
@@ -1088,8 +1205,8 @@ mod tests {
         assert_eq!(report.failed_apps.len(), 1);
         let current = store.list().unwrap().remove(0);
         assert_eq!(current.server["command"], "npx");
-        assert!(current.apps.claude);
-        assert!(!current.apps.codex);
+        assert!(current.apps.enabled(&AppType::Claude));
+        assert!(!current.apps.enabled(&AppType::Codex));
     }
 
     #[test]
@@ -1108,15 +1225,76 @@ mod tests {
             )]
         };
         import_observed(&store, import(false), true).unwrap();
-        assert!(!store.list().unwrap().remove(0).apps.opencode);
-        let connection = store.connect().unwrap();
-        assert!(get_native_link(&connection, "local", &AppType::OpenCode)
+        assert!(!store
+            .list()
             .unwrap()
-            .is_some());
+            .remove(0)
+            .apps
+            .enabled(&AppType::OpenCode));
+        let connection = store.connect().unwrap();
+        assert!(
+            read_native_link_for_test(&connection, "local", &AppType::OpenCode)
+                .unwrap()
+                .is_some()
+        );
 
         let report = import_observed(&store, import(true), true).unwrap();
         assert_eq!(report.enabled_apps, 1);
-        assert!(store.list().unwrap().remove(0).apps.opencode);
+        assert!(store
+            .list()
+            .unwrap()
+            .remove(0)
+            .apps
+            .enabled(&AppType::OpenCode));
+    }
+
+    #[test]
+    fn native_link_trigger_cannot_rewrite_catalog_during_import() {
+        let directory = tempdir().unwrap();
+        let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
+        store
+            .upsert_with_live(server(), |_| Ok::<_, ()>(()), |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        store
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER rewrite_catalog_during_import
+                 AFTER INSERT ON mcp_native_links BEGIN
+                    UPDATE mcp_servers SET name = 'rewritten' WHERE id = NEW.server_id;
+                 END;",
+            )
+            .unwrap();
+        let imports = vec![(
+            AppType::Claude,
+            Ok(vec![cc_switch_core::McpImport {
+                id: "context7".to_owned(),
+                server: json!({"type":"stdio","command":"npx","future":true}),
+                enabled: true,
+                native_snapshot: None,
+            }]),
+        )];
+
+        let result = import_observed(&store, imports, true);
+
+        assert!(matches!(result, Err(McpError::Conflict)));
+        let connection = store.connect().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT name FROM mcp_servers WHERE id = 'context7'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "Context7"
+        );
+        assert!(
+            read_native_link_for_test(&connection, "context7", &AppType::Claude)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1148,34 +1326,37 @@ mod tests {
 
         assert_eq!(report.enabled_apps, 0);
         assert_eq!(report.failed_apps.len(), 1);
-        assert!(!store.list().unwrap().remove(0).apps.opencode);
-        assert!(
-            get_native_link(&store.connect().unwrap(), "context7", &AppType::OpenCode)
-                .unwrap()
-                .is_none()
-        );
+        assert!(!store
+            .list()
+            .unwrap()
+            .remove(0)
+            .apps
+            .enabled(&AppType::OpenCode));
+        assert!(read_native_link_for_test(
+            &store.connect().unwrap(),
+            "context7",
+            &AppType::OpenCode
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
-    fn core_capabilities_and_mcp_targets_stay_aligned() {
-        let targets = AppType::all()
-            .filter(|app| {
-                builtin_app_registry()
-                    .for_app(app)
-                    .supports(AppCapability::Mcp)
-            })
-            .map(|app| require_mcp_app(&app).unwrap())
-            .collect::<Vec<_>>();
+    fn core_registry_and_mcp_selections_stay_aligned() {
+        let mut columns = Vec::new();
+        for descriptor in builtin_app_registry().descriptors() {
+            match descriptor.mcp_contract() {
+                Some(contract) => {
+                    let column = require_mcp_app(descriptor.app()).unwrap();
+                    assert_eq!(column, contract.catalog_column());
+                    columns.push(column);
+                }
+                None => assert!(require_mcp_app(descriptor.app()).is_err()),
+            }
+        }
         assert_eq!(
-            targets,
-            [
-                McpConfigTarget::Claude,
-                McpConfigTarget::Codex,
-                McpConfigTarget::Gemini,
-                McpConfigTarget::GrokBuild,
-                McpConfigTarget::OpenCode,
-                McpConfigTarget::Hermes,
-            ]
+            columns,
+            cc_switch_core::mcp_catalog_columns().collect::<Vec<_>>()
         );
     }
 
@@ -1184,29 +1365,34 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
         let mut connection = store.connect().unwrap();
-        let transaction = connection.transaction().unwrap();
+        let mut transaction = McpTransactionGuard::begin(&mut connection).unwrap();
         let mut previous = server();
         previous.apps = McpApps::default();
         let mut updated = previous.clone();
         updated.server = json!({"type":"stdio","command":"uvx"});
+        write_server(&mut transaction, None, &previous).unwrap();
 
-        assert!(live_changes(&transaction, Some(&previous), Some(&updated))
-            .unwrap()
-            .is_empty());
-        assert!(live_changes(&transaction, Some(&previous), None)
-            .unwrap()
-            .is_empty());
-
-        upsert_native_link(&transaction, &previous.id, &AppType::Claude, None, false).unwrap();
-        assert!(live_changes(&transaction, Some(&previous), Some(&updated))
-            .unwrap()
-            .is_empty());
-        assert!(live_changes(&transaction, Some(&previous), None)
+        assert!(
+            live_changes(&mut transaction, Some(&previous), Some(&updated))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(live_changes(&mut transaction, Some(&previous), None)
             .unwrap()
             .is_empty());
 
-        upsert_native_link(&transaction, &previous.id, &AppType::OpenCode, None, false).unwrap();
-        let removals = live_changes(&transaction, Some(&previous), None).unwrap();
+        upsert_native_link(&mut transaction, &previous.id, &AppType::Claude, None).unwrap();
+        assert!(
+            live_changes(&mut transaction, Some(&previous), Some(&updated))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(live_changes(&mut transaction, Some(&previous), None)
+            .unwrap()
+            .is_empty());
+
+        upsert_native_link(&mut transaction, &previous.id, &AppType::OpenCode, None).unwrap();
+        let removals = live_changes(&mut transaction, Some(&previous), None).unwrap();
         assert_eq!(removals.len(), 1);
         assert!(matches!(
             &removals[0],
@@ -1228,8 +1414,10 @@ mod tests {
             .upsert_with_live(record, |_| Ok::<_, ()>(()), |_| Ok(()))
             .unwrap()
             .unwrap();
-        let connection = Connection::open(&path).unwrap();
-        upsert_native_link(&connection, "context7", &AppType::Gemini, None, false).unwrap();
+        let mut connection = Connection::open(&path).unwrap();
+        let mut transaction = McpTransactionGuard::begin(&mut connection).unwrap();
+        upsert_native_link(&mut transaction, "context7", &AppType::Gemini, None).unwrap();
+        transaction.commit().unwrap();
         let current = store.list().unwrap().remove(0);
 
         store
@@ -1262,14 +1450,15 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
         let mut connection = store.connect().unwrap();
-        let transaction = connection.transaction().unwrap();
+        let mut transaction = McpTransactionGuard::begin(&mut connection).unwrap();
         let mut previous = server();
         previous.apps = McpApps::default();
         let mut updated = previous.clone();
         updated.server = json!({"type":"stdio","command":"uvx"});
-        upsert_native_link(&transaction, &previous.id, &AppType::OpenCode, None, false).unwrap();
+        write_server(&mut transaction, None, &previous).unwrap();
+        upsert_native_link(&mut transaction, &previous.id, &AppType::OpenCode, None).unwrap();
 
-        let updates = live_changes(&transaction, Some(&previous), Some(&updated)).unwrap();
+        let updates = live_changes(&mut transaction, Some(&previous), Some(&updated)).unwrap();
 
         assert_eq!(updates.len(), 1);
         assert!(matches!(
@@ -1290,10 +1479,7 @@ mod tests {
         let path = directory.path().join("cc-switch.db");
         let store = McpStore::open(path.clone()).unwrap();
         let mut record = server();
-        record.apps = McpApps {
-            gemini: true,
-            ..Default::default()
-        };
+        record.apps = apps_enabled([AppType::Gemini]);
         store
             .upsert_with_live(record, |_| Ok::<_, ()>(()), |_| Ok(()))
             .unwrap()
@@ -1332,10 +1518,7 @@ mod tests {
         let path = directory.path().join("cc-switch.db");
         let store = McpStore::open(path.clone()).unwrap();
         let mut record = server();
-        record.apps = McpApps {
-            gemini: true,
-            ..Default::default()
-        };
+        record.apps = apps_enabled([AppType::Gemini]);
         store
             .upsert_with_live(
                 record,
