@@ -4,9 +4,10 @@ A provider configuration editor for every application supported by CC Switch.
 
 CC Switch Lite uses
 [`cc-switch-core`](https://github.com/SaladDay/cc-switch-core) as its built-in
-application registry and native Import/Apply/Remove domain layer. Lite retains
-host paths and I/O, database persistence, UI presentation, and its own release
-cycle.
+application registry and native Import/Apply/Remove domain layer. Core also
+declares shared default config roots. Lite retains settings and environment
+overrides, platform-specific paths, I/O, database persistence, UI presentation,
+and its own release cycle.
 
 The project is in pre-alpha development. The first release is intentionally
 limited to provider switching, MCP configuration, and Skill configuration.
