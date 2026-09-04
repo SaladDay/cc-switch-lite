@@ -22,69 +22,52 @@ const MAX_CONTENT_BYTES: usize = MAX_OPERATION_CONTENT_BYTES;
 
 #[derive(Debug, Clone)]
 pub struct LivePaths {
-    pub claude_settings: PathBuf,
-    pub claude_desktop_normal_config: PathBuf,
-    pub claude_desktop_threep_config: PathBuf,
-    pub claude_desktop_profile: PathBuf,
-    pub claude_desktop_meta: PathBuf,
-    pub codex_auth: PathBuf,
-    pub codex_config: PathBuf,
-    pub codex_model_catalog: PathBuf,
-    pub gemini_env: PathBuf,
-    pub gemini_settings: PathBuf,
-    pub grok_config: PathBuf,
-    pub opencode_config: PathBuf,
-    pub openclaw_config: PathBuf,
-    pub hermes_config: PathBuf,
-    pub pi_models: PathBuf,
+    paths: Vec<(LogicalTarget, PathBuf)>,
 }
 
 impl LivePaths {
-    pub(crate) fn path_for(&self, target: LogicalTarget) -> &Path {
-        match target {
-            LogicalTarget::ClaudeSettings => &self.claude_settings,
-            LogicalTarget::ClaudeDesktopNormalConfig => &self.claude_desktop_normal_config,
-            LogicalTarget::ClaudeDesktopThreepConfig => &self.claude_desktop_threep_config,
-            LogicalTarget::ClaudeDesktopProfile => &self.claude_desktop_profile,
-            LogicalTarget::ClaudeDesktopMeta => &self.claude_desktop_meta,
-            LogicalTarget::CodexAuth => &self.codex_auth,
-            LogicalTarget::CodexConfig => &self.codex_config,
-            LogicalTarget::CodexModelCatalog => &self.codex_model_catalog,
-            LogicalTarget::GeminiEnv => &self.gemini_env,
-            LogicalTarget::GeminiSettings => &self.gemini_settings,
-            LogicalTarget::GrokConfig => &self.grok_config,
-            LogicalTarget::OpenCodeConfig => &self.opencode_config,
-            LogicalTarget::OpenClawConfig => &self.openclaw_config,
-            LogicalTarget::HermesConfig => &self.hermes_config,
-            LogicalTarget::PiModels => &self.pi_models,
+    pub(crate) fn try_new(
+        paths: impl IntoIterator<Item = (LogicalTarget, PathBuf)>,
+    ) -> Result<Self, OperationError> {
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        let targets = paths
+            .iter()
+            .map(|(target, _)| *target)
+            .collect::<HashSet<_>>();
+        if paths.len() != LogicalTarget::ALL.len()
+            || targets.len() != LogicalTarget::ALL.len()
+            || !LogicalTarget::ALL
+                .iter()
+                .all(|target| targets.contains(target))
+        {
+            return Err(OperationError::InvalidTarget(
+                "live paths must cover every logical target exactly once".to_owned(),
+            ));
         }
+        Ok(Self { paths })
+    }
+
+    pub(crate) fn path_for(&self, target: LogicalTarget) -> &Path {
+        self.paths
+            .iter()
+            .find_map(|(candidate, path)| (*candidate == target).then_some(path.as_path()))
+            .expect("LivePaths construction validates complete target coverage")
     }
 
     pub fn resolved_for_write(&self, target: LogicalTarget) -> Result<Self, OperationError> {
         let mut resolved = self.clone();
         let path = resolve_write_path(self.path_for(target))?;
-        match target {
-            LogicalTarget::ClaudeSettings => resolved.claude_settings = path,
-            LogicalTarget::ClaudeDesktopNormalConfig => {
-                resolved.claude_desktop_normal_config = path
-            }
-            LogicalTarget::ClaudeDesktopThreepConfig => {
-                resolved.claude_desktop_threep_config = path
-            }
-            LogicalTarget::ClaudeDesktopProfile => resolved.claude_desktop_profile = path,
-            LogicalTarget::ClaudeDesktopMeta => resolved.claude_desktop_meta = path,
-            LogicalTarget::CodexAuth => resolved.codex_auth = path,
-            LogicalTarget::CodexConfig => resolved.codex_config = path,
-            LogicalTarget::CodexModelCatalog => resolved.codex_model_catalog = path,
-            LogicalTarget::GeminiEnv => resolved.gemini_env = path,
-            LogicalTarget::GeminiSettings => resolved.gemini_settings = path,
-            LogicalTarget::GrokConfig => resolved.grok_config = path,
-            LogicalTarget::OpenCodeConfig => resolved.opencode_config = path,
-            LogicalTarget::OpenClawConfig => resolved.openclaw_config = path,
-            LogicalTarget::HermesConfig => resolved.hermes_config = path,
-            LogicalTarget::PiModels => resolved.pi_models = path,
-        }
+        resolved.replace(target, path);
         Ok(resolved)
+    }
+
+    pub(crate) fn replace(&mut self, target: LogicalTarget, path: PathBuf) {
+        let (_, current) = self
+            .paths
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == target)
+            .expect("LivePaths construction validates complete target coverage");
+        *current = path;
     }
 }
 
@@ -531,23 +514,63 @@ mod tests {
     use super::*;
 
     fn paths(directory: &Path) -> LivePaths {
-        LivePaths {
-            claude_settings: directory.join(".claude/settings.json"),
-            claude_desktop_normal_config: directory.join("Claude/claude_desktop_config.json"),
-            claude_desktop_threep_config: directory.join("Claude-3p/claude_desktop_config.json"),
-            claude_desktop_profile: directory.join("Claude-3p/configLibrary/profile.json"),
-            claude_desktop_meta: directory.join("Claude-3p/configLibrary/_meta.json"),
-            codex_auth: directory.join(".codex/auth.json"),
-            codex_config: directory.join(".codex/config.toml"),
-            codex_model_catalog: directory.join(".codex/cc-switch-model-catalog.json"),
-            gemini_env: directory.join(".gemini/.env"),
-            gemini_settings: directory.join(".gemini/settings.json"),
-            grok_config: directory.join(".grok/config.toml"),
-            opencode_config: directory.join(".config/opencode/opencode.json"),
-            openclaw_config: directory.join(".openclaw/openclaw.json"),
-            hermes_config: directory.join(".hermes/config.yaml"),
-            pi_models: directory.join(".pi/agent/models.json"),
-        }
+        LivePaths::try_new([
+            (
+                LogicalTarget::ClaudeSettings,
+                directory.join(".claude/settings.json"),
+            ),
+            (
+                LogicalTarget::ClaudeDesktopNormalConfig,
+                directory.join("Claude/claude_desktop_config.json"),
+            ),
+            (
+                LogicalTarget::ClaudeDesktopThreepConfig,
+                directory.join("Claude-3p/claude_desktop_config.json"),
+            ),
+            (
+                LogicalTarget::ClaudeDesktopProfile,
+                directory.join("Claude-3p/configLibrary/profile.json"),
+            ),
+            (
+                LogicalTarget::ClaudeDesktopMeta,
+                directory.join("Claude-3p/configLibrary/_meta.json"),
+            ),
+            (LogicalTarget::CodexAuth, directory.join(".codex/auth.json")),
+            (
+                LogicalTarget::CodexConfig,
+                directory.join(".codex/config.toml"),
+            ),
+            (
+                LogicalTarget::CodexModelCatalog,
+                directory.join(".codex/cc-switch-model-catalog.json"),
+            ),
+            (LogicalTarget::GeminiEnv, directory.join(".gemini/.env")),
+            (
+                LogicalTarget::GeminiSettings,
+                directory.join(".gemini/settings.json"),
+            ),
+            (
+                LogicalTarget::GrokConfig,
+                directory.join(".grok/config.toml"),
+            ),
+            (
+                LogicalTarget::OpenCodeConfig,
+                directory.join(".config/opencode/opencode.json"),
+            ),
+            (
+                LogicalTarget::OpenClawConfig,
+                directory.join(".openclaw/openclaw.json"),
+            ),
+            (
+                LogicalTarget::HermesConfig,
+                directory.join(".hermes/config.yaml"),
+            ),
+            (
+                LogicalTarget::PiModels,
+                directory.join(".pi/agent/models.json"),
+            ),
+        ])
+        .expect("complete test paths")
     }
 
     #[test]
@@ -567,15 +590,21 @@ mod tests {
         let result = OperationExecutor::new(&paths).execute(&plan);
 
         assert!(matches!(result, Err(OperationError::InvalidPlan(_))));
-        assert!(!paths.codex_config.exists());
+        assert!(!paths.path_for(LogicalTarget::CodexConfig).exists());
     }
 
     #[test]
     fn executor_checks_content_preconditions_before_writing() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = paths(directory.path());
-        fs::create_dir_all(paths.claude_settings.parent().unwrap()).unwrap();
-        fs::write(&paths.claude_settings, "{}\n").unwrap();
+        fs::create_dir_all(
+            paths
+                .path_for(LogicalTarget::ClaudeSettings)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        fs::write(paths.path_for(LogicalTarget::ClaudeSettings), "{}\n").unwrap();
         let plan = OperationPlan {
             contract_major: OPERATION_CONTRACT_MAJOR,
             app_id: "claude".to_owned(),
@@ -589,7 +618,10 @@ mod tests {
         let result = OperationExecutor::new(&paths).execute(&plan);
 
         assert!(matches!(result, Err(OperationError::Conflict)));
-        assert_eq!(fs::read_to_string(paths.claude_settings).unwrap(), "{}\n");
+        assert_eq!(
+            fs::read_to_string(paths.path_for(LogicalTarget::ClaudeSettings)).unwrap(),
+            "{}\n"
+        );
     }
 
     #[test]
@@ -612,14 +644,14 @@ mod tests {
             .expect("execute plan");
 
         assert_eq!(
-            fs::read_to_string(&paths.claude_settings).unwrap(),
+            fs::read_to_string(paths.path_for(LogicalTarget::ClaudeSettings)).unwrap(),
             contents
         );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                fs::metadata(paths.claude_settings)
+                fs::metadata(paths.path_for(LogicalTarget::ClaudeSettings))
                     .unwrap()
                     .permissions()
                     .mode()
@@ -636,9 +668,19 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = paths(directory.path());
-        fs::create_dir_all(paths.claude_settings.parent().unwrap()).unwrap();
-        fs::write(&paths.claude_settings, b"{}\n").unwrap();
-        fs::set_permissions(&paths.claude_settings, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::create_dir_all(
+            paths
+                .path_for(LogicalTarget::ClaudeSettings)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        fs::write(paths.path_for(LogicalTarget::ClaudeSettings), b"{}\n").unwrap();
+        fs::set_permissions(
+            paths.path_for(LogicalTarget::ClaudeSettings),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
         let plan = OperationPlan {
             contract_major: OPERATION_CONTRACT_MAJOR,
             app_id: "claude".to_owned(),
@@ -654,7 +696,7 @@ mod tests {
             .expect("execute plan");
 
         assert_eq!(
-            fs::metadata(paths.claude_settings)
+            fs::metadata(paths.path_for(LogicalTarget::ClaudeSettings))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -683,8 +725,14 @@ mod tests {
     fn rollback_preserves_external_changes() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = paths(directory.path());
-        fs::create_dir_all(paths.claude_settings.parent().unwrap()).unwrap();
-        fs::write(&paths.claude_settings, b"original").unwrap();
+        fs::create_dir_all(
+            paths
+                .path_for(LogicalTarget::ClaudeSettings)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        fs::write(paths.path_for(LogicalTarget::ClaudeSettings), b"original").unwrap();
         let plan = OperationPlan {
             contract_major: OPERATION_CONTRACT_MAJOR,
             app_id: "claude".to_owned(),
@@ -697,20 +745,29 @@ mod tests {
         let receipt = OperationExecutor::new(&paths)
             .execute_recoverable(&plan)
             .expect("execute plan");
-        fs::write(&paths.claude_settings, b"external").unwrap();
+        fs::write(paths.path_for(LogicalTarget::ClaudeSettings), b"external").unwrap();
 
         let result = receipt.rollback();
 
         assert!(matches!(result, Err(OperationError::Rollback(_))));
-        assert_eq!(fs::read(paths.claude_settings).unwrap(), b"external");
+        assert_eq!(
+            fs::read(paths.path_for(LogicalTarget::ClaudeSettings)).unwrap(),
+            b"external"
+        );
     }
 
     #[test]
     fn managed_profile_deletion_is_recoverable() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = paths(directory.path());
-        fs::create_dir_all(paths.claude_desktop_profile.parent().unwrap()).unwrap();
-        fs::write(&paths.claude_desktop_profile, b"{}\n").unwrap();
+        fs::create_dir_all(
+            paths
+                .path_for(LogicalTarget::ClaudeDesktopProfile)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        fs::write(paths.path_for(LogicalTarget::ClaudeDesktopProfile), b"{}\n").unwrap();
         let plan = OperationPlan {
             contract_major: OPERATION_CONTRACT_MAJOR,
             app_id: "claude-desktop".to_owned(),
@@ -724,18 +781,31 @@ mod tests {
         let receipt = OperationExecutor::new(&paths)
             .execute_recoverable(&plan)
             .expect("delete profile");
-        assert!(!paths.claude_desktop_profile.exists());
+        assert!(!paths.path_for(LogicalTarget::ClaudeDesktopProfile).exists());
 
         receipt.rollback().expect("restore profile");
-        assert_eq!(fs::read(&paths.claude_desktop_profile).unwrap(), b"{}\n");
+        assert_eq!(
+            fs::read(paths.path_for(LogicalTarget::ClaudeDesktopProfile)).unwrap(),
+            b"{}\n"
+        );
     }
 
     #[test]
     fn managed_codex_catalog_deletion_is_recoverable() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = paths(directory.path());
-        fs::create_dir_all(paths.codex_model_catalog.parent().unwrap()).unwrap();
-        fs::write(&paths.codex_model_catalog, b"{\"models\":[]}\n").unwrap();
+        fs::create_dir_all(
+            paths
+                .path_for(LogicalTarget::CodexModelCatalog)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            paths.path_for(LogicalTarget::CodexModelCatalog),
+            b"{\"models\":[]}\n",
+        )
+        .unwrap();
         let plan = OperationPlan {
             contract_major: OPERATION_CONTRACT_MAJOR,
             app_id: "codex".to_owned(),
@@ -749,11 +819,11 @@ mod tests {
         let receipt = OperationExecutor::new(&paths)
             .execute_recoverable(&plan)
             .expect("delete model catalog");
-        assert!(!paths.codex_model_catalog.exists());
+        assert!(!paths.path_for(LogicalTarget::CodexModelCatalog).exists());
 
         receipt.rollback().expect("restore model catalog");
         assert_eq!(
-            fs::read(&paths.codex_model_catalog).unwrap(),
+            fs::read(paths.path_for(LogicalTarget::CodexModelCatalog)).unwrap(),
             b"{\"models\":[]}\n"
         );
     }
@@ -809,9 +879,15 @@ mod tests {
         let paths = paths(directory.path());
         let target = directory.path().join("managed/settings.json");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
-        fs::create_dir_all(paths.claude_settings.parent().unwrap()).unwrap();
+        fs::create_dir_all(
+            paths
+                .path_for(LogicalTarget::ClaudeSettings)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
         fs::write(&target, b"{}\n").unwrap();
-        symlink(&target, &paths.claude_settings).unwrap();
+        symlink(&target, paths.path_for(LogicalTarget::ClaudeSettings)).unwrap();
         let plan = OperationPlan {
             contract_major: OPERATION_CONTRACT_MAJOR,
             app_id: "claude".to_owned(),
@@ -825,10 +901,12 @@ mod tests {
         let result = OperationExecutor::new(&paths).execute(&plan);
 
         assert!(matches!(result, Err(OperationError::InvalidTarget(_))));
-        assert!(fs::symlink_metadata(&paths.claude_settings)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            fs::symlink_metadata(paths.path_for(LogicalTarget::ClaudeSettings))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read_to_string(target).unwrap(), "{}\n");
     }
 
@@ -841,14 +919,21 @@ mod tests {
         let paths = paths(directory.path());
         let managed = directory.path().join("managed");
         fs::create_dir_all(&managed).unwrap();
-        symlink(&managed, paths.claude_settings.parent().unwrap()).unwrap();
+        symlink(
+            &managed,
+            paths
+                .path_for(LogicalTarget::ClaudeSettings)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
 
         let resolved = paths
             .resolved_for_write(LogicalTarget::ClaudeSettings)
             .expect("resolve target");
 
         assert_eq!(
-            resolved.claude_settings,
+            resolved.path_for(LogicalTarget::ClaudeSettings),
             fs::canonicalize(managed).unwrap().join("settings.json")
         );
     }

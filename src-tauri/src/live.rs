@@ -85,37 +85,52 @@ struct SharedPathSettings {
     gemini_config_dir: Option<String>,
     grok_config_dir: Option<String>,
     opencode_config_dir: Option<String>,
+    openclaw_config_dir: Option<String>,
     hermes_config_dir: Option<String>,
+    pi_config_dir: Option<String>,
     skill_storage_location: Option<String>,
 }
 
 #[derive(Clone)]
 pub(crate) struct ResolvedConfigDirs {
-    pub(crate) claude: PathBuf,
-    pub(crate) codex: PathBuf,
-    pub(crate) gemini: PathBuf,
-    pub(crate) grok: PathBuf,
-    pub(crate) opencode: PathBuf,
-    pub(crate) hermes: PathBuf,
-    pub(crate) pi: PathBuf,
+    roots: Vec<(AppType, PathBuf)>,
+}
+
+impl ResolvedConfigDirs {
+    pub(crate) fn root(&self, app: &AppType) -> Result<&Path, LiveError> {
+        self.roots
+            .iter()
+            .find_map(|(candidate, root)| (candidate == app).then_some(root.as_path()))
+            .ok_or_else(|| LiveError::Missing(format!("{} config root", app.as_str())))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(home: &Path, claude: PathBuf, codex: PathBuf) -> Self {
+        Self {
+            roots: vec![
+                (AppType::Claude, claude),
+                (AppType::Codex, codex),
+                (AppType::Gemini, home.join(".gemini")),
+                (AppType::GrokBuild, home.join(".grok")),
+                (AppType::OpenCode, home.join(".config/opencode")),
+                (AppType::OpenClaw, home.join(".openclaw")),
+                (AppType::Hermes, home.join(".hermes")),
+                (AppType::Pi, home.join(".pi/agent")),
+            ],
+        }
+    }
 }
 
 impl LiveConfig {
     pub fn from_home(home: &Path) -> Result<Self, LiveError> {
         let settings = load_shared_path_settings(home);
         let dirs = resolve_config_dirs(home, &settings)?;
-        let claude_mcp = claude_mcp_path(home, &dirs.claude)?;
+        let claude_mcp = claude_mcp_path(home, dirs.root(&AppType::Claude)?)?;
         let native = NativeLiveConfig::from_home(home, &dirs)?;
+        let mcp = McpLiveConfig::new(native.paths(), &dirs, [(AppType::Claude, claude_mcp)])?;
         Ok(Self {
             native,
-            mcp: McpLiveConfig::new(
-                (claude_mcp, dirs.claude),
-                (dirs.codex.join("config.toml"), dirs.codex),
-                (dirs.gemini.join("settings.json"), dirs.gemini),
-                (dirs.grok.join("config.toml"), dirs.grok),
-                (dirs.opencode.join("opencode.json"), dirs.opencode),
-                (dirs.hermes.join("config.yaml"), dirs.hermes),
-            ),
+            mcp,
             home: home.to_owned(),
             lock_path: shared_live_config_lock_path(home),
             gate: Mutex::new(()),
@@ -370,54 +385,87 @@ fn resolve_config_dirs(
     let hermes_env = std::env::var_os("HERMES_HOME");
     let pi_env = std::env::var_os("PI_CODING_AGENT_DIR");
     Ok(ResolvedConfigDirs {
-        claude: configured_root(
-            home,
-            settings.claude_config_dir.as_deref(),
-            claude_env.as_deref(),
-            &home.join(".claude"),
-            "Claude config directory",
-        )?,
-        codex: configured_root(
-            home,
-            settings.codex_config_dir.as_deref(),
-            codex_env.as_deref(),
-            &home.join(".codex"),
-            "Codex config directory",
-        )?,
-        gemini: configured_root(
-            home,
-            settings.gemini_config_dir.as_deref(),
-            None,
-            &home.join(".gemini"),
-            "Gemini config directory",
-        )?,
-        grok: configured_root(
-            home,
-            settings.grok_config_dir.as_deref(),
-            None,
-            &home.join(".grok"),
-            "Grok config directory",
-        )?,
-        opencode: configured_root(
-            home,
-            settings.opencode_config_dir.as_deref(),
-            None,
-            &home.join(".config/opencode"),
-            "OpenCode config directory",
-        )?,
-        hermes: hermes_root(
-            home,
-            settings.hermes_config_dir.as_deref(),
-            hermes_env.as_deref(),
-            &crate::native_live::default_hermes_dir(home),
-        ),
-        pi: configured_root(
-            home,
-            None,
-            pi_env.as_deref(),
-            &home.join(".pi/agent"),
-            "Pi config directory",
-        )?,
+        roots: vec![
+            (
+                AppType::Claude,
+                configured_root(
+                    home,
+                    settings.claude_config_dir.as_deref(),
+                    claude_env.as_deref(),
+                    &home.join(".claude"),
+                    "Claude config directory",
+                )?,
+            ),
+            (
+                AppType::Codex,
+                configured_root(
+                    home,
+                    settings.codex_config_dir.as_deref(),
+                    codex_env.as_deref(),
+                    &home.join(".codex"),
+                    "Codex config directory",
+                )?,
+            ),
+            (
+                AppType::Gemini,
+                configured_root(
+                    home,
+                    settings.gemini_config_dir.as_deref(),
+                    None,
+                    &home.join(".gemini"),
+                    "Gemini config directory",
+                )?,
+            ),
+            (
+                AppType::GrokBuild,
+                configured_root(
+                    home,
+                    settings.grok_config_dir.as_deref(),
+                    None,
+                    &home.join(".grok"),
+                    "Grok config directory",
+                )?,
+            ),
+            (
+                AppType::OpenCode,
+                configured_root(
+                    home,
+                    settings.opencode_config_dir.as_deref(),
+                    None,
+                    &home.join(".config/opencode"),
+                    "OpenCode config directory",
+                )?,
+            ),
+            (
+                AppType::OpenClaw,
+                configured_root(
+                    home,
+                    settings.openclaw_config_dir.as_deref(),
+                    None,
+                    &home.join(".openclaw"),
+                    "OpenClaw config directory",
+                )?,
+            ),
+            (
+                AppType::Hermes,
+                hermes_root(
+                    home,
+                    settings.hermes_config_dir.as_deref(),
+                    hermes_env.as_deref(),
+                    &crate::native_live::default_hermes_dir(home),
+                ),
+            ),
+            (
+                AppType::Pi,
+                configured_root(
+                    home,
+                    settings.pi_config_dir.as_deref(),
+                    pi_env.as_deref(),
+                    &home.join(".pi/agent"),
+                    "Pi config directory",
+                )?,
+            ),
+        ],
     })
 }
 
@@ -700,6 +748,30 @@ mod tests {
             fs::canonicalize(directory.path())
                 .unwrap()
                 .join("profiles/claude")
+        );
+    }
+
+    #[test]
+    fn shared_pi_and_openclaw_directories_are_respected() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let pi = directory.path().join("profiles/pi");
+        let openclaw = directory.path().join("profiles/openclaw");
+        let settings = SharedPathSettings {
+            pi_config_dir: Some(pi.to_string_lossy().into_owned()),
+            openclaw_config_dir: Some(openclaw.to_string_lossy().into_owned()),
+            ..SharedPathSettings::default()
+        };
+
+        let resolved = resolve_config_dirs(directory.path(), &settings).unwrap();
+        let canonical = fs::canonicalize(directory.path()).unwrap();
+
+        assert_eq!(
+            resolved.root(&AppType::Pi).unwrap(),
+            canonical.join("profiles/pi")
+        );
+        assert_eq!(
+            resolved.root(&AppType::OpenClaw).unwrap(),
+            canonical.join("profiles/openclaw")
         );
     }
 
