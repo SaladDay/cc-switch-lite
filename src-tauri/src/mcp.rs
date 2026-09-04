@@ -1,15 +1,15 @@
-use std::{fmt, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use cc_switch_core::{
-    builtin_app_adapter, builtin_app_registry, mcp_servers_equivalent, validate_mcp_server,
-    validate_mcp_server_for_app, AppCapability, AppType, McpConfigTarget, McpNativeSnapshot,
+    builtin_app_registry, mcp_servers_equivalent, validate_mcp_server, validate_mcp_server_for_app,
+    AppType, McpCatalogColumn, McpNativeSnapshot,
 };
 use cc_switch_store::{
     begin_immediate_transaction, delete_mcp_native_links, delete_mcp_server,
-    ensure_mcp_native_link_schema, insert_mcp_server, read_mcp_native_link, read_mcp_server_row,
-    read_mcp_server_rows, set_mcp_server_enabled, update_mcp_server, upsert_mcp_native_link,
-    McpServerRow as SharedMcpServerRow, McpServerValues, McpServerWriteOutcome, SharedDatabase,
-    SharedStoreError,
+    ensure_mcp_native_link_schema, insert_mcp_server_catalog, read_mcp_native_link,
+    read_mcp_server_row, read_mcp_server_rows, set_mcp_server_selection, update_mcp_server_catalog,
+    upsert_mcp_native_link, McpServerCatalogValues, McpServerFields,
+    McpServerRow as SharedMcpServerRow, McpServerWriteOutcome, SharedDatabase, SharedStoreError,
 };
 use hmac::{Hmac, Mac};
 use rusqlite::Connection;
@@ -62,47 +62,51 @@ impl From<SharedStoreError> for McpError {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpApps {
-    #[serde(default)]
-    pub claude: bool,
-    #[serde(default)]
-    pub codex: bool,
-    #[serde(default)]
-    pub gemini: bool,
-    #[serde(default)]
-    pub grokbuild: bool,
-    #[serde(default)]
-    pub opencode: bool,
-    #[serde(default)]
-    pub hermes: bool,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct McpApps(BTreeMap<String, bool>);
+
+impl Default for McpApps {
+    fn default() -> Self {
+        Self(
+            builtin_app_registry()
+                .descriptors()
+                .filter(|descriptor| descriptor.mcp_contract().is_some())
+                .map(|descriptor| (descriptor.id().to_owned(), false))
+                .collect(),
+        )
+    }
 }
 
 impl McpApps {
-    fn enabled(&self, app: &AppType) -> bool {
-        match app {
-            AppType::Claude => self.claude,
-            AppType::Codex => self.codex,
-            AppType::Gemini => self.gemini,
-            AppType::GrokBuild => self.grokbuild,
-            AppType::OpenCode => self.opencode,
-            AppType::Hermes => self.hermes,
-            AppType::ClaudeDesktop | AppType::OpenClaw | AppType::Pi => false,
-        }
+    pub(crate) fn enabled(&self, app: &AppType) -> bool {
+        self.0.get(app.as_str()).copied().unwrap_or(false)
     }
 
     fn set(&mut self, app: &AppType, enabled: bool) -> Result<(), McpError> {
-        match app {
-            AppType::Claude => self.claude = enabled,
-            AppType::Codex => self.codex = enabled,
-            AppType::Gemini => self.gemini = enabled,
-            AppType::GrokBuild => self.grokbuild = enabled,
-            AppType::OpenCode => self.opencode = enabled,
-            AppType::Hermes => self.hermes = enabled,
-            AppType::ClaudeDesktop | AppType::OpenClaw | AppType::Pi => {
+        require_mcp_app(app)?;
+        self.0.insert(app.as_str().to_owned(), enabled);
+        Ok(())
+    }
+
+    fn from_row(row: &SharedMcpServerRow) -> Self {
+        let mut apps = Self::default();
+        for descriptor in builtin_app_registry().descriptors() {
+            if let Some(enabled) = row.enabled_for(descriptor.app()) {
+                apps.0.insert(descriptor.id().to_owned(), enabled);
+            }
+        }
+        apps
+    }
+
+    fn validate(&self) -> Result<(), McpError> {
+        for id in self.0.keys() {
+            let descriptor = builtin_app_registry()
+                .find(id)
+                .filter(|descriptor| descriptor.id() == id && descriptor.mcp_contract().is_some());
+            if descriptor.is_none() {
                 return Err(McpError::InvalidServer(format!(
-                    "application '{}' does not support MCP",
-                    app.as_str()
+                    "application '{id}' does not support MCP"
                 )));
             }
         }
@@ -298,7 +302,7 @@ impl McpStore {
         };
         let finalize = (|| -> Result<(), McpError> {
             persist_native_links(&mut transaction, &changes)?;
-            require_applied(set_mcp_server_enabled(
+            require_applied(set_mcp_server_selection(
                 &mut transaction,
                 id,
                 &current.source_fingerprint,
@@ -429,7 +433,7 @@ fn merge_imports(
                 }
                 if current.server.apps.enabled(&app) != import.enabled {
                     current.server.apps.set(&app, import.enabled)?;
-                    require_applied(set_mcp_server_enabled(
+                    require_applied(set_mcp_server_selection(
                         transaction,
                         &import.id,
                         &current.source_fingerprint,
@@ -479,6 +483,7 @@ fn row_to_server(row: SharedMcpServerRow, revision_key: &[u8; 16]) -> Result<Mcp
         rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
     })?;
     let revision = server_revision(row.source_fingerprint(), revision_key);
+    let apps = McpApps::from_row(&row);
     Ok(McpServer {
         id: row.id,
         name: row.name,
@@ -488,14 +493,7 @@ fn row_to_server(row: SharedMcpServerRow, revision_key: &[u8; 16]) -> Result<Mcp
         docs: row.docs,
         tags,
         revision,
-        apps: McpApps {
-            claude: row.enabled_claude != 0,
-            codex: row.enabled_codex != 0,
-            gemini: row.enabled_gemini != 0,
-            grokbuild: row.enabled_grokbuild != 0,
-            opencode: row.enabled_opencode != 0,
-            hermes: row.enabled_hermes != 0,
-        },
+        apps,
     })
 }
 
@@ -543,24 +541,21 @@ fn write_server(
         .map_err(|error| McpError::InvalidServer(error.to_string()))?;
     let tags = serde_json::to_string(&server.tags)
         .map_err(|error| McpError::InvalidServer(error.to_string()))?;
-    let values = McpServerValues {
-        id: &server.id,
-        name: &server.name,
-        server_config: &server_config,
-        description: server.description.as_deref(),
-        homepage: server.homepage.as_deref(),
-        docs: server.docs.as_deref(),
-        tags: &tags,
-        enabled_claude: server.apps.claude,
-        enabled_codex: server.apps.codex,
-        enabled_gemini: server.apps.gemini,
-        enabled_grokbuild: server.apps.grokbuild,
-        enabled_opencode: server.apps.opencode,
-        enabled_hermes: server.apps.hermes,
-    };
+    let values = McpServerCatalogValues::new(
+        McpServerFields {
+            id: &server.id,
+            name: &server.name,
+            server_config: &server_config,
+            description: server.description.as_deref(),
+            homepage: server.homepage.as_deref(),
+            docs: server.docs.as_deref(),
+            tags: &tags,
+        },
+        |app| server.apps.enabled(app),
+    );
     let outcome = match expected_fingerprint {
-        Some(expected) => update_mcp_server(transaction, expected, &values)?,
-        None => insert_mcp_server(transaction, &values)?,
+        Some(expected) => update_mcp_server_catalog(transaction, expected, &values)?,
+        None => insert_mcp_server_catalog(transaction, &values)?,
     };
     require_applied(outcome)
 }
@@ -575,6 +570,7 @@ fn require_applied(outcome: McpServerWriteOutcome) -> Result<(), McpError> {
 fn validate_server(server: &McpServer) -> Result<(), McpError> {
     validate_mcp_server(&server.id, &server.server)
         .map_err(|error| McpError::InvalidServer(error.to_string()))?;
+    server.apps.validate()?;
     if server.name.trim().is_empty() || server.name.len() > 128 {
         return Err(McpError::InvalidServer(
             "name must contain at most 128 bytes".to_owned(),
@@ -616,21 +612,17 @@ fn validate_app_activation(app: &AppType, id: &str, server: &Value) -> Result<()
         .map_err(|error| McpError::InvalidServer(error.to_string()))
 }
 
-fn require_mcp_app(app: &AppType) -> Result<McpConfigTarget, McpError> {
+fn require_mcp_app(app: &AppType) -> Result<McpCatalogColumn, McpError> {
     let descriptor = builtin_app_registry().for_app(app);
-    let adapter = builtin_app_adapter(app);
-    if !descriptor.supports(AppCapability::Mcp) {
-        return Err(McpError::InvalidServer(format!(
-            "application '{}' does not support MCP",
-            app.as_str()
-        )));
-    }
-    adapter.mcp_config_target().ok_or_else(|| {
-        McpError::InvalidServer(format!(
-            "application '{}' does not support MCP",
-            app.as_str()
-        ))
-    })
+    descriptor
+        .mcp_contract()
+        .map(|contract| contract.catalog_column())
+        .ok_or_else(|| {
+            McpError::InvalidServer(format!(
+                "application '{}' does not support MCP",
+                app.as_str()
+            ))
+        })
 }
 
 fn live_changes(
@@ -639,15 +631,12 @@ fn live_changes(
     after: Option<&McpServer>,
 ) -> Result<Vec<McpLiveChange>, McpError> {
     let mut changes = Vec::new();
-    for descriptor in builtin_app_registry()
-        .descriptors()
-        .filter(|descriptor| descriptor.supports(AppCapability::Mcp))
-    {
+    for descriptor in builtin_app_registry().descriptors() {
+        let Some(contract) = descriptor.mcp_contract() else {
+            continue;
+        };
         let app = descriptor.app().clone();
-        let preserves_disabled_entry = descriptor
-            .mcp_contract()
-            .expect("MCP capability has a native contract")
-            .preserves_disabled_entry();
+        let preserves_disabled_entry = contract.preserves_disabled_entry();
         let id = after
             .or(before)
             .expect("a live change has a server")
@@ -789,15 +778,20 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    fn apps_enabled(apps: impl IntoIterator<Item = AppType>) -> McpApps {
+        let mut selections = McpApps::default();
+        for app in apps {
+            selections.set(&app, true).unwrap();
+        }
+        selections
+    }
+
     fn server() -> McpServer {
         McpServer {
             id: "context7".to_owned(),
             name: "Context7".to_owned(),
             server: json!({"type":"stdio","command":"npx","future":true}),
-            apps: McpApps {
-                claude: true,
-                ..Default::default()
-            },
+            apps: apps_enabled([AppType::Claude]),
             description: Some("Docs".to_owned()),
             homepage: None,
             docs: None,
@@ -828,6 +822,54 @@ mod tests {
         let mut expected = server();
         expected.revision = listed[0].revision;
         assert_eq!(listed, vec![expected]);
+    }
+
+    #[test]
+    fn shared_schema_and_ipc_apps_follow_the_core_registry() {
+        let directory = tempdir().unwrap();
+        let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let registry_apps = builtin_app_registry()
+            .descriptors()
+            .filter(|descriptor| descriptor.mcp_contract().is_some())
+            .map(|descriptor| descriptor.app().clone())
+            .collect::<Vec<_>>();
+        let mut record = server();
+        record.apps = apps_enabled(registry_apps.clone());
+
+        store
+            .upsert_with_live(record, |_| Ok::<_, ()>(()), |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        let current = store.list().unwrap().remove(0);
+        for app in &registry_apps {
+            assert!(current.apps.enabled(app));
+        }
+
+        let serialized = serde_json::to_value(current.apps).unwrap();
+        let keys = serialized
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = registry_apps
+            .iter()
+            .map(|app| app.as_str().to_owned())
+            .collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn save_rejects_non_mcp_app_selections() {
+        let directory = tempdir().unwrap();
+        let store = McpStore::open(directory.path().join("cc-switch.db")).unwrap();
+        let mut record = server();
+        record.apps.0.insert("pi".to_owned(), true);
+
+        let result = store.upsert_with_live(record, |_| Ok::<_, ()>(()), |_| Ok(()));
+
+        assert!(matches!(result, Err(McpError::InvalidServer(_))));
+        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]
@@ -989,7 +1031,7 @@ mod tests {
         assert!(!applied.get());
         let current = store.list().unwrap().remove(0);
         assert_eq!(current.name, "Context7");
-        assert!(current.apps.codex);
+        assert!(current.apps.enabled(&AppType::Codex));
     }
 
     #[test]
@@ -1066,7 +1108,12 @@ mod tests {
 
         assert!(matches!(result, Err(McpError::Conflict)));
         assert!(!applied.get());
-        assert!(!store.list().unwrap().remove(0).apps.codex);
+        assert!(!store
+            .list()
+            .unwrap()
+            .remove(0)
+            .apps
+            .enabled(&AppType::Codex));
     }
 
     #[test]
@@ -1102,8 +1149,8 @@ mod tests {
         assert_eq!(report.failed_apps.len(), 1);
         let current = store.list().unwrap().remove(0);
         assert_eq!(current.server["command"], "npx");
-        assert!(current.apps.claude);
-        assert!(!current.apps.codex);
+        assert!(current.apps.enabled(&AppType::Claude));
+        assert!(!current.apps.enabled(&AppType::Codex));
     }
 
     #[test]
@@ -1122,7 +1169,12 @@ mod tests {
             )]
         };
         import_observed(&store, import(false), true).unwrap();
-        assert!(!store.list().unwrap().remove(0).apps.opencode);
+        assert!(!store
+            .list()
+            .unwrap()
+            .remove(0)
+            .apps
+            .enabled(&AppType::OpenCode));
         let connection = store.connect().unwrap();
         assert!(get_native_link(&connection, "local", &AppType::OpenCode)
             .unwrap()
@@ -1130,7 +1182,12 @@ mod tests {
 
         let report = import_observed(&store, import(true), true).unwrap();
         assert_eq!(report.enabled_apps, 1);
-        assert!(store.list().unwrap().remove(0).apps.opencode);
+        assert!(store
+            .list()
+            .unwrap()
+            .remove(0)
+            .apps
+            .enabled(&AppType::OpenCode));
     }
 
     #[test]
@@ -1162,7 +1219,12 @@ mod tests {
 
         assert_eq!(report.enabled_apps, 0);
         assert_eq!(report.failed_apps.len(), 1);
-        assert!(!store.list().unwrap().remove(0).apps.opencode);
+        assert!(!store
+            .list()
+            .unwrap()
+            .remove(0)
+            .apps
+            .enabled(&AppType::OpenCode));
         assert!(
             get_native_link(&store.connect().unwrap(), "context7", &AppType::OpenCode)
                 .unwrap()
@@ -1171,25 +1233,21 @@ mod tests {
     }
 
     #[test]
-    fn core_capabilities_and_mcp_targets_stay_aligned() {
-        let targets = AppType::all()
-            .filter(|app| {
-                builtin_app_registry()
-                    .for_app(app)
-                    .supports(AppCapability::Mcp)
-            })
-            .map(|app| require_mcp_app(&app).unwrap())
-            .collect::<Vec<_>>();
+    fn core_registry_and_mcp_selections_stay_aligned() {
+        let mut columns = Vec::new();
+        for descriptor in builtin_app_registry().descriptors() {
+            match descriptor.mcp_contract() {
+                Some(contract) => {
+                    let column = require_mcp_app(descriptor.app()).unwrap();
+                    assert_eq!(column, contract.catalog_column());
+                    columns.push(column);
+                }
+                None => assert!(require_mcp_app(descriptor.app()).is_err()),
+            }
+        }
         assert_eq!(
-            targets,
-            [
-                McpConfigTarget::Claude,
-                McpConfigTarget::Codex,
-                McpConfigTarget::Gemini,
-                McpConfigTarget::GrokBuild,
-                McpConfigTarget::OpenCode,
-                McpConfigTarget::Hermes,
-            ]
+            columns,
+            cc_switch_core::mcp_catalog_columns().collect::<Vec<_>>()
         );
     }
 
@@ -1308,10 +1366,7 @@ mod tests {
         let path = directory.path().join("cc-switch.db");
         let store = McpStore::open(path.clone()).unwrap();
         let mut record = server();
-        record.apps = McpApps {
-            gemini: true,
-            ..Default::default()
-        };
+        record.apps = apps_enabled([AppType::Gemini]);
         store
             .upsert_with_live(record, |_| Ok::<_, ()>(()), |_| Ok(()))
             .unwrap()
@@ -1350,10 +1405,7 @@ mod tests {
         let path = directory.path().join("cc-switch.db");
         let store = McpStore::open(path.clone()).unwrap();
         let mut record = server();
-        record.apps = McpApps {
-            gemini: true,
-            ..Default::default()
-        };
+        record.apps = apps_enabled([AppType::Gemini]);
         store
             .upsert_with_live(
                 record,

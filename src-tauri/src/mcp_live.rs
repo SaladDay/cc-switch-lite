@@ -442,7 +442,12 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result, Err(LiveError::Missing(_))));
-        assert!(!store.list().unwrap().remove(0).apps.gemini);
+        assert!(!store
+            .list()
+            .unwrap()
+            .remove(0)
+            .apps
+            .enabled(&AppType::Gemini));
     }
 
     #[test]
