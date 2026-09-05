@@ -15,8 +15,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.4.0", features = [] }
 
 [dependencies]
-cc-switch-core = { git = "https://github.com/SaladDay/cc-switch-core", rev = "2b9e1426a20d0c79ad23f807358aa78942d5589d" }
-cc-switch-store = { git = "https://github.com/SaladDay/cc-switch-core", rev = "2b9e1426a20d0c79ad23f807358aa78942d5589d" }
+cc-switch-core = { git = "https://github.com/SaladDay/cc-switch-core", rev = "bfffedc495f115025092fd90fc5830a94ceb0297" }
+cc-switch-store = { git = "https://github.com/SaladDay/cc-switch-core", rev = "bfffedc495f115025092fd90fc5830a94ceb0297" }
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 hmac = "0.12"
 json5 = "0.4"
