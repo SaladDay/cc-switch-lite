@@ -16,6 +16,9 @@ mod skill;
 mod skill_live;
 mod store;
 
+#[cfg(test)]
+mod consumer_coordination;
+
 use live::{LiveConfig, LiveError};
 use mcp::{McpError, McpImportReport, McpServer, McpStore};
 use provider::{
