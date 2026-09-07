@@ -408,13 +408,25 @@ impl ProviderStore {
             if !same_live_input(&live_provider, &final_live_provider) {
                 return Err(StoreError::Conflict(id.to_owned()));
             }
-            transaction.commit()?;
+            // Keep the rollback guard after a failed COMMIT until native
+            // compensation has finished under the retained live-file lock.
+            transaction.execute_batch("COMMIT")?;
             Ok(())
         })();
         if let Err(error) = finalize {
+            let mut failures = Vec::new();
             if let Err(rollback_error) = rollback(receipt) {
+                failures.push(format!("live recovery error: {rollback_error}"));
+            }
+            if !transaction.is_autocommit() {
+                if let Err(rollback_error) = transaction.rollback() {
+                    failures.push(format!("database rollback error: {rollback_error}"));
+                }
+            }
+            if !failures.is_empty() {
                 return Err(StoreError::Recovery(format!(
-                    "database error: {error}; live recovery error: {rollback_error}"
+                    "database error: {error}; {}",
+                    failures.join("; ")
                 )));
             }
             return Err(error);
@@ -2931,6 +2943,96 @@ requires_openai_auth = true
             )
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn switch_commit_failure_keeps_database_and_native_locks_through_recovery() {
+        use crate::live::LiveConfig;
+        use fs4::{FileExt, TryLockError};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".cc-switch/cc-switch.db");
+        let store = ProviderStore::open(path.clone()).unwrap();
+        let create = |name: &str| {
+            store
+                .create_native_with_presentation(
+                    ProviderDraft {
+                        app_id: "gemini".into(),
+                        adapter: native_adapter_reference(&AppType::Gemini),
+                        name: name.into(),
+                        settings: json!({"env":{"GEMINI_API_KEY":format!("{name}-fake")}})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    },
+                    ProviderPresentation::default(),
+                )
+                .unwrap()
+        };
+        let old = create("old");
+        let new = create("new");
+        store.set_current("gemini", &old.id, old.revision).unwrap();
+        let env = directory.path().join(".gemini/.env");
+        let settings = directory.path().join(".gemini/settings.json");
+        fs::create_dir_all(env.parent().unwrap()).unwrap();
+        fs::write(&env, "# layout\nGEMINI_API_KEY=old-fake\n").unwrap();
+        fs::write(&settings, "{\"opaque\":true}\n").unwrap();
+        let before = (fs::read(&env).unwrap(), fs::read(&settings).unwrap());
+        let conn = store.connect().unwrap();
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX fixture_current_reference ON providers(id, app_type, is_current);
+            CREATE TABLE fixture_commit_guard(id TEXT, app_type TEXT, selected INTEGER,
+            FOREIGN KEY(id, app_type, selected) REFERENCES providers(id, app_type, is_current)
+            DEFERRABLE INITIALLY DEFERRED);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fixture_commit_guard VALUES(?1, 'gemini', 1)",
+            [&old.id],
+        )
+        .unwrap();
+        drop(conn);
+        let live = LiveConfig::from_home(directory.path()).unwrap();
+        let restored = std::cell::Cell::new(false);
+        let result = store.switch_with_provider("gemini", &new.id, new.revision,
+            |provider, snippet| live.switch_native_recoverable(provider, snippet),
+            |receipt| {
+                let contender = std::fs::OpenOptions::new().read(true).write(true)
+                    .open(cc_switch_core::fs::shared_live_config_lock_path(directory.path())).unwrap();
+                assert!(matches!(FileExt::try_lock(&contender), Err(TryLockError::WouldBlock)));
+                let peer = Connection::open(&path).unwrap();
+                peer.busy_timeout(std::time::Duration::ZERO).unwrap();
+                assert!(matches!(peer.execute_batch("BEGIN IMMEDIATE"),
+                    Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::DatabaseBusy),
+                    "database transaction must remain held during native compensation");
+                live.rollback(receipt).map_err(|error| error.to_string())?;
+                restored.set(true);
+                Ok(())
+            });
+        assert!(
+            matches!(result, Err(StoreError::Database(rusqlite::Error::SqliteFailure(error, _)))
+            if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY)
+        );
+        assert!(restored.get());
+        assert_eq!(
+            (fs::read(&env).unwrap(), fs::read(&settings).unwrap()),
+            before
+        );
+        assert_eq!(store.current("gemini").unwrap()[0].id, old.id);
+        let conn = store.connect().unwrap();
+        conn.execute_batch("DROP TABLE fixture_commit_guard")
+            .unwrap();
+        drop(conn);
+        store
+            .switch_with_provider(
+                "gemini",
+                &new.id,
+                new.revision,
+                |provider, snippet| live.switch_native_recoverable(provider, snippet),
+                |receipt| live.rollback(receipt).map_err(|error| error.to_string()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.current("gemini").unwrap()[0].id, new.id);
     }
 
     #[test]
