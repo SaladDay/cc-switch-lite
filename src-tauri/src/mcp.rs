@@ -261,10 +261,9 @@ impl McpStore {
                 &server,
             )?;
             persist_native_links(&mut transaction, &changes)?;
-            transaction.commit()?;
             Ok(())
         })();
-        recover_on_failure(finalize, receipt, rollback)?;
+        finish_with_live(transaction, finalize, receipt, rollback)?;
         Ok(Ok(()))
     }
 
@@ -301,10 +300,9 @@ impl McpStore {
         let finalize = (|| -> Result<(), McpError> {
             persist_native_links(&mut transaction, &changes)?;
             transaction.set_server_selection(id, &current.source_fingerprint, target, enabled)?;
-            transaction.commit()?;
             Ok(())
         })();
-        recover_on_failure(finalize, receipt, rollback)?;
+        finish_with_live(transaction, finalize, receipt, rollback)?;
         Ok(Ok(()))
     }
 
@@ -330,10 +328,9 @@ impl McpStore {
         };
         let finalize = (|| -> Result<(), McpError> {
             transaction.delete_server(id, &current.source_fingerprint)?;
-            transaction.commit()?;
             Ok(())
         })();
-        recover_on_failure(finalize, receipt, rollback)?;
+        finish_with_live(transaction, finalize, receipt, rollback)?;
         Ok(Ok(()))
     }
 
@@ -760,20 +757,33 @@ fn upsert_native_link(
     Ok(())
 }
 
-fn recover_on_failure<T>(
+fn finish_with_live<T>(
+    transaction: McpTransactionGuard<'_>,
     result: Result<(), McpError>,
     receipt: T,
     rollback: impl FnOnce(T) -> Result<(), String>,
 ) -> Result<(), McpError> {
-    if let Err(error) = result {
-        if let Err(rollback_error) = rollback(receipt) {
-            return Err(McpError::Recovery(format!(
-                "database error: {error}; live recovery error: {rollback_error}"
-            )));
-        }
-        return Err(error);
+    let (transaction, error) = match result {
+        Ok(()) => match transaction.commit_preserving_on_error() {
+            Ok(()) => return Ok(()),
+            Err((transaction, error)) => (transaction, McpError::from(error)),
+        },
+        Err(error) => (transaction, error),
+    };
+    let mut failures = Vec::new();
+    if let Err(rollback_error) = rollback(receipt) {
+        failures.push(format!("live recovery error: {rollback_error}"));
     }
-    Ok(())
+    if let Err(rollback_error) = transaction.rollback() {
+        failures.push(format!("database rollback error: {rollback_error}"));
+    }
+    if !failures.is_empty() {
+        return Err(McpError::Recovery(format!(
+            "database error: {error}; {}",
+            failures.join("; ")
+        )));
+    }
+    Err(error)
 }
 
 #[cfg(test)]
@@ -781,6 +791,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::tempdir;
+
+    mod recovery;
 
     fn apps_enabled(apps: impl IntoIterator<Item = AppType>) -> McpApps {
         let mut selections = McpApps::default();
