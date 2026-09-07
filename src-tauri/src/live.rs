@@ -1,15 +1,15 @@
 use std::{
     ffi::OsStr,
-    fs::{self, File, OpenOptions},
+    fs,
     path::{Component, Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
 
 use cc_switch_core::{
-    builtin_app_registry, fs::shared_live_config_lock_path, AppType, InstalledSkillSnapshot,
-    SkillCatalogEntry, MAX_OPERATION_CONTENT_BYTES,
+    builtin_app_registry,
+    fs::{shared_live_config_lock_path, SharedLiveConfigLock, SharedLiveConfigLockError},
+    AppType, InstalledSkillSnapshot, SkillCatalogEntry, MAX_OPERATION_CONTENT_BYTES,
 };
-use fs4::{FileExt, TryLockError};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -69,7 +69,7 @@ pub struct LiveConfig {
 pub(crate) struct LockedLiveReceipt<'a, T> {
     pub(crate) value: T,
     gate: MutexGuard<'a, ()>,
-    file_lock: File,
+    file_lock: SharedLiveConfigLock,
 }
 
 pub(crate) type LiveWriteReceipt<'a> = LockedLiveReceipt<'a, OperationReceipt>;
@@ -345,7 +345,7 @@ impl LiveConfig {
         })
     }
 
-    fn acquire_lock(&self) -> Result<(MutexGuard<'_, ()>, File), LiveError> {
+    fn acquire_lock(&self) -> Result<(MutexGuard<'_, ()>, SharedLiveConfigLock), LiveError> {
         let guard = self
             .gate
             .try_lock()
@@ -354,43 +354,11 @@ impl LiveConfig {
         Ok((guard, file_lock))
     }
 
-    fn lock_file(&self) -> Result<File, LiveError> {
-        if let Some(parent) = self.lock_path.parent() {
-            fs::create_dir_all(parent).map_err(|source| LiveError::Io {
-                path: parent.to_owned(),
-                source,
-            })?;
-        }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let lock = options
-            .open(&self.lock_path)
-            .map_err(|source| LiveError::Io {
-                path: self.lock_path.clone(),
-                source,
-            })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            lock.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|source| LiveError::Io {
-                    path: self.lock_path.clone(),
-                    source,
-                })?;
-        }
-        FileExt::try_lock(&lock).map_err(|error| match error {
-            TryLockError::WouldBlock => LiveError::LockUnavailable,
-            TryLockError::Error(source) => LiveError::Io {
-                path: self.lock_path.clone(),
-                source,
-            },
-        })?;
-        Ok(lock)
+    fn lock_file(&self) -> Result<SharedLiveConfigLock, LiveError> {
+        SharedLiveConfigLock::try_acquire(&self.lock_path).map_err(|error| match error {
+            SharedLiveConfigLockError::Unavailable => LiveError::LockUnavailable,
+            SharedLiveConfigLockError::Io { path, source } => LiveError::Io { path, source },
+        })
     }
 }
 
@@ -651,7 +619,9 @@ fn config_root(
 mod tests {
     use super::*;
     use cc_switch_core::builtin_app_adapter;
+    use fs4::{FileExt, TryLockError};
     use serde_json::json;
+    use std::fs::OpenOptions;
 
     #[test]
     fn config_dirs_cover_every_core_root_resource() {
