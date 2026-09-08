@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+#[cfg(test)]
+mod acceptance_tests;
+
 use cc_switch_core::{AppType, InstalledSkillSnapshot, SkillCatalogDecision, SkillControlReason};
 use cc_switch_store::{
     apply_skill_catalog_plan, begin_immediate_transaction, read_skill_catalog,
@@ -221,6 +224,8 @@ fn rollback_live(
     receipt: SkillWriteReceipt<'_>,
     error: SkillError,
 ) -> Result<(), SkillError> {
+    #[cfg(test)]
+    acceptance_tests::before_recovery();
     match live.rollback_skill(receipt) {
         Ok(()) => Err(error),
         Err(rollback_error) => Err(SkillError::Recovery(format!(
