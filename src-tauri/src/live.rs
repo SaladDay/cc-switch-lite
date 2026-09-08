@@ -140,6 +140,11 @@ impl ResolvedConfigDirs {
 }
 
 impl LiveConfig {
+    #[cfg(test)]
+    pub(crate) fn assert_mcp_fixture_paths(&self, home: &Path) {
+        self.mcp.assert_fixture_paths(home);
+    }
+
     pub fn from_home(home: &Path) -> Result<Self, LiveError> {
         let settings = load_shared_path_settings(home);
         let dirs = resolve_config_dirs(home, &settings)?;

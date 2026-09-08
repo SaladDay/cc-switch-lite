@@ -12,6 +12,8 @@ use crate::{
     store::ProviderStore,
 };
 
+mod mcp_lifecycle;
+
 #[test]
 #[ignore = "invoked by the CLI acceptance test with an isolated fixture"]
 fn create_mcp_in_cli_fixture() {
