@@ -43,6 +43,24 @@ struct McpFileReceipt {
 }
 
 impl McpLiveConfig {
+    #[cfg(test)]
+    pub(crate) fn assert_fixture_paths(&self, home: &std::path::Path) {
+        for target in &self.paths {
+            for path in [&target.path, &target.install_marker] {
+                let resolved = if path.is_dir() {
+                    fs::canonicalize(path).unwrap()
+                } else {
+                    resolve_write_path(path).unwrap()
+                };
+                assert!(
+                    resolved.starts_with(home),
+                    "MCP fixture path escaped its temporary profile: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
     pub fn new(
         native: &LivePaths,
         roots: &ResolvedConfigDirs,
