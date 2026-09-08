@@ -7,9 +7,75 @@ use serde_json::json;
 
 use crate::{
     live::{LiveConfig, LiveError},
+    mcp::{McpServer, McpStore},
     provider::{native_adapter_reference, ProviderDraft, ProviderPresentation, ProviderRecord},
     store::ProviderStore,
 };
+
+#[test]
+#[ignore = "invoked by the CLI acceptance test with an isolated fixture"]
+fn create_mcp_in_cli_fixture() {
+    let home = fixture_home();
+    let live = LiveConfig::from_home(&home).unwrap();
+    let store = McpStore::open(home.join(".cc-switch/cc-switch.db")).unwrap();
+    store
+        .upsert_with_live(
+            McpServer {
+                id: "lite-peer".into(),
+                name: "Lite MCP peer fixture".into(),
+                server: json!({"command":"not-executed-lite-peer"}),
+                apps: Default::default(),
+                description: Some("Retain this independently committed record".into()),
+                homepage: None,
+                docs: None,
+                tags: vec!["peer-fixture".into()],
+                revision: 0,
+            },
+            |changes| live.apply_mcp_recoverable(changes),
+            |receipt| {
+                live.rollback_mcp(receipt)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+#[ignore = "invoked by the CLI acceptance test with an isolated fixture"]
+fn toggle_mcp_in_cli_fixture() {
+    let home = fixture_home();
+    let live = LiveConfig::from_home(&home).unwrap();
+    let store = McpStore::open(home.join(".cc-switch/cc-switch.db")).unwrap();
+    let server = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|server| server.id == "cli-target")
+        .unwrap();
+    let enabled = match std::env::var("CC_SWITCH_COORDINATION_MODE")
+        .unwrap()
+        .as_str()
+    {
+        "enable" => true,
+        "disable" => false,
+        mode => panic!("unexpected MCP peer mode: {mode}"),
+    };
+    store
+        .toggle_with_live(
+            &server.id,
+            server.revision,
+            AppType::Gemini,
+            enabled,
+            |changes| live.apply_mcp_recoverable(changes),
+            |receipt| {
+                live.rollback_mcp(receipt)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap()
+        .unwrap();
+}
 
 #[test]
 #[ignore = "invoked by the CLI acceptance test with an isolated fixture"]
