@@ -11,6 +11,37 @@ fn skill_in_cli_fixture() {
     let path = home.join(".cc-switch/cc-switch.db");
     let live = LiveConfig::for_skill_fixture(&home);
     let mode = std::env::var("CC_SWITCH_COORDINATION_MODE").unwrap();
+    if let Some(request) = mode.strip_prefix("deployment:") {
+        let (app, action) = request.split_once(':').expect("App and deployment action");
+        let app = app.parse::<AppType>().unwrap();
+        assert_eq!(app, AppType::Claude);
+        let enabled = match action {
+            "enable" => true,
+            "disable" => false,
+            _ => panic!("unexpected deployment action: {action}"),
+        };
+        let store = SkillStore::open(path).unwrap();
+        let result = store.toggle(&live, "cli-skill", app.clone(), enabled);
+        let error = result.err().map(|error| {
+            json!({
+                "code": error.code(), "message": error.to_string()
+            })
+        });
+        let snapshots = store.list(&live).unwrap();
+        let state = snapshots
+            .iter()
+            .find(|skill| skill.id() == "cli-skill")
+            .unwrap()
+            .apps()
+            .find(|state| state.app() == &app)
+            .unwrap();
+        fs::write(
+            home.join("lite-skill-deployment.json"),
+            serde_json::to_vec(&json!({"error": error, "state": state})).unwrap(),
+        )
+        .unwrap();
+        return;
+    }
     if mode == "hold" {
         // Hold a real native receipt without a database write lock, so refusal
         // cannot be explained by SQLite contention alone.
