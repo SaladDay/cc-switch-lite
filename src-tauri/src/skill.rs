@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 #[cfg(test)]
-mod acceptance_tests;
+pub(crate) mod acceptance_tests;
 
 use cc_switch_core::{AppType, InstalledSkillSnapshot, SkillCatalogDecision, SkillControlReason};
 use cc_switch_store::{
@@ -155,16 +155,29 @@ impl SkillStore {
                 &mut transaction,
                 receipt.value.plan(),
             )?)?;
-            transaction.commit()?;
+            // Keep the transaction guard on failure until native recovery ends.
+            transaction.execute_batch("COMMIT")?;
             Ok(())
         })();
 
         match database_result {
             Ok(()) => commit_live(live, receipt),
+            Err(error) if !transaction.is_autocommit() => {
+                // A still-active transaction has not committed. Restore the Core
+                // receipt before releasing database protection; do not re-read
+                // this uncommitted selection through a second connection.
+                let error = rollback_live(live, receipt, error);
+                match transaction.rollback() {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(SkillError::Recovery(format!(
+                        "update error: {error}; database rollback error: {rollback_error}"
+                    ))),
+                }
+            }
             Err(SkillError::Database(database_error)) => {
                 self.resolve_uncertain_commit(live, receipt, skill_id, database_error)
             }
-            Err(error) => rollback_live(live, receipt, error),
+            Err(error) => Err(rollback_live(live, receipt, error)),
         }
     }
 
@@ -183,19 +196,21 @@ impl SkillStore {
             .map(|entry| receipt.value.decide_catalog(entry.as_ref()));
         match decision {
             Ok(SkillCatalogDecision::KeepLive) => commit_live(live, receipt),
-            Ok(SkillCatalogDecision::RestoreLive) => {
-                rollback_live(live, receipt, SkillError::Database(database_error))
-            }
+            Ok(SkillCatalogDecision::RestoreLive) => Err(rollback_live(
+                live,
+                receipt,
+                SkillError::Database(database_error),
+            )),
             Ok(SkillCatalogDecision::Conflict) => {
-                rollback_live(live, receipt, SkillError::Conflict)
+                Err(rollback_live(live, receipt, SkillError::Conflict))
             }
-            Err(read_error) => rollback_live(
+            Err(read_error) => Err(rollback_live(
                 live,
                 receipt,
                 SkillError::Recovery(format!(
                     "database commit error: {database_error}; catalog re-read error: {read_error}"
                 )),
-            ),
+            )),
         }
     }
 
@@ -223,14 +238,14 @@ fn rollback_live(
     live: &LiveConfig,
     receipt: SkillWriteReceipt<'_>,
     error: SkillError,
-) -> Result<(), SkillError> {
+) -> SkillError {
     #[cfg(test)]
     acceptance_tests::before_recovery();
     match live.rollback_skill(receipt) {
-        Ok(()) => Err(error),
-        Err(rollback_error) => Err(SkillError::Recovery(format!(
+        Ok(()) => error,
+        Err(rollback_error) => SkillError::Recovery(format!(
             "update error: {error}; live recovery error: {rollback_error}"
-        ))),
+        )),
     }
 }
 

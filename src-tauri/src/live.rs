@@ -245,6 +245,8 @@ impl LiveConfig {
             file_lock,
         } = receipt;
         let result = value.rollback();
+        #[cfg(test)]
+        crate::skill::acceptance_tests::after_recovery();
         drop(file_lock);
         drop(gate);
         result
