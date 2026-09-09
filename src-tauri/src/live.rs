@@ -64,6 +64,8 @@ pub struct LiveConfig {
     home: PathBuf,
     lock_path: PathBuf,
     gate: Mutex<()>,
+    #[cfg(test)]
+    skill_fixture_dirs: Option<ResolvedConfigDirs>,
 }
 
 pub(crate) struct LockedLiveReceipt<'a, T> {
@@ -157,7 +159,38 @@ impl LiveConfig {
             home: home.to_owned(),
             lock_path: shared_live_config_lock_path(home),
             gate: Mutex::new(()),
+            #[cfg(test)]
+            skill_fixture_dirs: None,
         })
+    }
+
+    /// Test-only paths; never consult ambient App directory overrides.
+    #[cfg(test)]
+    pub(crate) fn for_skill_fixture(home: &Path) -> Self {
+        let home = home.canonicalize().unwrap();
+        let temporary = std::env::temp_dir().canonicalize().unwrap();
+        assert!(home.starts_with(&temporary) && home != temporary);
+        let dirs = ResolvedConfigDirs::for_tests(&home, home.join(".claude"), home.join(".codex"));
+        assert!(dirs.roots.iter().all(|(_, root)| root.starts_with(&home)));
+        let native = NativeLiveConfig::for_tests(&home, home.join(".claude"), home.join(".codex"));
+        assert!(cc_switch_core::LogicalTarget::ALL
+            .iter()
+            .all(|target| native.paths().path_for(*target).starts_with(&home)));
+        let mcp = McpLiveConfig::new(
+            native.paths(),
+            &dirs,
+            [(AppType::Claude, home.join(".claude.json"))],
+        )
+        .unwrap();
+        mcp.assert_fixture_paths(&home);
+        Self {
+            native,
+            mcp,
+            lock_path: shared_live_config_lock_path(&home),
+            home,
+            gate: Mutex::new(()),
+            skill_fixture_dirs: Some(dirs),
+        }
     }
 
     pub fn import_native_drafts(&self, app_id: &str) -> Result<Vec<NativeImport>, LiveError> {
@@ -212,6 +245,8 @@ impl LiveConfig {
             file_lock,
         } = receipt;
         let result = value.rollback();
+        #[cfg(test)]
+        crate::skill::acceptance_tests::after_recovery();
         drop(file_lock);
         drop(gate);
         result
@@ -219,6 +254,15 @@ impl LiveConfig {
 
     fn skill_config(&self) -> Result<SkillLiveConfig, SkillHostError> {
         let settings = load_shared_path_settings(&self.home);
+        #[cfg(test)]
+        if let Some(dirs) = &self.skill_fixture_dirs {
+            return SkillLiveConfig::from_home(
+                &self.home,
+                dirs,
+                self.native.paths(),
+                settings.skill_storage_location.as_deref(),
+            );
+        }
         let dirs = resolve_config_dirs(&self.home, &settings)
             .map_err(|error| SkillHostError::Live(error.to_string()))?;
         let native = NativeLiveConfig::from_home(&self.home, &dirs)

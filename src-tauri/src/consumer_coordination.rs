@@ -13,6 +13,7 @@ use crate::{
 };
 
 mod mcp_lifecycle;
+mod skill;
 
 #[test]
 #[ignore = "invoked by the CLI acceptance test with an isolated fixture"]
